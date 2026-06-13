@@ -1,0 +1,88 @@
+import express from 'express';
+import { join } from 'path';
+import dotenv from 'dotenv';
+import router from './routes/index.js';
+import { notFound, serverError } from './controller/page.controller.js';
+import { startDailyCleanup, stopDailyCleanup } from './services/cleanup.service.js';
+import { startWhatsappClient, stopWhatsappClient } from './services/whatsapp.service.js';
+import { saveInteraction } from './controller/notification.controller.js';
+
+dotenv.config();
+
+const PORT = Number.parseInt(process.env.PORT ?? '8080', 10);
+const app = express();
+
+app.disable('x-powered-by');
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+app.use('/assets', express.static('assets'));
+app.use('/media', express.static(join(process.cwd(), 'public/media')));
+app.use('/sounds', express.static(join(process.cwd(), 'public/sounds'), {
+  maxAge: 0,
+  etag: false,
+  lastModified: false,
+  setHeaders: (res) => {
+    res.set({
+      'Cache-Control': 'no-store, no-cache',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+    });
+  },
+}));
+
+app.use(router);
+
+app.use(notFound);
+app.use(serverError);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Arranque principal
+// ──────────────────────────────────────────────────────────────────────────────
+async function main() {
+  // 1. Planificador de limpieza diaria (02:00 Europe/Madrid)
+  startDailyCleanup();
+
+  // 2. Iniciar cliente WhatsApp Web
+  try {
+    // FUNCIÓN ADAPTADORA: Permite que el cliente de WhatsApp mande los datos directamente a saveInteraction
+    const handleIncomingMessage = async (payload) => {
+      const mockReq = { body: payload };
+      const mockRes = {
+        status: () => mockRes,
+        json: () => mockRes
+      };
+      const mockNext = (err) => { if (err) console.error('[main] Error en saveInteraction:', err); };
+      await saveInteraction(mockReq, mockRes, mockNext);
+    };
+
+    await startWhatsappClient(handleIncomingMessage);
+    console.log('[main] Cliente WhatsApp Web iniciado correctamente.');
+  } catch (err) {
+    console.error('[main] Error al iniciar WhatsApp Web:', err.message);
+    console.log('[main] El servidor continuara. Escanea el QR en /whatsapp/qr para vincular.');
+  }
+
+  // 3. Iniciar servidor HTTP Express
+  const httpServer = app.listen(PORT, () => {
+    console.log(`[http] Servidor Express escuchando en puerto ${PORT}`);
+  });
+
+  // 4. Shutdown graceful al recibir señales del SO / Docker
+  async function shutdown(signal) {
+    console.log(`\n[main] Señal ${signal} recibida, cerrando...`);
+    stopDailyCleanup();
+    await stopWhatsappClient();
+    httpServer.close(() => {
+      console.log('[main] Servidor HTTP cerrado. Saliendo.');
+      process.exit(0);
+    });
+  }
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+main().catch((err) => {
+  console.error('[main] Error fatal al arrancar:', err);
+  process.exit(1);
+});

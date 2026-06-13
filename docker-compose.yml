@@ -1,0 +1,36 @@
+services:
+  app:
+    build: .
+    user: "root"
+    container_name: app
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/.env
+      - ./data:/data
+      - ./.wwebjs_auth:/usr/src/app/.wwebjs_auth
+      - ./public/media:/usr/src/app/public/media
+    environment:
+      - DB_PATH=/data/nokia.db
+      - ENV_FILE_PATH=/.env
+    ports:
+      - "8080:8080"
+    networks:
+      - app-network
+
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: cloudflared
+  #   restart: always
+  #   command: tunnel run
+  #   environment:
+  #     - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+  #   depends_on:
+  #     - app
+  #   networks:
+  #     - app-network
+
+
+networks:
+  app-network:
