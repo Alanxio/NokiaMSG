@@ -1,12 +1,13 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
+import { sendWhatsappSeen } from '../services/whatsapp.service.js';
 import {
   DIRECTORY_PAGE_SIZE,
   MESSAGE_PAGE_SIZE,
   escapeXml,
   getTotal,
   renderList,
-  nl2br,
+  renderMentions,
   renderPager,
   sendInvalidEntity,
   sendMissingEntity,
@@ -57,6 +58,11 @@ export async function showGroupMessages(req, res, next) {
 
     stmts.resetGroupUnseen.run(groupId);
 
+    // Enviar visto por WhatsApp si el ajuste está activo y había mensajes no vistos
+    if (unseenCount > 0 && process.env.SEND_READ_RECEIPTS_ENABLED === 'true') {
+      sendWhatsappSeen(groupId).catch(() => {});
+    }
+
     const total = getTotal(stmts.countGroupMessages, groupId);
     const totalPages = Math.max(1, Math.ceil(total / MESSAGE_PAGE_SIZE));
     const page = Math.min(toPositiveInt(req.query.p, 1), totalPages);
@@ -77,7 +83,7 @@ export async function showGroupMessages(req, res, next) {
         if (message.has_media && message.file_path_thumb) {
           contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
         } else {
-          contentPart = nl2br(escapeXml(message.text));
+          contentPart = renderMentions(message.text);
         }
 
         const isSaliente = Number(message.from_me) === 1;

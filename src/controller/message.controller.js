@@ -1,9 +1,26 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
 import { escapeXml, sendPage } from './page.controller.js';
+import multer from 'multer';
+import pkg from 'whatsapp-web.js';
+
+const { MessageMedia } = pkg;
 
 // Asegúrate de que esta ruta apunte correctamente a donde exportas el cliente
 import { client } from '../services/whatsapp.service.js';
+
+export const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png'];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Solo se permiten imagenes JPG o PNG'), false);
+    }
+  },
+});
 
 export async function renderComposePage(req, res, next) {
   try {
@@ -39,11 +56,14 @@ export async function renderComposePage(req, res, next) {
       let body = `<h1>Para: ${escapeXml(destinoNombre)}</h1>`;
 
       body += `
-        <form action="/mensaje/validar-y-crear" method="POST">
+        <form action="/mensaje/validar-y-crear" method="POST" enctype="multipart/form-data">
           <input type="hidden" name="phone" value="${escapeXml(to)}"/>
           <input type="hidden" name="type" value="${escapeXml(type)}"/>
           <p>
             <textarea name="text" rows="5" cols="22">${escapeXml(textoPrevio)}</textarea>
+          </p>
+          <p>
+            <input type="file" name="image" accept="image/jpeg,image/png"/>
           </p>
           <p>
             <input type="submit" value="Enviar"/> <a href="${urlCancelar}">Cancelar</a>
@@ -173,28 +193,81 @@ export async function renderComposePage(req, res, next) {
 }
 
 export async function validateAndCreateChat(req, res, next) {
+  // ===========================================================================
+  // 1. Procesar posible imagen adjunta con multer
+  // ===========================================================================
+  try {
+    await new Promise((resolve, reject) => {
+      upload.single('image')(req, res, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  } catch (err) {
+    let message = 'Error al procesar la imagen.';
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      message = 'La imagen es demasiado grande. Maximo 5 MB.';
+    } else if (err.message === 'Solo se permiten imagenes JPG o PNG') {
+      message = err.message;
+    }
+    return sendPage(
+      req,
+      res,
+      400,
+      'Error',
+      `<p>${escapeXml(message)}</p><p><a href="/mensaje/componer">Volver</a></p>`
+    );
+  }
+
   try {
     const { phone, text, type } = req.body;
+    const imageFile = req.file;
 
-    if (!phone || !text || text.trim() === '') {
-      res.redirect('/mensaje/componer');
-      return;
+    const trimmedText = typeof text === 'string' ? text.trim() : '';
+    const hasText = trimmedText !== '';
+    const hasImage = !!imageFile;
+
+    if (!phone || (!hasText && !hasImage)) {
+      return sendPage(
+        req,
+        res,
+        400,
+        'Error',
+        '<p>Debes escribir un mensaje o adjuntar una imagen.</p><p><a href="/mensaje/componer">Volver</a></p>'
+      );
     }
 
+    const processedText = hasText ? convertEmojisToAscii(trimmedText) : '';
+
     let targetJid = phone.trim();
-    const processedText = convertEmojisToAscii(text.trim());
 
     if (!targetJid.includes('@')) {
       const numberDetails = await client.getNumberId(targetJid);
       if (!numberDetails) {
-        const errorBody = '<h1>Error</h1><p>El número no tiene WhatsApp registrado.</p><p><a href="/mensaje/componer">Volver</a></p>';
-        sendPage(req, res, 400, 'Error', errorBody);
-        return;
+        return sendPage(
+          req,
+          res,
+          400,
+          'Error',
+          '<h1>Error</h1><p>El número no tiene WhatsApp registrado.</p><p><a href="/mensaje/componer">Volver</a></p>'
+        );
       }
       targetJid = numberDetails._serialized;
     }
 
-    await client.sendMessage(targetJid, processedText);
+    // =========================================================================
+    // 2. Enviar mensaje de texto, imagen o imagen con caption
+    // =========================================================================
+    if (hasImage) {
+      const media = new MessageMedia(
+        imageFile.mimetype,
+        imageFile.buffer.toString('base64'),
+        imageFile.originalname
+      );
+      await client.sendMessage(targetJid, media, { caption: processedText });
+    } else {
+      await client.sendMessage(targetJid, processedText);
+    }
 
     // CONTROL ESTRICTO DE FECHA/HORA EN FORMATO SQLITE ("YYYY-MM-DD HH:MM:SS")
     const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
@@ -202,6 +275,7 @@ export async function validateAndCreateChat(req, res, next) {
     const daySend = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
     const hourSend = `${daySend} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 
+    const finalText = processedText || '[Imagen]';
     let urlDestino = '/';
 
     if (type === 'group' || targetJid.endsWith('@g.us')) {
@@ -214,7 +288,11 @@ export async function validateAndCreateChat(req, res, next) {
         } catch (e) {}
         stmts.upsertGroup.run(targetJid, groupName);
       }
-      stmts.insertMessage.run(processedText, daySend, hourSend, 1, null, targetJid);
+      if (hasImage) {
+        stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null);
+      } else {
+        stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid);
+      }
       urlDestino = `/grupo/${encodeURIComponent(targetJid)}`;
     } else {
       const u = db.prepare('SELECT chat_id FROM users WHERE chat_id = ?').get(targetJid);
@@ -228,7 +306,11 @@ export async function validateAndCreateChat(req, res, next) {
         } catch (e) {}
         stmts.upsertUser.run(targetJid, finalName);
       }
-      stmts.insertMessage.run(processedText, daySend, hourSend, 1, targetJid, null);
+      if (hasImage) {
+        stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null);
+      } else {
+        stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null);
+      }
       urlDestino = `/usuario/${encodeURIComponent(targetJid)}`;
     }
 

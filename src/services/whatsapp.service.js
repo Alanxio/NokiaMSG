@@ -6,6 +6,7 @@ import { join, dirname } from 'path';
 import db, { stmts } from '../../db/db.js';
 import { saveInteraction } from '../controller/notification.controller.js';
 import { marcarNovedad } from './polling.service.js';
+import { resolveMentions } from '../utils/mentions.js';
 
 const { Client, LocalAuth } = pkg;
 
@@ -364,6 +365,12 @@ export async function startWhatsappClient(processMessageFn) {
       const chat = await msg.getChat();
       const isGroup = chat.isGroup;
 
+      // Resolver menciones en mensajes de grupo (solo mensajes nuevos)
+      let resolvedBody = msg.body;
+      if (isGroup && Array.isArray(msg.mentionedIds) && msg.mentionedIds.length > 0 && client) {
+        resolvedBody = await resolveMentions(msg.body, msg.mentionedIds, client);
+      }
+
       const d = new Date(msg.timestamp * 1000);
       const localDate = new Date(d.toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
       const pad = (n) => String(n).padStart(2, '0');
@@ -400,7 +407,7 @@ export async function startWhatsappClient(processMessageFn) {
       const fakeReq = {
         body: {
           title,
-          message: msg.body,
+          message: resolvedBody,
           date: dateStr,
           time: timeStr,
           chat_id: msg.from,
@@ -417,7 +424,7 @@ export async function startWhatsappClient(processMessageFn) {
         json(data) { this._json = data; },
       }, () => {}, mediaInfo);
 
-      marcarNovedad(msg.body);
+      marcarNovedad(resolvedBody);
 
     } catch (err) {
       console.error('[whatsapp] Error en message_create:', err.message);
@@ -648,5 +655,25 @@ export async function sendWhatsappMessage(chatId, messageText) {
       error: err.message || 'Error desconocido al enviar',
       code: 'SEND_ERROR',
     };
+  }
+}
+
+export async function sendWhatsappSeen(chatId) {
+  if (!client || connectionStatus !== 'connected' || !chatId) {
+    return { success: false, code: 'NOT_CONNECTED' };
+  }
+
+  try {
+    const chat = await client.getChatById(chatId);
+    if (!chat) {
+      return { success: false, code: 'CHAT_NOT_FOUND' };
+    }
+
+    const result = await chat.sendSeen();
+    console.log(`[whatsapp] ✓ Visto enviado a ${chatId}:`, result);
+    return { success: true, result };
+  } catch (err) {
+    console.error(`[whatsapp] Error enviando visto a ${chatId}:`, err.message);
+    return { success: false, error: err.message || 'Error desconocido', code: 'SEND_ERROR' };
   }
 }

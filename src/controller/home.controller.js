@@ -1,6 +1,6 @@
 import db, { stmts } from '../../db/db.js';
 import { sendPage, escapeXml } from './page.controller.js';
-import { getConnectionStatus, getUsersPresence } from '../services/whatsapp.service.js';
+import { getConnectionStatus, getUsersPresence, sendWhatsappSeen } from '../services/whatsapp.service.js';
 
 const USER_ICON_HTML = '<img src="/assets/user.jpeg" alt="U" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
 const GROUP_ICON_HTML = '<img src="/assets/group.jpeg" alt="G" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
@@ -62,16 +62,46 @@ export async function showHome(req, res, next) {
           : '<a href="/whatsapp/qr">Vincular dispositivo (QR)</a>') +
       '</p>';
 
+    const readAllLink = count > 0 ? ' <a href="/leer-todo">[Leer Todo]</a>' : '';
+
     const body =
       '<h1>Nokia</h1>' +
       `<p><a href="/usuario">Usuarios</a> | <a href="/grupo">Grupos</a></p>` +
       '<p><a href="/mensaje/componer">[Enviar Mensaje]</a></p>' +
-      `<p style="margin-bottom:0">Ultimos mensajes (${count}/10)</p>` +
+      `<p style="margin-bottom:0">Ultimos mensajes (${count}/10)${readAllLink}</p>` +
       itemsHtml +
       waStatusHtml +
       '<br/><p><a href="/ajustes">Ajustes del Sistema</a></p>';
 
     sendPage(req, res, 200, 'Nokia', body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function markAllAsRead(req, res, next) {
+  try {
+    const usersWithUnseen = stmts.getUsersWithUnseen.all().map((row) => row.chat_id);
+    const groupsWithUnseen = stmts.getGroupsWithUnseen.all().map((row) => row.group_id);
+
+    stmts.resetAllUsersUnseen.run();
+    stmts.resetAllGroupsUnseen.run();
+
+    if (process.env.SEND_READ_RECEIPTS_ENABLED === 'true') {
+      const allChatIds = [...usersWithUnseen, ...groupsWithUnseen];
+      allChatIds.forEach((chatId, index) => {
+        setTimeout(() => {
+          sendWhatsappSeen(chatId).catch(() => {});
+        }, index * 1200);
+      });
+    }
+
+    const body =
+      '<h1>Nokia</h1>' +
+      '<p>Leiendo mensajes...</p>' +
+      '<p><a href="/">Inicio</a></p>';
+
+    sendPage(req, res, 200, 'Leyendo', body, '<meta http-equiv="refresh" content="3;url=/"/>');
   } catch (error) {
     next(error);
   }

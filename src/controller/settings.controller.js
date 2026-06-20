@@ -31,6 +31,8 @@ function updateEnvVariables(updates) {
 export function showSettings(req, res, next) {
   const smsCurrent = process.env.SMS_NOTIFICATIONS_ENABLED === 'true' ? 'true' : 'false';
   const smsChecked = smsCurrent === 'true' ? 'checked="checked"' : '';
+  const readReceiptsCurrent = process.env.SEND_READ_RECEIPTS_ENABLED === 'true' ? 'true' : 'false';
+  const readReceiptsChecked = readReceiptsCurrent === 'true' ? 'checked="checked"' : '';
   const cleanupValue = process.env.DAILY_CLEANUP_ENABLED === 'false'
     ? 'never'
     : process.env.MESSAGE_RETENTION_DAYS || '3';
@@ -48,6 +50,9 @@ export function showSettings(req, res, next) {
     <form action="/ajustes" method="post">
       <p>Notificaciones SMS:</p>
       <input type="hidden" name="sms_current" value="${smsCurrent}" /><input type="checkbox" name="sms" value="true" ${smsChecked} /><small>Activado</small>
+      <br/>
+      <p>Ticks azules al leer:</p>
+      <input type="hidden" name="read_receipts_current" value="${readReceiptsCurrent}" /><input type="checkbox" name="readReceipts" value="true" ${readReceiptsChecked} /><small>Activado</small>
       <br/>
       <p>Borrado automatico:</p>
       <select name="messageRetentionDays">
@@ -67,8 +72,9 @@ export function showSettings(req, res, next) {
 }
 
 export function saveSettings(req, res, next) {
-  const { sms, sms_current, messageRetentionDays } = req.body;
+  const { sms, sms_current, readReceipts, read_receipts_current, messageRetentionDays } = req.body;
   const newSmsEnabled = sms === 'true' ? 'true' : 'false';
+  const newReadReceiptsEnabled = readReceipts === 'true' ? 'true' : 'false';
   const isCleanupDisabled = messageRetentionDays === 'never';
   const allowedCleanupValues = new Set(CLEANUP_RETENTION_OPTIONS.map((option) => option.value));
   const safeRetentionValue =
@@ -78,6 +84,7 @@ export function saveSettings(req, res, next) {
 
   updateEnvVariables({
     SMS_NOTIFICATIONS_ENABLED: newSmsEnabled,
+    SEND_READ_RECEIPTS_ENABLED: newReadReceiptsEnabled,
     DAILY_CLEANUP_ENABLED: isCleanupDisabled ? 'false' : 'true',
     MESSAGE_RETENTION_DAYS: isCleanupDisabled ? (process.env.MESSAGE_RETENTION_DAYS || '3') : safeRetentionValue,
   });
@@ -95,6 +102,7 @@ export function saveSettings(req, res, next) {
     '<meta http-equiv="refresh" content="2; url=/"/>' +
     '<p>Ajustes guardados.</p>' +
     `<p>SMS: ${newSmsEnabled === 'true' ? 'Activado' : 'Desactivado'}</p>` +
+    `<p>Ticks azules: ${newReadReceiptsEnabled === 'true' ? 'Activado' : 'Desactivado'}</p>` +
     `<p>Borrado: ${cleanupLabel}</p>` +
     '<p>Volviendo...</p>');
 }

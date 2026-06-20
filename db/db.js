@@ -335,6 +335,22 @@ export const stmts = {
     UPDATE users SET unseen_count = 0 WHERE chat_id = ?
   `),
 
+  resetAllUsersUnseen: db.prepare(`
+    UPDATE users SET unseen_count = 0
+  `),
+
+  resetAllGroupsUnseen: db.prepare(`
+    UPDATE wgroups SET unseen_count = 0
+  `),
+
+  getUsersWithUnseen: db.prepare(`
+    SELECT chat_id FROM users WHERE unseen_count > 0
+  `),
+
+  getGroupsWithUnseen: db.prepare(`
+    SELECT group_id FROM wgroups WHERE unseen_count > 0
+  `),
+
 };
 
 // Cierre seguro de la base de datos para evitar corrupción del modo WAL

@@ -1,13 +1,13 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { getUsersPresence } from '../services/whatsapp.service.js';
+import { getUsersPresence, sendWhatsappSeen } from '../services/whatsapp.service.js';
 import {
   DIRECTORY_PAGE_SIZE,
   MESSAGE_PAGE_SIZE,
   escapeXml,
   getTotal,
   renderList,
-  nl2br,
+  renderMentions,
   renderPager,
   sendInvalidEntity,
   sendMissingEntity,
@@ -72,6 +72,11 @@ export async function showUserMessages(req, res, next) {
     // Reseteo del contador usando las sentencias estables de tu db.js
     stmts.resetUserUnseen.run(chatId);
 
+    // Enviar visto por WhatsApp si el ajuste está activo y había mensajes no vistos
+    if (unseenCount > 0 && process.env.SEND_READ_RECEIPTS_ENABLED === 'true') {
+      sendWhatsappSeen(chatId).catch(() => {});
+    }
+
     const total = getTotal(stmts.countUserMessages, chatId);
     const totalPages = Math.max(1, Math.ceil(total / MESSAGE_PAGE_SIZE));
     const page = Math.min(toPositiveInt(req.query.p, 1), totalPages);
@@ -94,7 +99,7 @@ export async function showUserMessages(req, res, next) {
         if (message.has_media && message.file_path_thumb) {
           contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
         } else {
-          contentPart = nl2br(escapeXml(message.text));
+          contentPart = renderMentions(message.text);
         }
 
         // CORRECCIÓN DEFINITIVA: Comprobación numérica estricta para evitar falsos positivos

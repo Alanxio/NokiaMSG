@@ -18,6 +18,19 @@ export function nl2br(value = '') {
   return escapeXml(value).replace(/\r?\n/g, '<br/>');
 }
 
+// Dominios comunes en España: si un @termina en uno de estos, lo tratamos como correo, no mención.
+const EMAIL_DOMAIN_RE = /\.(com|es|org|net|info|eu)$/i;
+
+export function renderMentions(value = '') {
+  const escaped = escapeXml(value).replace(/\r?\n/g, '<br/>');
+  // Palabra o grupo de palabras separadas por un espacio.
+  // Cada palabra debe tener al menos 2 caracteres para evitar capturar conectores sueltos.
+  return escaped.replace(
+    /(@[A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,}(?: [A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,})*)/g,
+    (match) => EMAIL_DOMAIN_RE.test(match) ? match : `<font color="#003399">${match}</font>`
+  );
+}
+
 export function toPositiveInt(value, fallback = 1) {
   const parsed = Number.parseInt(value, 10);
   return Number.isNaN(parsed) || parsed < 1 ? fallback : parsed;
@@ -57,9 +70,9 @@ function pickContentType(req) {
   return HTML_CONTENT_TYPE;
 }
 
-export function sendPage(req, res, statusCode, title, body) {
+export function sendPage(req, res, statusCode, title, body, extraHead = '') {
   const contentType = pickContentType(req);
-  const page = `${XHTML_DOCTYPE}<html xmlns="http://www.w3.org/1999/xhtml"><head><title>${escapeXml(title)}</title><meta http-equiv="Content-Type" content="${escapeXml(contentType)}"/></head><body>${body}</body></html>`;
+  const page = `${XHTML_DOCTYPE}<html xmlns="http://www.w3.org/1999/xhtml"><head><title>${escapeXml(title)}</title><meta http-equiv="Content-Type" content="${escapeXml(contentType)}"/>${extraHead}</head><body>${body}</body></html>`;
 
   res.status(statusCode);
   res.set({
