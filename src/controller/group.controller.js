@@ -82,6 +82,8 @@ export async function showGroupMessages(req, res, next) {
         let contentPart;
         if (message.has_media && message.file_path_thumb) {
           contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
+        } else if (Number(message.is_sticker) === 1) {
+          contentPart = '<i>[Sticker]</i>';
         } else {
           contentPart = renderMentions(message.text);
         }
@@ -89,17 +91,14 @@ export async function showGroupMessages(req, res, next) {
         const isSaliente = Number(message.from_me) === 1;
         const fromMeMarker = isSaliente ? '<font color="#006600">[Yo]</font> ' : '';
 
-        const usernameLine = isSaliente 
-          ? '' 
+        const usernameLine = isSaliente
+          ? ''
           : `<font size="1" color="#000000">[${message.username ? escapeXml(convertEmojisToAscii(message.username)) : 'Desconocido'}] dice:</font><br/>`;
 
         messagesHtml +=
-          `<p>` +
-          `<a href="/mensaje/${message.id}">Ver</a><br/>` +
-          `${unseenMarker}${fromMeMarker}` +
+          `<p>${unseenMarker}${fromMeMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font><br/>` +
           usernameLine +
           `<font size="1" color="#000000">${contentPart}</font><br/>` +
-          `<font size="1" color="#666666">${escapeXml(sentAt)}</font><br/>` +
           `----------</p>`;
       });
     }

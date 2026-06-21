@@ -101,6 +101,7 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
 
     let whatsappMsgId = payload.whatsapp_msg_id || null;
     let fromMe = payload.from_me ?? 0;
+    let isSticker = payload.is_sticker ?? 0;
 
     // =========================================================================
     // SEGURIDAD RADICAL: Forzar from_me a 0 o 1 basándonos en el ID oficial
@@ -223,8 +224,8 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       // SOLUCIÓN AL [Yo]: Inserción segura con parámetros explícitos y nombrados
       // =========================================================================
       const msgResult = db.prepare(`
-        INSERT OR IGNORE INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, media_key, whatsapp_msg_id)
-        VALUES (@text, @day_send, @hour_send, @from_me, @user_chat_id, @group_id, @has_media, @media_key, @whatsapp_msg_id)
+        INSERT OR IGNORE INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, is_sticker, media_key, whatsapp_msg_id)
+        VALUES (@text, @day_send, @hour_send, @from_me, @user_chat_id, @group_id, @has_media, @is_sticker, @media_key, @whatsapp_msg_id)
       `).run({
         text: processedMessage,
         day_send: daySend,
@@ -233,6 +234,7 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
         user_chat_id: finalUserChatId,
         group_id: finalGroupId,
         has_media: hasMedia ? 1 : 0,
+        is_sticker: isSticker ? 1 : 0,
         media_key: mediaKey,
         whatsapp_msg_id: whatsappMsgId
       });
@@ -246,9 +248,15 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
 
       const messageId = msgResult.lastInsertRowid;
 
+      // Consultar unseen ANTES de incrementar para decidir si enviar SMS
+      let previousUnseen = 0;
       if (isGroup) {
+        const groupRow = stmts.getGroupById.get(finalGroupId);
+        previousUnseen = groupRow?.unseen_count || 0;
         stmts.incrementGroupUnseen.run(finalGroupId);
       } else {
+        const userRow = stmts.getUserByChatId.get(finalUserChatId);
+        previousUnseen = userRow?.unseen_count || 0;
         stmts.incrementUserUnseen.run(finalUserChatId);
       }
 
@@ -259,8 +267,9 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
           mediaInfo.mimeType,
           mediaInfo.filename,
           mediaInfo.bufferLength,
-          mediaInfo.originalPath,
-          null,
+          mediaInfo.filePathFull || mediaInfo.originalPath,
+          mediaInfo.filePathView || null,
+          mediaInfo.filePathThumb || null,
           0,
           Math.floor(Date.now() / 1000)
         );
@@ -268,8 +277,8 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
 
       db.exec('COMMIT');
 
-      // Disparar la notificación SMS en segundo plano si el mensaje no es nuestro
-      if (!fromMe) {
+      // Disparar la notificación SMS solo si pasamos de 0 a 1 mensaje no visto
+      if (!fromMe && previousUnseen === 0) {
         sendSmsNotification({
           type: isGroup ? 'group' : 'user',
           groupName: nameOrGroupName,
@@ -278,6 +287,7 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       }
 
       res.status(201).json({ success: true, messageId });
+      return messageId;
 
     } catch (dbError) {
       db.exec('ROLLBACK');
@@ -286,5 +296,6 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
 
   } catch (error) {
     next(error);
+    return null;
   }
 }

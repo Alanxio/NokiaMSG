@@ -1,11 +1,14 @@
 import express from 'express';
-import { join } from 'path';
+import { basename, join } from 'path';
+import { existsSync } from 'fs';
 import dotenv from 'dotenv';
 import router from './routes/index.js';
 import { notFound, serverError } from './controller/page.controller.js';
 import { startDailyCleanup, stopDailyCleanup } from './services/cleanup.service.js';
 import { startWhatsappClient, stopWhatsappClient } from './services/whatsapp.service.js';
 import { saveInteraction } from './controller/notification.controller.js';
+import { requireAuth } from './middlewares/auth.middleware.js';
+import { cleanupOrphanMediaFiles, migrateAttachmentsToView } from './utils/media.js';
 
 dotenv.config();
 
@@ -16,7 +19,22 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use('/assets', express.static('assets'));
-app.use('/media', express.static(join(process.cwd(), 'public/media')));
+app.use('/media', requireAuth, express.static(join(process.cwd(), 'public/media')));
+
+// Descarga de imágenes con Content-Disposition: attachment
+app.get('/descargar/:file', requireAuth, (req, res, next) => {
+  try {
+    const fileName = basename(req.params.file);
+    const filePath = join(process.cwd(), 'public', 'media', fileName);
+    if (!existsSync(filePath)) {
+      return res.status(404).send('Archivo no encontrado');
+    }
+    res.download(filePath, fileName);
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.use('/sounds', express.static(join(process.cwd(), 'public/sounds'), {
   maxAge: 0,
   etag: false,
@@ -39,6 +57,10 @@ app.use(serverError);
 // Arranque principal
 // ──────────────────────────────────────────────────────────────────────────────
 async function main() {
+  // 0. Migrar attachments antiguos y luego limpiar archivos huérfanos
+  await migrateAttachmentsToView();
+  cleanupOrphanMediaFiles();
+
   // 1. Planificador de limpieza diaria (02:00 Europe/Madrid)
   startDailyCleanup();
 

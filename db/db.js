@@ -32,6 +32,7 @@ db.exec(`
     user_chat_id TEXT,
     group_id TEXT,
     has_media INTEGER DEFAULT 0,
+    is_sticker INTEGER DEFAULT 0,
     media_key TEXT,
     whatsapp_msg_id TEXT UNIQUE,
     FOREIGN KEY (user_chat_id) REFERENCES users(chat_id),
@@ -54,6 +55,7 @@ db.exec(`
     file_name TEXT,
     file_size INTEGER,
     file_path_full TEXT,
+    file_path_view TEXT,
     file_path_thumb TEXT,
     album_order INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
@@ -66,6 +68,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments(message_id);
   CREATE INDEX IF NOT EXISTS idx_attachments_media_key ON attachments(media_key);
 `);
+
+// Migración suave: añadir columnas si la BD es antigua
+try {
+  db.exec(`ALTER TABLE attachments ADD COLUMN file_path_view TEXT`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN is_sticker INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
 
 export const stmts = {
   upsertUser: db.prepare(`
@@ -171,7 +185,7 @@ export const stmts = {
   `),
 
   getUserMessagesPaginated: db.prepare(`
-    SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media,
+    SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker,
            g.group_name,
            a.file_path_thumb
     FROM messages m
@@ -183,7 +197,7 @@ export const stmts = {
   `),
 
   getGroupMessagesPaginated: db.prepare(`
-    SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media,
+    SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker,
            u.username,
            a.file_path_thumb
     FROM messages m
@@ -264,8 +278,8 @@ export const stmts = {
   `),
 
   insertAttachment: db.prepare(`
-    INSERT INTO attachments (message_id, media_key, mime_type, file_name, file_size, file_path_full, album_order, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO attachments (message_id, media_key, mime_type, file_name, file_size, file_path_full, file_path_view, file_path_thumb, album_order, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
 
   getLastMessageWithMedia: db.prepare(`
@@ -296,6 +310,10 @@ export const stmts = {
     UPDATE attachments SET file_path_full = ?, file_path_thumb = ? WHERE id = ?
   `),
 
+  markMessageHasMedia: db.prepare(`
+    UPDATE messages SET has_media = 1 WHERE id = ?
+  `),
+
   getAttachmentsByCreatedAt: db.prepare(`
     SELECT id, file_path_full, file_path_thumb, file_name, created_at
     FROM attachments
@@ -307,10 +325,10 @@ export const stmts = {
   `),
 
   getMessageByIdWithMedia: db.prepare(`
-    SELECT m.id, m.text, m.day_send, m.hour_send, m.from_me, m.has_media, m.media_key,
+    SELECT m.id, m.text, m.day_send, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.media_key,
            u.username, u.chat_id AS user_chat_id,
            g.group_name, m.group_id,
-           a.file_path_thumb, a.mime_type
+           a.file_path_full, a.file_path_view, a.file_path_thumb, a.mime_type
     FROM messages m
     LEFT JOIN users   u ON u.chat_id  = m.user_chat_id
     LEFT JOIN wgroups g ON g.group_id = m.group_id

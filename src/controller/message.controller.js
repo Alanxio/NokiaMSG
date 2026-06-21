@@ -1,6 +1,7 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
 import { escapeXml, sendPage } from './page.controller.js';
+import { processAndAttachMedia } from '../utils/media.js';
 import multer from 'multer';
 import pkg from 'whatsapp-web.js';
 
@@ -277,6 +278,7 @@ export async function validateAndCreateChat(req, res, next) {
 
     const finalText = processedText || '[Imagen]';
     let urlDestino = '/';
+    let insertedMessageId = null;
 
     if (type === 'group' || targetJid.endsWith('@g.us')) {
       const g = db.prepare('SELECT group_id FROM wgroups WHERE group_id = ?').get(targetJid);
@@ -289,9 +291,11 @@ export async function validateAndCreateChat(req, res, next) {
         stmts.upsertGroup.run(targetJid, groupName);
       }
       if (hasImage) {
-        stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null);
+        const result = stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null);
+        insertedMessageId = result.lastInsertRowid;
       } else {
-        stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid);
+        const result = stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid);
+        insertedMessageId = result.lastInsertRowid;
       }
       urlDestino = `/grupo/${encodeURIComponent(targetJid)}`;
     } else {
@@ -307,11 +311,25 @@ export async function validateAndCreateChat(req, res, next) {
         stmts.upsertUser.run(targetJid, finalName);
       }
       if (hasImage) {
-        stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null);
+        const result = stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null);
+        insertedMessageId = result.lastInsertRowid;
       } else {
-        stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null);
+        const result = stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null);
+        insertedMessageId = result.lastInsertRowid;
       }
       urlDestino = `/usuario/${encodeURIComponent(targetJid)}`;
+    }
+
+    if (hasImage && insertedMessageId && imageFile?.buffer) {
+      try {
+        await processAndAttachMedia(insertedMessageId, imageFile.buffer, {
+          mediaKey: `out_${insertedMessageId}_${Date.now()}`,
+          filename: imageFile.originalname || `out_${insertedMessageId}.jpg`,
+          mimeType: imageFile.mimetype || 'image/jpeg',
+        });
+      } catch (mediaErr) {
+        console.error('[mensaje] Error guardando attachment saliente:', mediaErr.message);
+      }
     }
 
     // Pantalla nostálgica de espera de 3 segundos sin botones
@@ -334,6 +352,72 @@ export async function validateAndCreateChat(req, res, next) {
       </html>
     `);
 
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function showMessageDetail(req, res, next) {
+  try {
+    const messageId = Number.parseInt(req.params.id, 10);
+    if (Number.isNaN(messageId)) {
+      return sendPage(req, res, 404, 'No encontrado', '<p>Mensaje no encontrado.</p><p><a href="/">Inicio</a></p>');
+    }
+
+    const message = stmts.getMessageByIdWithMedia.get(messageId);
+    if (!message) {
+      return sendPage(req, res, 404, 'No encontrado', '<p>Mensaje no encontrado.</p><p><a href="/">Inicio</a></p>');
+    }
+
+    const attachments = stmts.getAttachmentsByMessageId.all(messageId);
+    const attachment = attachments[0] || null;
+
+    let fromToLabel = '';
+    let backUrl = '/';
+
+    if (message.group_id) {
+      fromToLabel = `Grupo: ${escapeXml(message.group_name || 'Grupo sin nombre')}`;
+      backUrl = `/grupo/${encodeURIComponent(message.group_id)}`;
+    } else if (message.user_chat_id) {
+      const isOutgoing = Number(message.from_me) === 1;
+      const name = escapeXml(message.username || message.user_chat_id.replace(/@.*$/, ''));
+      fromToLabel = isOutgoing ? `Para: ${name}` : `De: ${name}`;
+      backUrl = `/usuario/${encodeURIComponent(message.user_chat_id)}`;
+    }
+
+    const sentAt = message.hour_send || `${message.day_send} 00:00:00`;
+    const timeMatch = sentAt.match(/(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/);
+    const dateTimeLabel = timeMatch
+      ? `${timeMatch[1]} ${timeMatch[2]}`
+      : escapeXml(sentAt);
+
+    const isSticker = Number(message.is_sticker) === 1;
+    let contentHtml = '';
+
+    if (isSticker && attachment?.file_path_thumb) {
+      contentHtml += `<p><img src="${escapeXml(attachment.file_path_thumb)}" alt="Sticker" width="40"/></p>`;
+    } else if (attachment?.file_path_view) {
+      contentHtml += `<p><img src="${escapeXml(attachment.file_path_view)}" alt="Imagen" width="${attachment.view_width || 120}" height="${attachment.view_height || 90}"/></p>`;
+    }
+
+    if (message.text && message.text !== '[Imagen]') {
+      contentHtml += `<p>${escapeXml(message.text)}</p>`;
+    } else if (!attachment?.file_path_view && !isSticker) {
+      contentHtml += `<p>${escapeXml(message.text || '')}</p>`;
+    }
+
+    if (!isSticker && attachment?.file_path_full) {
+      const fileName = attachment.file_path_full.split('/').pop();
+      contentHtml += `<p><a href="/descargar/${escapeXml(fileName)}">Descargar imagen</a></p>`;
+    }
+
+    const body =
+      '<h1>Mensaje</h1>' +
+      `<p><b>${fromToLabel}</b><br/>${escapeXml(dateTimeLabel)}</p>` +
+      contentHtml +
+      `<p><a href="${backUrl}">Volver a la conversacion</a></p>`;
+
+    sendPage(req, res, 200, 'Mensaje', body);
   } catch (error) {
     next(error);
   }

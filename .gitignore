@@ -5,3 +5,4 @@ data/
 assets/qr.png
 *.log
 .opencode/
+public/media/

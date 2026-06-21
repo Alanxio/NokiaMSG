@@ -7,6 +7,7 @@ import db, { stmts } from '../../db/db.js';
 import { saveInteraction } from '../controller/notification.controller.js';
 import { marcarNovedad } from './polling.service.js';
 import { resolveMentions } from '../utils/mentions.js';
+import { saveImageVersions, processSticker } from '../utils/media.js';
 
 const { Client, LocalAuth } = pkg;
 
@@ -344,21 +345,27 @@ export async function startWhatsappClient(processMessageFn) {
       return;
     }
 
+    const esSticker = msg.hasMedia && msg.type === 'sticker';
     const esImagenReal = msg.hasMedia && msg.type === 'image';
+    const esMediaReal = esImagenReal || esSticker;
 
-    if (!msg.body && !esImagenReal) {
+    if (!msg.body && !esMediaReal) {
       console.log(`[whatsapp] Mensaje sin texto de ${msg.from} (${msg.type}/${msg.mediaKey ? 'media' : 'no-media'}) — ignorado.`);
       return;
     }
 
     let mediaInfo = null;
 
-    if (msg.hasMedia) {
+    if (msg.hasMedia && esImagenReal) {
       console.log(`[whatsapp] 📸 Detectado mensaje multimedia de ${msg.from}. Descargando...`);
       mediaInfo = await downloadAndProcessMedia(msg);
       if (!msg.body) {
         msg.body = '[Imagen]';
       }
+    }
+
+    if (esSticker && !msg.body) {
+      msg.body = '[Sticker]';
     }
 
     try {
@@ -417,12 +424,41 @@ export async function startWhatsappClient(processMessageFn) {
         },
       };
 
-      await saveInteraction(fakeReq, {
+      const mockRes = {
         statusCode: 200,
         _json: null,
         status(code) { this.statusCode = code; return this; },
         json(data) { this._json = data; },
-      }, () => {}, mediaInfo);
+      };
+
+      if (esSticker) {
+        // Guardar mensaje de sticker primero (sin media), luego procesar y adjuntar
+        const stickerReq = {
+          body: {
+            ...fakeReq.body,
+            is_sticker: 1,
+          },
+        };
+        const messageId = await saveInteraction(stickerReq, mockRes, () => {}, null);
+
+        if (messageId) {
+          try {
+            const stickerMedia = await msg.downloadMedia();
+            if (stickerMedia && stickerMedia.data) {
+              const buffer = Buffer.from(stickerMedia.data, 'base64');
+              await processSticker(messageId, buffer, {
+                mediaKey: msg.mediaKey || `sticker_${msg.id?.id || Date.now()}`,
+                filename: 'sticker.png',
+              });
+              stmts.markMessageHasMedia.run(messageId);
+            }
+          } catch (stickerErr) {
+            console.error('[whatsapp] Error procesando sticker:', stickerErr.message);
+          }
+        }
+      } else {
+        await saveInteraction(fakeReq, mockRes, () => {}, mediaInfo);
+      }
 
       marcarNovedad(resolvedBody);
 
@@ -541,28 +577,23 @@ async function downloadAndProcessMedia(msg) {
 
     const { data, mimetype, filename } = media;
     const buffer = Buffer.from(data, 'base64');
-    const ext = mimetype?.split('/')[1]?.replace('jpeg', 'jpg') || 'jpg';
-
-    const publicDir = join(process.cwd(), 'public', 'media');
-    mkdirSync(publicDir, { recursive: true });
 
     const mediaKey = msg.mediaKey || `msg_${msg.id?.id || Date.now()}`;
-    const originalPath = join(publicDir, `orig_${mediaKey}.${ext}`);
-    const targetDir = dirname(originalPath);
-    if (!existsSync(targetDir)) {
-      mkdirSync(targetDir, { recursive: true });
-    }
-    writeFileSync(originalPath, buffer);
 
-    console.log(`[whatsapp] Media descargada: mediaKey=${mediaKey}, size=${buffer.length}`);
+    const saved = await saveImageVersions(mediaKey, buffer);
+
+    console.log(`[whatsapp] Media descargada: mediaKey=${saved.mediaKey}, orig=${buffer.length}, full=${saved.fullSize}, view=${saved.viewSize}, thumb=${saved.thumbSize}`);
 
     return {
       hasMedia: true,
-      mediaKey,
-      mimeType: mimetype,
-      filename: filename || `media_${Date.now()}`,
+      mediaKey: saved.mediaKey,
+      mimeType: mimetype || 'image/jpeg',
+      filename: filename || `media_${Date.now()}.jpg`,
       bufferLength: buffer.length,
-      originalPath,
+      originalPath: saved.fullPath,
+      filePathFull: saved.fullRel,
+      filePathView: saved.viewRel,
+      filePathThumb: saved.thumbRel,
     };
   } catch (err) {
     console.error('[whatsapp] Error downloadAndProcessMedia:', err.message);

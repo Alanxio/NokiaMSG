@@ -98,6 +98,8 @@ export async function showUserMessages(req, res, next) {
         let contentPart;
         if (message.has_media && message.file_path_thumb) {
           contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
+        } else if (Number(message.is_sticker) === 1) {
+          contentPart = '<i>[Sticker]</i>';
         } else {
           contentPart = renderMentions(message.text);
         }
@@ -107,8 +109,7 @@ export async function showUserMessages(req, res, next) {
         const fromMeMarker = isSaliente ? '<font color="#006600">[Yo]</font> ' : '';
 
         messagesHtml +=
-          `<p><a href="/mensaje/${message.id}">Ver</a><br/>` +
-          `${unseenMarker}${fromMeMarker}${escapeXml(sentAt)}${groupPart}<br/>` +
+          `<p>${unseenMarker}${fromMeMarker}${escapeXml(sentAt)}${groupPart}<br/>` +
           `${contentPart}<br/>----------</p>`;
       });
     }
