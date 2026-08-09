@@ -16,6 +16,7 @@ const RECONNECT_BASE_DELAY = 5000;
 const RECONNECT_MAX_DELAY = 30000;
 const RECONNECT_MAX_ATTEMPTS = 3;
 const AUTH_READY_TIMEOUT = 25000;
+const SEND_SEEN_RETRY_DELAY_MS = 250;
 
 export let client = null;
 let currentQr = null;
@@ -62,6 +63,50 @@ async function syncChatsMetadata() {
   // Sincronización deshabilitada: usuarios y grupos se crean dinámicamente
   // cuando se recibe el primer mensaje de ellos
   console.log('[whatsapp] 🔄 Modo dinámico: usuarios y grupos se crearán al recibir mensajes.');
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendSeenWithFallback(chatId) {
+  const strategies = [
+    {
+      name: 'direct',
+      run: async () => client.sendSeen(chatId),
+    },
+    {
+      name: 'chat',
+      run: async () => {
+        const chat = await client.getChatById(chatId);
+        if (!chat) {
+          throw new Error('Chat no encontrado en WhatsApp');
+        }
+        return chat.sendSeen();
+      },
+    },
+  ];
+
+  let lastError = null;
+
+  for (const strategy of strategies) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const result = await strategy.run();
+        if (strategy.name !== 'direct' || attempt > 1) {
+          console.debug(`[whatsapp] Visto enviado a ${chatId} usando ${strategy.name} (reintento ${attempt}).`);
+        }
+        return result;
+      } catch (err) {
+        lastError = err;
+        if (attempt < 2) {
+          await delay(SEND_SEEN_RETRY_DELAY_MS);
+        }
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 function scheduleReconnect() {
@@ -369,8 +414,21 @@ export async function startWhatsappClient(processMessageFn) {
     }
 
     try {
-      const chat = await msg.getChat();
-      const isGroup = chat.isGroup;
+      const chatId = msg.from || null;
+      let chat = null;
+      let isGroup = Boolean(chatId && chatId.endsWith('@g.us'));
+
+      try {
+        chat = await msg.getChat();
+        if (typeof chat?.isGroup === 'boolean') {
+          isGroup = chat.isGroup;
+        }
+      } catch (chatErr) {
+        console.debug(
+          `[whatsapp] No se pudo resolver el chat de ${chatId || 'desconocido'}, usando fallback:`,
+          chatErr?.message || chatErr
+        );
+      }
 
       // Resolver menciones en mensajes de grupo (solo mensajes nuevos)
       let resolvedBody = msg.body;
@@ -388,12 +446,12 @@ export async function startWhatsappClient(processMessageFn) {
       let title, senderName, groupName;
 
       if (isGroup) {
-        groupName = chat.name || 'Grupo sin nombre';
+        groupName = chat?.name || chatId?.replace(/@.*$/, '') || 'Grupo sin nombre';
         try {
           const contact = await msg.getContact();
-          senderName = contact.name || contact.pushname || contact.verifiedName || contact.shortName || 'Desconocido';
+          senderName = contact.name || contact.pushname || contact.verifiedName || contact.shortName || msg.author?.replace(/@.*$/, '') || 'Desconocido';
         } catch {
-          senderName = 'Desconocido';
+          senderName = msg.author?.replace(/@.*$/, '') || 'Desconocido';
         }
         title = `${groupName}:${senderName}`;
       } else {
@@ -421,6 +479,8 @@ export async function startWhatsappClient(processMessageFn) {
           sender_chat_id: senderChatId,
           whatsapp_msg_id: whatsappMsgId,
           from_me: msg.fromMe ? 1 : 0,
+          chat_type: isGroup ? 'group' : 'user',
+          is_group: isGroup ? 1 : 0,
         },
       };
 
@@ -463,7 +523,7 @@ export async function startWhatsappClient(processMessageFn) {
       marcarNovedad(resolvedBody);
 
     } catch (err) {
-      console.error('[whatsapp] Error en message_create:', err.message);
+      console.error('[whatsapp] Error en message_create:', err?.stack || err?.message || err);
     }
   });
 
@@ -695,16 +755,11 @@ export async function sendWhatsappSeen(chatId) {
   }
 
   try {
-    const chat = await client.getChatById(chatId);
-    if (!chat) {
-      return { success: false, code: 'CHAT_NOT_FOUND' };
-    }
-
-    const result = await chat.sendSeen();
-    console.log(`[whatsapp] ✓ Visto enviado a ${chatId}:`, result);
+    const result = await sendSeenWithFallback(chatId);
+    console.debug(`[whatsapp] ✓ Visto enviado a ${chatId}.`);
     return { success: true, result };
   } catch (err) {
-    console.error(`[whatsapp] Error enviando visto a ${chatId}:`, err.message);
+    console.warn(`[whatsapp] No se pudo enviar visto a ${chatId}:`, err?.message || err);
     return { success: false, error: err.message || 'Error desconocido', code: 'SEND_ERROR' };
   }
 }

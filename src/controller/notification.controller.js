@@ -147,7 +147,8 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       return;
     }
 
-    const { daySend, hourSend, usedFallback } = buildNotificationTimestamps(date, time);
+    const { daySend, hourSend: initialHourSend, usedFallback } = buildNotificationTimestamps(date, time);
+    let hourSend = initialHourSend;
     if (usedFallback) console.log('[DB] Fecha/hora no válida, usando actual.');
 
     if (hourSend && (hourSend.includes('00:00:00') || hourSend === '00:00' || hourSend === '00:00:00')) {
@@ -165,8 +166,12 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
     try {
       let finalGroupId = null;
       let finalUserChatId = null;
+      const explicitType = typeof payload.chat_type === 'string' ? payload.chat_type.trim().toLowerCase() : '';
+      const explicitIsGroup = payload.is_group === 1 || payload.is_group === true || payload.is_group === 'true';
+      const explicitIsUser = payload.is_group === 0 || payload.is_group === false || payload.is_group === 'false';
+      const hasExplicitType = explicitType === 'group' || explicitType === 'user' || explicitIsGroup || explicitIsUser;
 
-      if (isGroup) {
+      if (hasExplicitType ? (explicitType === 'group' || explicitIsGroup) : isGroup) {
         const existingGroup = stmts.getGroupByName.get(nameOrGroupName);
         if (existingGroup) {
           finalGroupId = existingGroup.group_id;

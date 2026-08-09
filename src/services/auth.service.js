@@ -40,9 +40,24 @@ const LOCK_DURATION_MS    = 10 * 60 * 1000;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 export function getClientIp(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) return forwarded.split(',')[0].trim();
-  return req.socket.remoteAddress || 'unknown';
+  const normalizeIp = (ip) => {
+    if (!ip) return 'unknown';
+    if (typeof ip !== 'string') return String(ip);
+    // IPv4-mapped IPv6 addresses like ::ffff:172.19.0.1 -> strip prefix
+    if (ip.startsWith('::ffff:')) return ip.slice(7);
+    // Remove surrounding brackets for IPv6 if present
+    if (ip.startsWith('[') && ip.endsWith(']')) return ip.slice(1, -1);
+    return ip;
+  };
+
+  const forwarded = req.headers['x-forwarded-for'] || req.headers['X-Forwarded-For'];
+  if (forwarded) {
+    const first = Array.isArray(forwarded) ? forwarded[0] : forwarded.split(',')[0];
+    return normalizeIp(first.trim());
+  }
+
+  const remote = req.socket?.remoteAddress || req.connection?.remoteAddress || null;
+  return normalizeIp(remote);
 }
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
