@@ -1,14 +1,16 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { getUsersPresence, sendWhatsappSeen } from '../services/whatsapp.service.js';
+import { getUsersPresence, sendWhatsappSeen, resolveContactPhone } from '../services/whatsapp.service.js';
 import {
   DIRECTORY_PAGE_SIZE,
   MESSAGE_PAGE_SIZE,
   escapeXml,
+  formatPhoneNumber,
   getTotal,
   renderList,
   renderMentions,
   renderPager,
+  renderPhoneLink,
   sendInvalidEntity,
   sendMissingEntity,
   sendPage,
@@ -114,8 +116,18 @@ export async function showUserMessages(req, res, next) {
       });
     }
 
+    let phone = null;
+    if (user.chat_id && user.chat_id.endsWith('@lid')) {
+      phone = await resolveContactPhone(user.chat_id);
+    }
+    if (!phone) {
+      phone = formatPhoneNumber(user.chat_id, user.username);
+    }
+    const phoneHtml = phone ? `<p style="margin-top:-5px;margin-bottom:5px;">${renderPhoneLink(phone)}</p>` : '';
+
     const body =
       `<h1>${escapeXml(user.username)}${onlineTag}</h1>` +
+      phoneHtml +
       '<p><a href="/">Inicio</a> | <a href="/usuario">Usuarios</a></p>' +
       `<p><a href="/mensaje/componer?to=${encodeURIComponent(user.chat_id)}&type=user"><b>[Enviar mensaje]</b></a></p>` +
       renderPager(`/usuario/${user.chat_id}`, page, totalPages) +

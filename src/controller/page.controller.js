@@ -1,3 +1,5 @@
+import { stmts } from '../../db/db.js';
+
 export const DIRECTORY_PAGE_SIZE = 20;
 export const MESSAGE_PAGE_SIZE = 12;
 
@@ -18,16 +20,65 @@ export function nl2br(value = '') {
   return escapeXml(value).replace(/\r?\n/g, '<br/>');
 }
 
+export function formatPhoneNumber(chatId = '', username = '') {
+  if (!chatId && !username) return null;
+  const digitsFromChatId = chatId ? String(chatId).split('@')[0].replace(/[^0-9]/g, '') : '';
+  const digitsFromUsername = username ? String(username).replace(/[^0-9]/g, '') : '';
+
+  const digits = digitsFromChatId.length >= 8 ? digitsFromChatId : digitsFromUsername;
+  if (digits.length >= 8) {
+    return `+${digits}`;
+  }
+  return null;
+}
+
+export function isNumericOrJid(value = '') {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+
+  if (trimmed.includes('@')) {
+    return true;
+  }
+
+  const digits = trimmed.replace(/[^0-9]/g, '');
+  return digits.length >= 8;
+}
+
+export function renderPhoneLink(phone) {
+  if (!phone) return '';
+  const cleanNumber = phone.replace(/[^0-9+]/g, '');
+  return `<font size="1" color="#666666">(<a href="wtai://wp/mc;${escapeXml(cleanNumber)}"><font color="#666666">${escapeXml(phone)}</font></a>)</font>`;
+}
+
 // Dominios comunes en España: si un @termina en uno de estos, lo tratamos como correo, no mención.
 const EMAIL_DOMAIN_RE = /\.(com|es|org|net|info|eu)$/i;
 
 export function renderMentions(value = '') {
+  if (!value) return '';
   const escaped = escapeXml(value).replace(/\r?\n/g, '<br/>');
-  // Palabra o grupo de palabras separadas por un espacio.
-  // Cada palabra debe tener al menos 2 caracteres para evitar capturar conectores sueltos.
+
   return escaped.replace(
     /(@[A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,}(?: [A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,})*)/g,
-    (match) => EMAIL_DOMAIN_RE.test(match) ? match : `<font color="#003399">${match}</font>`
+    (match) => {
+      if (EMAIL_DOMAIN_RE.test(match)) {
+        return match;
+      }
+
+      let display = match;
+      // Si la mención contiene un número de teléfono (ej. @34612345678 o @521...), buscar nombre en BD
+      const phoneCandidate = match.slice(1).replace(/[^0-9]/g, '');
+      if (phoneCandidate.length >= 8) {
+        try {
+          const row = stmts.getUserByPhonePattern ? stmts.getUserByPhonePattern.get(`${phoneCandidate}%`) : null;
+          if (row && row.username && row.username !== phoneCandidate && !row.username.startsWith('+')) {
+            display = `@${escapeXml(row.username)}`;
+          }
+        } catch (e) { }
+      }
+
+      return `<font color="#000099"><b>${display}</b></font>`;
+    }
   );
 }
 

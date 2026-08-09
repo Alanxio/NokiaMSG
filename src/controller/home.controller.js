@@ -1,6 +1,7 @@
 import db, { stmts } from '../../db/db.js';
 import { sendPage, escapeXml } from './page.controller.js';
 import { getConnectionStatus, getUsersPresence, sendWhatsappSeen } from '../services/whatsapp.service.js';
+import { ensureGroupDisplayName } from './group.controller.js';
 
 const USER_ICON_HTML = '<img src="/assets/user.jpeg" alt="U" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
 const GROUP_ICON_HTML = '<img src="/assets/group.jpeg" alt="G" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
@@ -10,9 +11,11 @@ export async function showHome(req, res, next) {
     const recentUsers = stmts.getRecentUsersWithUnseen.all(10);
     const recentGroups = stmts.getRecentGroupsWithUnseen.all(10);
 
+    const resolvedRecentGroups = await Promise.all(recentGroups.map(ensureGroupDisplayName));
+
     const recentItems = [
       ...recentUsers.map(u => ({ type: 'user', id: u.chat_id, name: u.username, chat_id: u.chat_id, unseen_count: u.unseen_count, last_message: u.last_message })),
-      ...recentGroups.map(g => ({ type: 'group', id: g.group_id, name: g.group_name, chat_id: null, unseen_count: g.unseen_count, last_message: g.last_message })),
+      ...resolvedRecentGroups.map(g => ({ type: 'group', id: g.group_id, name: g.group_name, chat_id: null, unseen_count: g.unseen_count, last_message: g.last_message })),
     ].sort((a, b) => {
       const aTime = a.last_message || '';
       const bTime = b.last_message || '';

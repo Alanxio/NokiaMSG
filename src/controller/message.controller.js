@@ -1,14 +1,26 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { escapeXml, sendPage } from './page.controller.js';
+import { escapeXml, formatPhoneNumber, isNumericOrJid, renderMentions, renderPhoneLink, sendPage } from './page.controller.js';
 import { processAndAttachMedia } from '../utils/media.js';
 import multer from 'multer';
 import pkg from 'whatsapp-web.js';
 
 const { MessageMedia } = pkg;
 
+function normalizeGroupName(rawName) {
+  if (typeof rawName !== 'string' || !rawName.trim()) {
+    return null;
+  }
+  const trimmed = rawName.trim();
+  if (isNumericOrJid(trimmed)) {
+    return null;
+  }
+  return trimmed.slice(0, 100);
+}
+
 // Asegúrate de que esta ruta apunte correctamente a donde exportas el cliente
 import { client } from '../services/whatsapp.service.js';
+import { ensureGroupDisplayName } from './group.controller.js';
 
 export const upload = multer({
   storage: multer.memoryStorage(),
@@ -45,9 +57,10 @@ export async function renderComposePage(req, res, next) {
           urlCancelar = '/usuario';
         }
       } else if (type === 'group') {
-        const g = db.prepare('SELECT group_name FROM wgroups WHERE group_id = ?').get(to);
+        const g = db.prepare('SELECT group_id, group_name FROM wgroups WHERE group_id = ?').get(to);
         if (g) {
-          destinoNombre = g.group_name;
+          const resolvedGroup = await ensureGroupDisplayName(g);
+          destinoNombre = resolvedGroup.group_name;
           urlCancelar = `/grupo/${encodeURIComponent(to)}`;
         } else {
           urlCancelar = '/grupo';
@@ -55,6 +68,27 @@ export async function renderComposePage(req, res, next) {
       }
 
       let body = `<h1>Para: ${escapeXml(destinoNombre)}</h1>`;
+
+      if (type === 'group') {
+        try {
+          const participants = db.prepare(`
+            SELECT DISTINCT u.chat_id, u.username FROM group_participants gp
+            JOIN users u ON u.chat_id = gp.user_chat_id
+            WHERE gp.group_id = ? AND u.username IS NOT NULL AND u.username != ''
+            ORDER BY u.username ASC
+            LIMIT 15
+          `).all(to);
+
+          if (participants && participants.length > 0) {
+            body += `<p><font size="1" color="#555555">Mencionar en grupo:</font><br/>`;
+            body += participants.map(p => {
+              const textWithMention = (textoPrevio ? textoPrevio + ' ' : '') + '@' + p.username + ' ';
+              return `<a href="/mensaje/componer?to=${encodeURIComponent(to)}&type=group&text=${encodeURIComponent(textWithMention)}">@${escapeXml(p.username)}</a>`;
+            }).join(' | ');
+            body += `</p>`;
+          }
+        } catch (e) {}
+      }
 
       body += `
         <form action="/mensaje/validar-y-crear" method="POST" enctype="multipart/form-data">
@@ -98,41 +132,40 @@ export async function renderComposePage(req, res, next) {
       const allContacts = await client.getContacts();
       const uniqueContactsMap = new Map();
 
+      function normalizeContactName(value) {
+        return value ? String(value).trim().toLowerCase() : '';
+      }
+
+      function shouldPreferCandidate(existing, candidate) {
+        if (existing.isBusiness && !candidate.isBusiness) return true;
+        if (existing.isMyContact !== candidate.isMyContact) return candidate.isMyContact;
+        if (existing.hasRealName !== candidate.hasRealName) return candidate.hasRealName;
+        if (existing.isLid && !candidate.isLid) return true;
+        return false;
+      }
+
       allContacts.forEach(c => {
         if (c.isUser && !c.isMe && c.number) {
           const basePhone = c.number.split(':')[0].trim();
-          
-          // Construir el chatId real respetando si es @c.us o @lid
           const server = c.id && c.id.server ? c.id.server : 'c.us';
-          const baseChatId = `${basePhone}@${server}`;
-          
+          const chatId = `${basePhone}@${server}`;
           const displayName = (c.name || c.pushname || c.shortName || `+${basePhone}`).trim();
-
-          // Usamos el nombre de la agenda como clave primaria de deduplicación si existe.
-          // Si no existe nombre, usamos el teléfono para no agrupar gente sin nombre.
-          const dedupKey = c.name ? c.name.trim().toLowerCase() : basePhone;
+          const dedupKey = c.name ? normalizeContactName(c.name) : basePhone;
+          const candidate = {
+            chatId,
+            displayName,
+            hasRealName: !!c.name,
+            isBusiness: !!c.isBusiness,
+            isMyContact: !!c.isMyContact,
+            isLid: server === 'lid' || basePhone.length > 14,
+          };
 
           if (!uniqueContactsMap.has(dedupKey)) {
-            uniqueContactsMap.set(dedupKey, { 
-              chatId: baseChatId, 
-              displayName: displayName, 
-              hasRealName: !!c.name,
-              isLid: server === 'lid' || basePhone.length > 14
-            });
+            uniqueContactsMap.set(dedupKey, candidate);
           } else {
             const existingContact = uniqueContactsMap.get(dedupKey);
-            const isCurrentLid = server === 'lid' || basePhone.length > 14;
-            
-            // Si el contacto guardado es LID y el actual NO lo es, sobreescribimos con el real
-            if (existingContact.isLid && !isCurrentLid) {
-              existingContact.chatId = baseChatId;
-              existingContact.isLid = false;
-            }
-            
-            // Si el actual tiene nombre de agenda y el guardado no, actualizamos el nombre
-            if (c.name && !existingContact.hasRealName) {
-              existingContact.displayName = displayName;
-              existingContact.hasRealName = true;
+            if (shouldPreferCandidate(existingContact, candidate)) {
+              uniqueContactsMap.set(dedupKey, candidate);
             }
           }
         }
@@ -238,7 +271,7 @@ export async function validateAndCreateChat(req, res, next) {
       );
     }
 
-    const processedText = hasText ? convertEmojisToAscii(trimmedText) : '';
+    let processedText = hasText ? convertEmojisToAscii(trimmedText) : '';
 
     let targetJid = phone.trim();
 
@@ -259,15 +292,73 @@ export async function validateAndCreateChat(req, res, next) {
     // =========================================================================
     // 2. Enviar mensaje de texto, imagen o imagen con caption
     // =========================================================================
+    const options = {};
+    if (type === 'group' || targetJid.endsWith('@g.us')) {
+      const mentionRegex = /@[A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,}/g;
+      const mentionMatches = processedText.match(mentionRegex);
+      if (mentionMatches && mentionMatches.length > 0) {
+        const mentionedJids = [];
+        // Mapa texto-original -> "@<digitos>", que es el formato que WhatsApp
+        // necesita en el cuerpo del mensaje para reconocer y resaltar la mención
+        // en el dispositivo del destinatario (no basta con pasar `mentions`).
+        const textReplacements = new Map();
+        for (const match of mentionMatches) {
+          if (textReplacements.has(match)) continue;
+          const cleanName = match.slice(1).trim();
+          const cleanDigits = cleanName.replace(/[^0-9]/g, '');
+          let user = db.prepare('SELECT chat_id FROM users WHERE username = ? LIMIT 1').get(cleanName);
+          if (!user && cleanDigits.length >= 8) {
+            user = db.prepare('SELECT chat_id FROM users WHERE chat_id LIKE ? LIMIT 1').get(`${cleanDigits}%`);
+          }
+          if (user && user.chat_id) {
+            if (!mentionedJids.includes(user.chat_id)) {
+              mentionedJids.push(user.chat_id);
+            }
+            textReplacements.set(match, `@${user.chat_id.split('@')[0]}`);
+          }
+        }
+        if (textReplacements.size > 0) {
+          processedText = processedText.replace(mentionRegex, (m) => textReplacements.get(m) || m);
+        }
+        if (mentionedJids.length > 0) {
+          options.mentions = mentionedJids;
+        }
+      }
+
+      const existingGroup = stmts.getGroupById.get(targetJid);
+      const existingIsRaw = existingGroup ? isNumericOrJid(existingGroup.group_name) : false;
+      let nameToSave = existingGroup ? existingGroup.group_name : null;
+
+      if (!nameToSave || existingIsRaw) {
+        let candidateName = targetJid.replace(/@.*$/, '');
+        if (client) {
+          try {
+            const chat = await client.getChatById(targetJid);
+            if (chat?.name && !isNumericOrJid(chat.name)) {
+              candidateName = chat.name;
+            }
+          } catch (e) {
+            // Ignorar error de resolución de grupo.
+          }
+        }
+        const normalizedName = normalizeGroupName(candidateName) || 'Grupo sin nombre';
+        nameToSave = normalizedName;
+      }
+
+      if (!existingGroup || existingGroup.group_name !== nameToSave) {
+        stmts.upsertGroup.run(targetJid, nameToSave);
+      }
+    }
+
     if (hasImage) {
       const media = new MessageMedia(
         imageFile.mimetype,
         imageFile.buffer.toString('base64'),
         imageFile.originalname
       );
-      await client.sendMessage(targetJid, media, { caption: processedText });
+      await client.sendMessage(targetJid, media, { ...options, caption: processedText });
     } else {
-      await client.sendMessage(targetJid, processedText);
+      await client.sendMessage(targetJid, processedText, options);
     }
 
     // CONTROL ESTRICTO DE FECHA/HORA EN FORMATO SQLITE ("YYYY-MM-DD HH:MM:SS")
@@ -305,7 +396,7 @@ export async function validateAndCreateChat(req, res, next) {
         try {
           const contact = await client.getContactById(targetJid);
           if (contact) {
-            finalName = contact.name || contact.pushname || contact.verifiedName || contact.shortName || finalName;
+            finalName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || finalName;
           }
         } catch (e) {}
         stmts.upsertUser.run(targetJid, finalName);
@@ -376,12 +467,15 @@ export async function showMessageDetail(req, res, next) {
     let backUrl = '/';
 
     if (message.group_id) {
-      fromToLabel = `Grupo: ${escapeXml(message.group_name || 'Grupo sin nombre')}`;
+      const resolvedGroup = await ensureGroupDisplayName({ group_id: message.group_id, group_name: message.group_name });
+      fromToLabel = `Grupo: ${escapeXml(resolvedGroup.group_name || 'Grupo sin nombre')}`;
       backUrl = `/grupo/${encodeURIComponent(message.group_id)}`;
     } else if (message.user_chat_id) {
       const isOutgoing = Number(message.from_me) === 1;
       const name = escapeXml(message.username || message.user_chat_id.replace(/@.*$/, ''));
-      fromToLabel = isOutgoing ? `Para: ${name}` : `De: ${name}`;
+      const phone = formatPhoneNumber(message.user_chat_id, message.username);
+      const phoneLink = phone ? ` ${renderPhoneLink(phone)}` : '';
+      fromToLabel = isOutgoing ? `Para: ${name}` : `De: ${name}${phoneLink}`;
       backUrl = `/usuario/${encodeURIComponent(message.user_chat_id)}`;
     }
 
@@ -401,9 +495,9 @@ export async function showMessageDetail(req, res, next) {
     }
 
     if (message.text && message.text !== '[Imagen]') {
-      contentHtml += `<p>${escapeXml(message.text)}</p>`;
+      contentHtml += `<p>${renderMentions(message.text)}</p>`;
     } else if (!attachment?.file_path_view && !isSticker) {
-      contentHtml += `<p>${escapeXml(message.text || '')}</p>`;
+      contentHtml += `<p>${renderMentions(message.text || '')}</p>`;
     }
 
     if (!isSticker && attachment?.file_path_full) {

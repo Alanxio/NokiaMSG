@@ -3,11 +3,12 @@ import qrcode from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import { existsSync, writeFileSync, unlinkSync, statSync, rmSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
-import db, { stmts } from '../../db/db.js';
+import { stmts } from '../../db/db.js';
 import { saveInteraction } from '../controller/notification.controller.js';
 import { marcarNovedad } from './polling.service.js';
 import { resolveMentions } from '../utils/mentions.js';
 import { saveImageVersions, processSticker } from '../utils/media.js';
+import { resolvePendingGroupNames } from '../controller/group.controller.js';
 
 const { Client, LocalAuth } = pkg;
 
@@ -31,6 +32,59 @@ let readyPollInterval = null;
 
 const activeChatsSinceStart = new Set();
 
+export async function resolveContactPhone(chatId) {
+  if (!client || !chatId || typeof chatId !== 'string') return null;
+  const cleanChatId = chatId.trim();
+
+  try {
+    if (cleanChatId.endsWith('@lid') && typeof client.getContactLidAndPhone === 'function') {
+      const [result] = await client.getContactLidAndPhone([cleanChatId]);
+      const rawPhone = result?.pn && typeof result.pn === 'string'
+        ? result.pn
+        : result?.pn?._serialized;
+      if (rawPhone) {
+        const digits = String(rawPhone).replace(/[^0-9]/g, '');
+        if (digits.length >= 8) {
+          return `+${digits}`;
+        }
+      }
+    }
+
+    if (typeof client.getContactById === 'function') {
+      const contact = await client.getContactById(cleanChatId);
+      if (contact) {
+        const candidateNumbers = [];
+        if (typeof contact.number === 'string' && contact.number.trim()) {
+          candidateNumbers.push(contact.number);
+        }
+        if (typeof contact.getFormattedNumber === 'function') {
+          try {
+            const formatted = await contact.getFormattedNumber();
+            if (formatted) candidateNumbers.push(formatted);
+          } catch {
+            // Ignorar error de formato
+          }
+        }
+        if (typeof contact.id === 'object' && contact.id?._serialized) {
+          candidateNumbers.push(contact.id._serialized);
+        }
+
+        for (const candidate of candidateNumbers) {
+          if (!candidate) continue;
+          const digits = String(candidate).replace(/[^0-9]/g, '');
+          if (digits.length >= 8) {
+            return `+${digits}`;
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignorar cualquier error de resolución del contacto.
+  }
+
+  return null;
+}
+
 function formatWhatsappTimestamp(timestamp) {
   if (!timestamp) {
     const now = new Date();
@@ -53,16 +107,83 @@ function cleanStaleLocks() {
     if (!existsSync(sessionDir)) return;
     for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
       const p = join(sessionDir, name);
-      try { unlinkSync(p); } catch {}
+      try { unlinkSync(p); } catch { }
     }
     console.log('[whatsapp] Lock files limpiados.');
-  } catch {}
+  } catch { }
 }
 
 async function syncChatsMetadata() {
   // Sincronización deshabilitada: usuarios y grupos se crean dinámicamente
   // cuando se recibe el primer mensaje de ellos
   console.log('[whatsapp] 🔄 Modo dinámico: usuarios y grupos se crearán al recibir mensajes.');
+}
+
+// client.getChats() (whatsapp-web.js@1.34.7) construye el modelo COMPLETO de cada
+// chat con Promise.all — y ese modelo completo intenta refrescar metadatos de grupo
+// vía "groupMetadata.update()", una llamada que falla con un error interno opaco de
+// la propia web de WhatsApp para algunos grupos (ver resolveGroupNameFromWhatsapp en
+// group.controller.js). Como Promise.all aborta entero si UNA sola promesa falla,
+// un solo grupo problemático tira abajo la sincronización de TODOS los chats. Aquí
+// se lee la lista de chats "en crudo" (id, si es grupo, contador de no leídos), que
+// no depende de esa llamada, así que no se ve afectada por ese bug.
+async function getChatUnreadSummariesDirectly() {
+  if (!client?.pupPage) return [];
+  try {
+    return await client.pupPage.evaluate(() => {
+      const chats = window.require('WAWebCollections').Chat.getModelsArray();
+      return chats.map((chat) => ({
+        id: chat.id?._serialized || null,
+        isGroup: !!chat.groupMetadata,
+        unreadCount: typeof chat.unreadCount === 'number' ? chat.unreadCount : 0,
+      }));
+    });
+  } catch (err) {
+    console.warn('[whatsapp] getChatUnreadSummariesDirectly falló:', err?.name, err?.message);
+    return [];
+  }
+}
+
+async function applyChatUnreadCount(chat) {
+  const chatId = chat.id?._serialized || chat.id;
+  if (!chatId || typeof chatId !== 'string') return;
+  const unreadCount = typeof chat.unreadCount === 'number' ? chat.unreadCount : 0;
+
+  if (chat.isGroup || chatId.endsWith('@g.us')) {
+    stmts.updateGroupUnseen.run(unreadCount, chatId);
+    return;
+  }
+
+  const baseDigits = chatId.split('@')[0];
+  const result = stmts.updateUserUnseen.run(unreadCount, chatId, `${baseDigits}@%`);
+
+  if (result.changes === 0) {
+    // El usuario puede estar guardado en BD bajo un identificador distinto al que
+    // reporta este evento (WhatsApp puede identificar el mismo chat como @lid en un
+    // sitio y como @c.us en otro). Sin esto, el estado de "leído" de esa conversación
+    // se queda desincronizado entre dispositivos porque nunca encontramos la fila a
+    // actualizar.
+    const altPhone = await resolveContactPhone(chatId);
+    if (altPhone) {
+      const altDigits = altPhone.replace(/[^0-9]/g, '');
+      if (altDigits && altDigits !== baseDigits) {
+        stmts.updateUserUnseen.run(unreadCount, `${altDigits}@c.us`, `${altDigits}@%`);
+      }
+    }
+  }
+}
+
+export async function syncUnreadCountsFromWhatsapp() {
+  if (!client || connectionStatus !== 'connected') return;
+  try {
+    const chats = await getChatUnreadSummariesDirectly();
+    for (const chat of chats) {
+      if (chat.id) await applyChatUnreadCount(chat);
+    }
+    console.log(`[whatsapp] 🔄 Sincronizados contadores de no leídos con WhatsApp (${chats.length} chats).`);
+  } catch (err) {
+    console.warn('[whatsapp] Error sincronizando unread counts:', err.message);
+  }
 }
 
 function delay(ms) {
@@ -121,7 +242,7 @@ function scheduleReconnect() {
         rmSync(sessionDir, { recursive: true, force: true });
         console.log('[whatsapp] Sesion eliminada.');
       }
-    } catch {}
+    } catch { }
     return;
   }
 
@@ -262,7 +383,7 @@ export async function startWhatsappClient(processMessageFn) {
           lastStatusChange = new Date().toISOString();
           currentQr = null;
           reconnectAttempts = 0;
-          try { writeFileSync('assets/qr.png', ''); } catch {}
+          try { writeFileSync('assets/qr.png', ''); } catch { }
         }
         if (pollCount >= MAX_POLLS) {
           clearInterval(readyPollInterval);
@@ -286,7 +407,7 @@ export async function startWhatsappClient(processMessageFn) {
         const oldClient = client;
         client = null;
         oldClient.removeAllListeners();
-        try { await oldClient.destroy(); } catch {}
+        try { await oldClient.destroy(); } catch { }
         hasEverAuthenticated = false;
         connectionStatus = 'waiting_qr';
         lastStatusChange = new Date().toISOString();
@@ -296,10 +417,10 @@ export async function startWhatsappClient(processMessageFn) {
             rmSync(sessionDir, { recursive: true, force: true });
             console.log('[whatsapp] Sesion eliminada. Reiniciando con QR limpio...');
           }
-        } catch {}
+        } catch { }
         try {
           await startWhatsappClient(storedProcessMessageFn);
-        } catch {}
+        } catch { }
       }
     }, AUTH_READY_TIMEOUT);
   });
@@ -312,7 +433,7 @@ export async function startWhatsappClient(processMessageFn) {
     lastStatusChange = new Date().toISOString();
     currentQr = null;
     reconnectAttempts = 0;
-    try { writeFileSync('assets/qr.png', ''); } catch {}
+    try { writeFileSync('assets/qr.png', ''); } catch { }
 
     const maxRetries = 5;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -351,6 +472,32 @@ export async function startWhatsappClient(processMessageFn) {
 
     // Sincronizar metadatos (actualmente deshabilitado - modo dinámico)
     await syncChatsMetadata();
+    // Sincronizar contadores de no leídos con WhatsApp al conectar
+    await syncUnreadCountsFromWhatsapp();
+    // Reintentar la resolución de nombres de grupo que quedaron como ID/placeholder
+    // (p. ej. porque fallaron en su momento al no estar el chat aún cacheado).
+    try {
+      const results = await resolvePendingGroupNames();
+      const updated = results.filter((r) => r.status === 'actualizado');
+      console.log(`[whatsapp] 🏷 Resolución de nombres de grupo: ${updated.length}/${results.length} corregidos.`);
+      if (updated.length > 0) {
+        console.log(`[whatsapp] 🏷 Nombres de grupo corregidos: ${updated.map((r) => `${r.group_id}→${r.new_name}`).join(', ')}`);
+      }
+    } catch (err) {
+      console.warn('[whatsapp] Error resolviendo nombres de grupo pendientes:', err.message);
+    }
+  });
+
+  client.on('unread_count', async (chat) => {
+    try {
+      const chatId = chat.id?._serialized || chat.id;
+      if (!chatId) return;
+      const unreadCount = typeof chat.unreadCount === 'number' ? chat.unreadCount : 0;
+      await applyChatUnreadCount(chat);
+      console.log(`[whatsapp] 👁 Sincronizado estado de lectura para ${chatId}: unreadCount = ${unreadCount}`);
+    } catch (err) {
+      console.warn('[whatsapp] Error en evento unread_count:', err.message);
+    }
   });
 
   client.on('disconnected', (reason) => {
@@ -449,7 +596,7 @@ export async function startWhatsappClient(processMessageFn) {
         groupName = chat?.name || chatId?.replace(/@.*$/, '') || 'Grupo sin nombre';
         try {
           const contact = await msg.getContact();
-          senderName = contact.name || contact.pushname || contact.verifiedName || contact.shortName || msg.author?.replace(/@.*$/, '') || 'Desconocido';
+          senderName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || msg.author?.replace(/@.*$/, '') || 'Desconocido';
         } catch {
           senderName = msg.author?.replace(/@.*$/, '') || 'Desconocido';
         }
@@ -458,7 +605,7 @@ export async function startWhatsappClient(processMessageFn) {
         groupName = null;
         try {
           const contact = await msg.getContact();
-          senderName = contact.name || contact.pushname || contact.verifiedName || contact.shortName || msg.from.replace(/@.*$/, '') || 'Desconocido';
+          senderName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || msg.from.replace(/@.*$/, '') || 'Desconocido';
         } catch {
           senderName = msg.from.replace(/@.*$/, '') || 'Desconocido';
         }
@@ -481,6 +628,10 @@ export async function startWhatsappClient(processMessageFn) {
           from_me: msg.fromMe ? 1 : 0,
           chat_type: isGroup ? 'group' : 'user',
           is_group: isGroup ? 1 : 0,
+          // Evita depender de partir "title" por ":" (frágil si el nombre del
+          // grupo o del remitente contiene ese carácter).
+          group_name: isGroup ? groupName : undefined,
+          sender_name: senderName,
         },
       };
 
@@ -499,7 +650,7 @@ export async function startWhatsappClient(processMessageFn) {
             is_sticker: 1,
           },
         };
-        const messageId = await saveInteraction(stickerReq, mockRes, () => {}, null);
+        const messageId = await saveInteraction(stickerReq, mockRes, () => { }, null);
 
         if (messageId) {
           try {
@@ -517,7 +668,7 @@ export async function startWhatsappClient(processMessageFn) {
           }
         }
       } else {
-        await saveInteraction(fakeReq, mockRes, () => {}, mediaInfo);
+        await saveInteraction(fakeReq, mockRes, () => { }, mediaInfo);
       }
 
       marcarNovedad(resolvedBody);
@@ -548,7 +699,7 @@ export async function startWhatsappClient(processMessageFn) {
       console.log('[whatsapp] Sin QR ni autenticacion en 15s. Limpiando sesion corrupta...');
       try {
         await client.destroy();
-      } catch {}
+      } catch { }
       client = null;
       hasEverAuthenticated = false;
       connectionStatus = 'waiting_qr';
@@ -559,10 +710,10 @@ export async function startWhatsappClient(processMessageFn) {
           rmSync(sessionDir, { recursive: true, force: true });
           console.log('[whatsapp] Sesion corrupta eliminada.');
         }
-      } catch {}
+      } catch { }
       try {
         await startWhatsappClient(storedProcessMessageFn);
-      } catch {}
+      } catch { }
     }
   }, 15000);
 }
@@ -622,7 +773,7 @@ export async function logoutWhatsapp() {
       rmSync(sessionDir, { recursive: true, force: true });
       console.log('[whatsapp] Sesion eliminada del disco.');
     }
-  } catch {}
+  } catch { }
 
   console.log('[whatsapp] Sesion de WhatsApp cerrada. QR disponible en /whatsapp/qr');
 }

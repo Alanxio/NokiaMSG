@@ -7,6 +7,18 @@ import {
   getSmsNotificationStatus,
   sendSmsNotification,
 } from '../services/sms-notification.service.js';
+import { isNumericOrJid } from './page.controller.js';
+
+function normalizeGroupName(rawName) {
+  if (typeof rawName !== 'string' || !rawName.trim()) {
+    return null;
+  }
+  const trimmed = rawName.trim();
+  if (isNumericOrJid(trimmed)) {
+    return null;
+  }
+  return trimmed.slice(0, 100);
+}
 
 function normalizeNotificationDate(value) {
   if (typeof value !== 'string') return null;
@@ -124,19 +136,42 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       return;
     }
 
+    // La clasificación explícita (chat_type/is_group), cuando viene informada por el
+    // llamador, manda siempre sobre el heurístico de ":" en el título. Un pushname o
+    // nombre de grupo que contenga ":" desbarataba el heurístico y hacía que este
+    // bloque y el de más abajo (que decide a qué contador de no-leídos sumar) discreparan
+    // entre sí, dejando el contador de esa conversación congelado para siempre.
+    const explicitType = typeof payload.chat_type === 'string' ? payload.chat_type.trim().toLowerCase() : '';
+    const explicitIsGroup = payload.is_group === 1 || payload.is_group === true || payload.is_group === 'true';
+    const explicitIsUser = payload.is_group === 0 || payload.is_group === false || payload.is_group === 'false';
+    const hasExplicitType = explicitType === 'group' || explicitType === 'user' || explicitIsGroup || explicitIsUser;
+
     const cleanPattern = /\s*\(\d+\s*(mensajes?|messages?)\)/gi;
     const normalizedTitle = title.replace(cleanPattern, '').trim();
     const lastColon = normalizedTitle.lastIndexOf(':');
     const looksLikeGroup = lastColon > 0 && lastColon < normalizedTitle.length - 1;
 
-    let isGroup, nameOrGroupName, username;
-    if (looksLikeGroup) {
-      isGroup = true;
-      nameOrGroupName = normalizedTitle.slice(0, lastColon).trim().slice(0, 100);
-      username = (normalizedTitle.slice(lastColon + 1).trim() || 'Desconocido').slice(0, 100);
+    const isGroup = hasExplicitType ? (explicitType === 'group' || explicitIsGroup) : looksLikeGroup;
+
+    // Campos explícitos opcionales (los usa whatsapp.service.js) para no depender de
+    // partir el título por ":" cuando el nombre del grupo o del remitente lo contenga.
+    const explicitGroupName = typeof payload.group_name === 'string' ? payload.group_name.trim().slice(0, 100) : '';
+    const explicitSenderName = typeof payload.sender_name === 'string' ? payload.sender_name.trim().slice(0, 100) : '';
+
+    let nameOrGroupName, username;
+    if (isGroup) {
+      if (explicitGroupName) {
+        nameOrGroupName = explicitGroupName;
+        username = (explicitSenderName || 'Desconocido').slice(0, 100);
+      } else if (looksLikeGroup) {
+        nameOrGroupName = normalizedTitle.slice(0, lastColon).trim().slice(0, 100);
+        username = (normalizedTitle.slice(lastColon + 1).trim() || 'Desconocido').slice(0, 100);
+      } else {
+        nameOrGroupName = normalizedTitle.slice(0, 100);
+        username = 'Desconocido';
+      }
     } else {
-      isGroup = false;
-      nameOrGroupName = normalizedTitle.slice(0, 100);
+      nameOrGroupName = (explicitSenderName || normalizedTitle).slice(0, 100);
       username = nameOrGroupName;
     }
 
@@ -166,18 +201,22 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
     try {
       let finalGroupId = null;
       let finalUserChatId = null;
-      const explicitType = typeof payload.chat_type === 'string' ? payload.chat_type.trim().toLowerCase() : '';
-      const explicitIsGroup = payload.is_group === 1 || payload.is_group === true || payload.is_group === 'true';
-      const explicitIsUser = payload.is_group === 0 || payload.is_group === false || payload.is_group === 'false';
-      const hasExplicitType = explicitType === 'group' || explicitType === 'user' || explicitIsGroup || explicitIsUser;
 
-      if (hasExplicitType ? (explicitType === 'group' || explicitIsGroup) : isGroup) {
-        const existingGroup = stmts.getGroupByName.get(nameOrGroupName);
+      if (isGroup) {
+        finalGroupId = chatId || makeId('g_');
+        const existingGroup = stmts.getGroupById.get(finalGroupId) || (nameOrGroupName ? stmts.getGroupByName.get(nameOrGroupName) : null);
+        const normalizedGroupName = normalizeGroupName(nameOrGroupName) || (existingGroup?.group_name || 'Grupo sin nombre');
+
         if (existingGroup) {
           finalGroupId = existingGroup.group_id;
+          if (existingGroup.group_name !== normalizedGroupName) {
+            const shouldUpdate = !isNumericOrJid(normalizedGroupName) || isNumericOrJid(existingGroup.group_name);
+            if (shouldUpdate) {
+              stmts.upsertGroup.run(finalGroupId, normalizedGroupName);
+            }
+          }
         } else {
-          finalGroupId = chatId || makeId('g_');
-          stmts.upsertGroup.run(finalGroupId, nameOrGroupName);
+          stmts.upsertGroup.run(finalGroupId, normalizedGroupName);
         }
 
         // Usar senderChatId (msg.author) para el usuario emisor, NO chatId (que es el grupo)

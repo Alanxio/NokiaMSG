@@ -198,7 +198,7 @@ export const stmts = {
 
   getGroupMessagesPaginated: db.prepare(`
     SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker,
-           u.username,
+           u.username, u.chat_id AS user_chat_id,
            a.file_path_thumb
     FROM messages m
     LEFT JOIN users u ON u.chat_id = m.user_chat_id
@@ -369,6 +369,17 @@ export const stmts = {
     SELECT group_id FROM wgroups WHERE unseen_count > 0
   `),
 
+  updateUserUnseen: db.prepare(`
+    UPDATE users SET unseen_count = ? WHERE chat_id = ? OR chat_id LIKE ?
+  `),
+
+  updateGroupUnseen: db.prepare(`
+    UPDATE wgroups SET unseen_count = ? WHERE group_id = ?
+  `),
+
+  getUserByPhonePattern: db.prepare(`
+    SELECT chat_id, username FROM users WHERE chat_id LIKE ? LIMIT 1
+  `),
 };
 
 // Cierre seguro de la base de datos para evitar corrupción del modo WAL
