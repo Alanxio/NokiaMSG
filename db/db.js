@@ -315,7 +315,7 @@ export const stmts = {
   `),
 
   getAttachmentsByCreatedAt: db.prepare(`
-    SELECT id, file_path_full, file_path_thumb, file_name, created_at
+    SELECT id, file_path_full, file_path_view, file_path_thumb, file_name, created_at
     FROM attachments
     WHERE created_at < (CAST(strftime('%s', 'now') AS INTEGER) - ?)
   `),

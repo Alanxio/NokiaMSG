@@ -18,7 +18,7 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
-app.use('/assets', express.static('assets'));
+app.use('/assets', requireAuth, express.static('assets'));
 app.use('/media', requireAuth, express.static(join(process.cwd(), 'public/media')));
 
 // Descarga de imágenes con Content-Disposition: attachment

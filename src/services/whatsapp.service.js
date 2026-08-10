@@ -173,6 +173,41 @@ async function applyChatUnreadCount(chat) {
   }
 }
 
+// El evento 'unread_count' oficial de whatsapp-web.js (Client.js: onChatUnreadCountEvent)
+// hace "const chat = await this.getChatById(data.id)" antes de emitir el evento — es decir,
+// pasa por la MISMA llamada que falla con el bug "r: r" para ciertos chats (ver
+// resolveGroupNameFromWhatsapp en group.controller.js). Cuando eso pasa, el evento
+// simplemente no llega a emitirse para ese chat y la lectura en tiempo real se queda
+// desincronizada hasta la próxima reconexión (que sí se autocorrige, vía
+// syncUnreadCountsFromWhatsapp en 'ready'). Para no depender de esperar a una reconexión,
+// aquí nos enganchamos directamente a la colección interna de WhatsApp (el mismo evento
+// que usa la librería por debajo) pero leyendo el chat "en crudo", sin la llamada que falla.
+async function attachDirectUnreadCountListener() {
+  if (!client?.pupPage) return;
+  try {
+    await client.pupPage.exposeFunction('onRawUnreadCountEvent', (data) => {
+      applyChatUnreadCount(data).then(() => {
+        console.log(`[whatsapp] 👁 (directo) unreadCount=${data.unreadCount} para ${data.id}`);
+      }).catch((err) => {
+        console.warn('[whatsapp] Error aplicando unreadCount (listener directo):', err.message);
+      });
+    });
+    await client.pupPage.evaluate(() => {
+      const { Chat } = window.require('WAWebCollections');
+      Chat.on('change:unreadCount', (chat) => {
+        window.onRawUnreadCountEvent({
+          id: chat.id?._serialized || null,
+          unreadCount: typeof chat.unreadCount === 'number' ? chat.unreadCount : 0,
+          isGroup: !!chat.groupMetadata,
+        });
+      });
+    });
+    console.log('[whatsapp] 👁 Listener directo de unreadCount adjuntado (evita el bug de getChatById).');
+  } catch (err) {
+    console.warn('[whatsapp] No se pudo adjuntar el listener directo de unreadCount:', err?.message);
+  }
+}
+
 export async function syncUnreadCountsFromWhatsapp() {
   if (!client || connectionStatus !== 'connected') return;
   try {
@@ -474,6 +509,10 @@ export async function startWhatsappClient(processMessageFn) {
     await syncChatsMetadata();
     // Sincronizar contadores de no leídos con WhatsApp al conectar
     await syncUnreadCountsFromWhatsapp();
+    // Enganchar el listener directo de unreadCount para que la lectura en tiempo real
+    // (marcar como leído en el móvil) llegue también a los chats afectados por el bug
+    // de getChatById, sin esperar a la próxima reconexión.
+    await attachDirectUnreadCountListener();
     // Reintentar la resolución de nombres de grupo que quedaron como ID/placeholder
     // (p. ej. porque fallaron en su momento al no estar el chat aún cacheado).
     try {

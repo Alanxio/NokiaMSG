@@ -14,9 +14,9 @@ const router = Router();
 
 // Rutas sin protección
 router.use('/', authRoutes);
-router.use('/whatsapp', whatsappRoutes);
 
 // Rutas protegidas
+router.use('/whatsapp', requireAuth, whatsappRoutes);
 router.use('/', requireAuth, homeRoutes);
 router.use('/', requireAuth, pollingRoutes);
 router.use('/usuario', requireAuth, userRoutes);

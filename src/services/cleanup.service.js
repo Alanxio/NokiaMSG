@@ -1,6 +1,7 @@
 import { existsSync, unlinkSync, readdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import db, { stmts } from '../../db/db.js';
+import { getMediaDir } from '../utils/media.js';
 
 const TIMEZONE = 'Europe/Madrid';
 const CLEANUP_HOUR = 2;
@@ -99,6 +100,15 @@ function getMadridUtcOffsetMs(date) {
   return localAsUTC - date.getTime();
 }
 
+// file_path_* en BD se guarda como ruta "estilo URL" (p. ej. "/media/full_xxx.jpg"),
+// pensada para usarse directamente en <img src="...">, no como ruta real de filesystem.
+// Hay que resolverla contra el directorio real de medios antes de borrar en disco.
+function resolveMediaFsPath(storedPath) {
+  if (!storedPath) return null;
+  const fileName = storedPath.split('/').pop();
+  return fileName ? join(getMediaDir(), fileName) : null;
+}
+
 function safeUnlink(filePath) {
   if (!filePath) return;
   try {
@@ -119,9 +129,9 @@ function cleanupMedia(retentionDays) {
   console.log(`[cleanup] Limpiando ${attachments.length} adjuntos antiguos...`);
 
   for (const a of attachments) {
-    safeUnlink(a.file_path_thumb);
-    safeUnlink(a.file_path_full);
-    safeUnlink(findOriginalFile(a.file_name));
+    safeUnlink(resolveMediaFsPath(a.file_path_thumb));
+    safeUnlink(resolveMediaFsPath(a.file_path_full));
+    safeUnlink(resolveMediaFsPath(a.file_path_view));
   }
 
   if (attachments.length > 0) {
@@ -129,14 +139,6 @@ function cleanupMedia(retentionDays) {
     const placeholders = ids.map(() => '?').join(',');
     db.prepare(`DELETE FROM attachments WHERE id IN (${placeholders})`).run(...ids);
   }
-}
-
-function findOriginalFile(fileName) {
-  if (!fileName) return null;
-  const publicDir = join(process.cwd(), 'public', 'media');
-  const ext = fileName.split('.').pop();
-  const origPath = join(publicDir, `orig_${fileName}.${ext}`);
-  return existsSync(origPath) ? origPath : null;
 }
 
 function cleanupPuppeteerCache() {
