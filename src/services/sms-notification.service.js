@@ -12,6 +12,24 @@ function normalizeAsciiText(value, fallback = '') {
   return convertEmojisToAscii(text || fallback);
 }
 
+function getPublicBaseUrl() {
+  const useCloudflare = (process.env.CLOUDFLARE_ENABLED || '').toLowerCase() === 'true';
+  if (useCloudflare && process.env.CLOUDFLARE_TUNNEL_HOSTNAME) {
+    return `https://${process.env.CLOUDFLARE_TUNNEL_HOSTNAME}`;
+  }
+  if (process.env.NGROK_HTTP_URL) {
+    return process.env.NGROK_HTTP_URL.replace(/\/$/, '');
+  }
+  return null;
+}
+
+function buildChatUrl(payload) {
+  const baseUrl = getPublicBaseUrl();
+  if (!baseUrl || !payload.chatId) return null;
+  const path = payload.type === 'group' ? 'grupo' : 'usuario';
+  return `${baseUrl}/${path}/${encodeURIComponent(payload.chatId)}`;
+}
+
 function getSmsConfig() {
   return {
     enabled: parseBoolean(process.env.SMS_NOTIFICATIONS_ENABLED, false),
@@ -54,7 +72,10 @@ export async function sendSmsNotification(payload) {
     ? payload.groupName
     : payload.username;
 
-  const smsText = `¡Tienes un mensaje de ${normalizeAsciiText(sourceName, 'Desconocido')}!`;
+  const chatUrl = buildChatUrl(payload);
+  const smsText = chatUrl
+    ? `¡Tienes un mensaje de ${normalizeAsciiText(sourceName, 'Desconocido')}! ${chatUrl}`
+    : `¡Tienes un mensaje de ${normalizeAsciiText(sourceName, 'Desconocido')}!`;
 
   // Basic Auth for Twilio REST API
   const authHeader = 'Basic ' + Buffer.from(`${config.accountSid}:${config.authToken}`).toString('base64');

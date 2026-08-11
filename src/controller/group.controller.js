@@ -271,19 +271,10 @@ export async function showGroupMessages(req, res, next) {
           ? `<font color="#006600">[Yo]</font> ${renderAckLabel(message.ack_status)}`
           : '';
 
-        let senderPhone = null;
-        if (!isSaliente && message.user_chat_id) {
-          senderPhone = await resolveContactPhone(message.user_chat_id);
-          if (!senderPhone) {
-            senderPhone = formatPhoneNumber(message.user_chat_id, message.username);
-          }
-        }
-        const phoneLink = senderPhone ? ` ${renderPhoneLink(senderPhone)}` : '';
-
         const senderColor = getMemberColor(message.user_chat_id, memberColorMap);
         const usernameLine = isSaliente
           ? ''
-          : `<font size="1" color="${senderColor}">[${message.username ? escapeXml(convertEmojisToAscii(message.username)) : 'Desconocido'}]${phoneLink} dice:</font><br/>`;
+          : `<font size="1" color="${senderColor}">[${message.username ? escapeXml(truncateName(convertEmojisToAscii(message.username))) : 'Desconocido'}] dice:</font><br/>`;
 
         messagesHtml +=
           `<p>${unseenMarker}${fromMeMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font><br/>` +
@@ -400,6 +391,17 @@ export async function showGroupDetails(req, res, next) {
       return resolveDisplay(a.id).localeCompare(resolveDisplay(b.id), 'es', { sensitivity: 'base' });
     });
 
+    // Teléfonos resueltos en paralelo para todos los ids implicados (actuales +
+    // anteriores) — solo se hace aquí, no por mensaje en el historial.
+    const allPhoneIds = [...currentIds, ...pastParticipants.map((p) => p.chat_id)];
+    const phoneEntries = await Promise.all(
+      allPhoneIds.map(async (id) => {
+        const phone = id?.endsWith('@lid') ? await resolveContactPhone(id) : null;
+        return [id, phone || formatPhoneNumber(id)];
+      })
+    );
+    const phoneByChatId = new Map(phoneEntries);
+
     body += `<p>${sortedParticipants.length} participante${sortedParticipants.length === 1 ? '' : 's'}:</p>`;
     body +=
       '<ul>' +
@@ -410,8 +412,10 @@ export async function showGroupDetails(req, res, next) {
             : p.isAdmin
               ? ' <font color="#0000cc">[Admin]</font>'
               : '';
-          const nameHtml = `<font color="${getMemberColor(p.id, memberColorMap)}">${escapeXml(resolveDisplay(p.id))}</font>`;
-          return `<li>${nameHtml}${roleTag}</li>`;
+          const nameHtml = `<font color="${getMemberColor(p.id, memberColorMap)}">${escapeXml(resolveDisplay(p.id))}</font>${roleTag}`;
+          const phone = phoneByChatId.get(p.id);
+          const phoneHtml = phone ? `<br/>${renderPhoneLink(phone)}` : '';
+          return `<li>${nameHtml}${phoneHtml}</li>`;
         })
         .join('') +
       '</ul>';
@@ -425,7 +429,9 @@ export async function showGroupDetails(req, res, next) {
         pastParticipants
           .map((p) => {
             const nameHtml = `<font color="${getMemberColor(p.chat_id, memberColorMap)}">${escapeXml(p.username || p.chat_id)}</font>`;
-            return `<li>${nameHtml}</li>`;
+            const phone = phoneByChatId.get(p.chat_id);
+            const phoneHtml = phone ? `<br/>${renderPhoneLink(phone)}` : '';
+            return `<li>${nameHtml}${phoneHtml}</li>`;
           })
           .join('') +
         '</ul>';

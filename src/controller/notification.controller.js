@@ -330,7 +330,8 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
         sendSmsNotification({
           type: isGroup ? 'group' : 'user',
           groupName: nameOrGroupName,
-          username: username
+          username: username,
+          chatId: isGroup ? finalGroupId : finalUserChatId
         }).catch(err => console.error('[SMS] Fallo al lanzar notificación:', err));
       }
 
