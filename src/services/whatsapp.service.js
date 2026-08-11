@@ -570,6 +570,53 @@ export async function startWhatsappClient(processMessageFn) {
     }
   });
 
+  // Las llamadas de WhatsApp no se pueden "reenviar" a una llamada real (son audio/vídeo
+  // en directo por WebRTC) — lo único posible es dejar constancia en el chat de que han
+  // llamado, igual que ya se hace con los stickers.
+  client.on('call', async (call) => {
+    try {
+      // Solo llamadas entrantes 1:1 — las salientes no necesitan aviso, y las de grupo se
+      // dejan fuera porque no está claro si call.from es el JID del grupo o del que llama.
+      if (call.fromMe || call.isGroup || !call.from) return;
+
+      const callerChatId = call.from;
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
+      const pad = (n) => String(n).padStart(2, '0');
+      const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+      const timeStr = `${dateStr} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+
+      const existingUser = stmts.getUserByChatId.get(callerChatId);
+      const callerName = existingUser?.username || callerChatId;
+
+      const fakeReq = {
+        body: {
+          title: callerName,
+          message: call.isVideo ? '[Videollamada]' : '[Llamada]',
+          date: dateStr,
+          time: timeStr,
+          chat_id: callerChatId,
+          sender_chat_id: callerChatId,
+          whatsapp_msg_id: `call_${call.id}`,
+          from_me: 0,
+          chat_type: 'user',
+          is_group: 0,
+          sender_name: callerName,
+        },
+      };
+      const mockRes = {
+        statusCode: 200,
+        _json: null,
+        status(code) { this.statusCode = code; return this; },
+        json(data) { this._json = data; },
+      };
+
+      await saveInteraction(fakeReq, mockRes, () => {}, null);
+      console.log(`[whatsapp] 📞 Llamada${call.isVideo ? ' de video' : ''} registrada de ${callerChatId}`);
+    } catch (err) {
+      console.error('[whatsapp] Error registrando llamada:', err.message);
+    }
+  });
+
   client.on('message_create', async (msg) => {
     const whatsappMsgId = msg.id?._serialized || null;
 

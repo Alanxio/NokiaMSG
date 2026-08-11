@@ -327,12 +327,15 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       // Disparar la notificación SMS solo si pasamos de 0 a 1 mensaje no visto
       // y el chat no está silenciado (el silencio no afecta al contador de no leídos)
       if (!fromMe && previousUnseen === 0 && !isSmsMuted) {
+        console.log(`[SMS] Disparando notificación (previousUnseen=${previousUnseen}, muted=${isSmsMuted})`);
         sendSmsNotification({
           type: isGroup ? 'group' : 'user',
           groupName: nameOrGroupName,
           username: username,
           chatId: isGroup ? finalGroupId : finalUserChatId
         }).catch(err => console.error('[SMS] Fallo al lanzar notificación:', err));
+      } else if (!fromMe) {
+        console.log(`[SMS] Omitido (previousUnseen=${previousUnseen}, muted=${isSmsMuted})`);
       }
 
       res.status(201).json({ success: true, messageId });

@@ -1,3 +1,4 @@
+import twilio from 'twilio';
 import { convertEmojisToAscii } from '../utils/emoji.js';
 
 function parseBoolean(value, defaultValue = false) {
@@ -77,36 +78,17 @@ export async function sendSmsNotification(payload) {
     ? `¡Tienes un mensaje de ${normalizeAsciiText(sourceName, 'Desconocido')}! ${chatUrl}`
     : `¡Tienes un mensaje de ${normalizeAsciiText(sourceName, 'Desconocido')}!`;
 
-  // Basic Auth for Twilio REST API
-  const authHeader = 'Basic ' + Buffer.from(`${config.accountSid}:${config.authToken}`).toString('base64');
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${config.accountSid}/Messages.json`;
-
-  const requestBody = new URLSearchParams({
-    To: config.toNumber,
-    From: config.fromNumber,
-    Body: smsText,
-  });
-
   try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': authHeader,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: requestBody.toString(),
+    const client = twilio(config.accountSid, config.authToken);
+    const message = await client.messages.create({
+      body: smsText,
+      from: config.fromNumber,
+      to: config.toNumber,
     });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error('[SMS] Error from Twilio API:', data);
-      return { status: 'failed', error: data.message };
-    }
-
-    return { status: 'sent', messageId: data.sid };
+    console.log(`[SMS] Enviado correctamente (SID: ${message.sid}, estado: ${message.status})`);
+    return { status: 'sent', messageId: message.sid };
   } catch (err) {
-    console.error('[SMS] Network error pushing to Twilio:', err.message);
+    console.error(`[SMS] Error enviando con Twilio SDK (code: ${err.code}):`, err.message);
     return { status: 'failed', error: err.message };
   }
 }
