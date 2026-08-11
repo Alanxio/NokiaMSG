@@ -294,13 +294,16 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
 
       // Consultar unseen ANTES de incrementar para decidir si enviar SMS
       let previousUnseen = 0;
+      let isSmsMuted = false;
       if (isGroup) {
         const groupRow = stmts.getGroupById.get(finalGroupId);
         previousUnseen = groupRow?.unseen_count || 0;
+        isSmsMuted = Number(groupRow?.sms_muted) === 1;
         stmts.incrementGroupUnseen.run(finalGroupId);
       } else {
         const userRow = stmts.getUserByChatId.get(finalUserChatId);
         previousUnseen = userRow?.unseen_count || 0;
+        isSmsMuted = Number(userRow?.sms_muted) === 1;
         stmts.incrementUserUnseen.run(finalUserChatId);
       }
 
@@ -322,7 +325,8 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       db.exec('COMMIT');
 
       // Disparar la notificación SMS solo si pasamos de 0 a 1 mensaje no visto
-      if (!fromMe && previousUnseen === 0) {
+      // y el chat no está silenciado (el silencio no afecta al contador de no leídos)
+      if (!fromMe && previousUnseen === 0 && !isSmsMuted) {
         sendSmsNotification({
           type: isGroup ? 'group' : 'user',
           groupName: nameOrGroupName,

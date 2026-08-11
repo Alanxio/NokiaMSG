@@ -103,13 +103,13 @@ function getMadridUtcOffsetMs(date) {
 // file_path_* en BD se guarda como ruta "estilo URL" (p. ej. "/media/full_xxx.jpg"),
 // pensada para usarse directamente en <img src="...">, no como ruta real de filesystem.
 // Hay que resolverla contra el directorio real de medios antes de borrar en disco.
-function resolveMediaFsPath(storedPath) {
+export function resolveMediaFsPath(storedPath) {
   if (!storedPath) return null;
   const fileName = storedPath.split('/').pop();
   return fileName ? join(getMediaDir(), fileName) : null;
 }
 
-function safeUnlink(filePath) {
+export function safeUnlink(filePath) {
   if (!filePath) return;
   try {
     if (existsSync(filePath)) {

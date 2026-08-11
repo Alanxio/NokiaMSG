@@ -1,31 +1,39 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
 import { getUsersPresence, sendWhatsappSeen, resolveContactPhone } from '../services/whatsapp.service.js';
+import { resolveMediaFsPath, safeUnlink } from '../services/cleanup.service.js';
 import {
   DIRECTORY_PAGE_SIZE,
   MESSAGE_PAGE_SIZE,
   escapeXml,
   formatPhoneNumber,
+  getLetterBucket,
   getTotal,
   renderList,
   renderMentions,
+  renderNumberedPager,
   renderPager,
   renderPhoneLink,
   sendInvalidEntity,
   sendMissingEntity,
   sendPage,
   toPositiveInt,
+  truncateName,
 } from './page.controller.js';
 
 export async function listUsers(req, res, next) {
   try {
+    const allUsers = stmts.getAllUsers.all();
+    allUsers.sort((a, b) =>
+      (a.username || '').localeCompare(b.username || '', 'es', { sensitivity: 'base' })
+    );
+
     const requestedPage = toPositiveInt(req.query.p, 1);
-    const total = getTotal(stmts.countUsers);
-    const totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
+    const totalPages = Math.max(1, Math.ceil(allUsers.length / DIRECTORY_PAGE_SIZE));
     const page = Math.min(requestedPage, totalPages);
     const offset = (page - 1) * DIRECTORY_PAGE_SIZE;
 
-    const users = stmts.getAllUsersPaginated.all(DIRECTORY_PAGE_SIZE, offset);
+    const users = allUsers.slice(offset, offset + DIRECTORY_PAGE_SIZE);
 
     const chatIds = users.map((u) => u.chat_id).filter(Boolean);
     const presenceMap = await getUsersPresence(chatIds);
@@ -33,13 +41,13 @@ export async function listUsers(req, res, next) {
     const body =
       '<h1>Usuarios</h1>' +
       '<p><a href="/">Inicio</a></p>' +
-      renderPager('/usuario', page, totalPages) +
+      renderNumberedPager('/usuario', page, totalPages) +
       renderList(users, (user) => `/usuario/${user.chat_id}`, (user) => {
         const presence = user.chat_id ? presenceMap.get(user.chat_id) : null;
         const onlineTag = presence && presence.isOnline ? '*' : '';
-        return `${escapeXml(user.username)}${onlineTag}[${user.unseen_count}]`;
-      }, 'Sin usuarios.') +
-      renderPager('/usuario', page, totalPages);
+        return `${truncateName(user.username)}${onlineTag}[${user.unseen_count}]`;
+      }, 'Sin usuarios.', (user) => getLetterBucket(user.username)) +
+      renderNumberedPager('/usuario', page, totalPages);
 
     sendPage(req, res, 200, 'Usuarios', body);
   } catch (error) {
@@ -55,9 +63,7 @@ export async function showUserMessages(req, res, next) {
       return;
     }
 
-    const userRows = db.prepare(`
-      SELECT chat_id, username, unseen_count FROM users WHERE chat_id = ? LIMIT 1
-    `).get(chatId);
+    const userRows = stmts.getUserByChatId.get(chatId);
 
     if (!userRows) {
       sendMissingEntity(req, res, 'Usuario');
@@ -125,16 +131,109 @@ export async function showUserMessages(req, res, next) {
     }
     const phoneHtml = phone ? `<p style="margin-top:-5px;margin-bottom:5px;">${renderPhoneLink(phone)}</p>` : '';
 
+    const isMuted = Number(user.sms_muted) === 1;
+    const muteLabel = isMuted ? 'Activar SMS' : 'Silenciar SMS';
+
     const body =
       `<h1>${escapeXml(user.username)}${onlineTag}</h1>` +
       phoneHtml +
       '<p><a href="/">Inicio</a> | <a href="/usuario">Usuarios</a></p>' +
       `<p><a href="/mensaje/componer?to=${encodeURIComponent(user.chat_id)}&type=user"><b>[Enviar mensaje]</b></a></p>` +
+      `<p><a href="/usuario/${encodeURIComponent(user.chat_id)}/silenciar">[${escapeXml(muteLabel)}]</a> | ` +
+      `<a href="/usuario/${encodeURIComponent(user.chat_id)}/eliminar">[Eliminar]</a></p>` +
       renderPager(`/usuario/${user.chat_id}`, page, totalPages) +
       messagesHtml +
       renderPager(`/usuario/${user.chat_id}`, page, totalPages);
 
     sendPage(req, res, 200, `${user.username}${onlineTag}`, body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function toggleUserMute(req, res, next) {
+  try {
+    const chatId = req.params.id;
+    const user = stmts.getUserByChatId.get(chatId);
+    if (!user) {
+      sendMissingEntity(req, res, 'Usuario');
+      return;
+    }
+
+    const newState = Number(user.sms_muted) === 1 ? 0 : 1;
+    stmts.setUserSmsMuted.run(newState, chatId);
+
+    const backUrl = `/usuario/${encodeURIComponent(chatId)}`;
+    const body = `<p><a href="${backUrl}">Volver</a></p>`;
+    sendPage(req, res, 200, 'Nokia', body, `<meta http-equiv="refresh" content="0;url=${backUrl}"/>`);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function confirmDeleteUser(req, res, next) {
+  try {
+    const chatId = req.params.id;
+    const user = stmts.getUserByChatId.get(chatId);
+    if (!user) {
+      sendMissingEntity(req, res, 'Usuario');
+      return;
+    }
+
+    const body =
+      `<h1>Eliminar</h1>` +
+      `<p>¿Eliminar a ${escapeXml(user.username)}? Se borrará el historial guardado en el ` +
+      `Nokia. La conversación de WhatsApp en el móvil no se ve afectada.</p>` +
+      `<form action="/usuario/${encodeURIComponent(chatId)}/eliminar" method="POST">` +
+      `<p><input type="submit" value="Si, eliminar"/> ` +
+      `<a href="/usuario/${encodeURIComponent(chatId)}">Cancelar</a></p>` +
+      `</form>`;
+
+    sendPage(req, res, 200, 'Eliminar usuario', body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteUser(req, res, next) {
+  try {
+    const chatId = req.params.id;
+    const user = stmts.getUserByChatId.get(chatId);
+    if (!user) {
+      sendMissingEntity(req, res, 'Usuario');
+      return;
+    }
+
+    const attachments = stmts.getDmAttachmentsByUserChatId.all(chatId);
+
+    db.exec('BEGIN');
+    try {
+      stmts.deleteDmAttachmentsByUserChatId.run(chatId);
+      stmts.deleteDmMessagesByUserChatId.run(chatId);
+
+      const remaining = getTotal(stmts.countMessagesByUserChatId, chatId);
+      if (remaining === 0) {
+        stmts.deleteParticipantsByUserChatId.run(chatId);
+        stmts.deleteUserRow.run(chatId);
+      }
+
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+
+    attachments.forEach((a) => {
+      safeUnlink(resolveMediaFsPath(a.file_path_thumb));
+      safeUnlink(resolveMediaFsPath(a.file_path_full));
+      safeUnlink(resolveMediaFsPath(a.file_path_view));
+    });
+
+    const body =
+      '<h1>Nokia</h1>' +
+      '<p>Eliminado.</p>' +
+      '<p><a href="/usuario">Usuarios</a></p>';
+    sendPage(req, res, 200, 'Eliminado', body, '<meta http-equiv="refresh" content="2;url=/usuario"/>');
   } catch (error) {
     next(error);
   }

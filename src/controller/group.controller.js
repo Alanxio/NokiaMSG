@@ -1,21 +1,25 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
 import { client, sendWhatsappSeen, resolveContactPhone } from '../services/whatsapp.service.js';
+import { resolveMediaFsPath, safeUnlink } from '../services/cleanup.service.js';
 import {
   DIRECTORY_PAGE_SIZE,
   MESSAGE_PAGE_SIZE,
   escapeXml,
   formatPhoneNumber,
+  getLetterBucket,
   getTotal,
   isNumericOrJid,
   renderList,
   renderMentions,
+  renderNumberedPager,
   renderPager,
   renderPhoneLink,
   sendInvalidEntity,
   sendMissingEntity,
   sendPage,
   toPositiveInt,
+  truncateName,
 } from './page.controller.js';
 
 // Un nombre de grupo "necesita resolución" cuando aún no tenemos el nombre real:
@@ -107,21 +111,26 @@ export async function ensureGroupDisplayName(group) {
 
 export async function listGroups(req, res, next) {
   try {
+    // Resolvemos los nombres pendientes ANTES de ordenar, para que el orden alfabético
+    // y las cabeceras de letra reflejen el nombre real y no el ID/JID en crudo.
+    const allGroups = await Promise.all(stmts.getAllGroups.all().map(ensureGroupDisplayName));
+    allGroups.sort((a, b) =>
+      (a.group_name || '').localeCompare(b.group_name || '', 'es', { sensitivity: 'base' })
+    );
+
     const requestedPage = toPositiveInt(req.query.p, 1);
-    const total = getTotal(stmts.countGroups);
-    const totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
+    const totalPages = Math.max(1, Math.ceil(allGroups.length / DIRECTORY_PAGE_SIZE));
     const page = Math.min(requestedPage, totalPages);
     const offset = (page - 1) * DIRECTORY_PAGE_SIZE;
 
-    const groups = stmts.getAllGroupsPaginated.all(DIRECTORY_PAGE_SIZE, offset);
-    const resolvedGroups = await Promise.all(groups.map(ensureGroupDisplayName));
+    const resolvedGroups = allGroups.slice(offset, offset + DIRECTORY_PAGE_SIZE);
 
     const body =
       '<h1>Grupos</h1>' +
       '<p><a href="/">Inicio</a></p>' +
-      renderPager('/grupo', page, totalPages) +
-      renderList(resolvedGroups, (group) => `/grupo/${group.group_id}`, (group) => `${escapeXml(group.group_name)}[${group.unseen_count}]`, 'Sin grupos.') +
-      renderPager('/grupo', page, totalPages);
+      renderNumberedPager('/grupo', page, totalPages) +
+      renderList(resolvedGroups, (group) => `/grupo/${group.group_id}`, (group) => `${truncateName(group.group_name)}[${group.unseen_count}]`, 'Sin grupos.', (group) => getLetterBucket(group.group_name)) +
+      renderNumberedPager('/grupo', page, totalPages);
 
     sendPage(req, res, 200, 'Grupos', body);
   } catch (error) {
@@ -221,15 +230,105 @@ export async function showGroupMessages(req, res, next) {
       }
     }
 
+    const isMuted = Number(group.sms_muted) === 1;
+    const muteLabel = isMuted ? 'Activar SMS' : 'Silenciar SMS';
+
     const body =
       `<h1>${escapeXml(group.group_name)}</h1>` +
       '<p><a href="/">Inicio</a> | <a href="/grupo">Grupos</a></p>' +
       `<p><a href="/mensaje/componer?to=${encodeURIComponent(group.group_id)}&type=group"><b>[Enviar mensaje al grupo]</b></a></p>` +
+      `<p><a href="/grupo/${encodeURIComponent(group.group_id)}/silenciar">[${escapeXml(muteLabel)}]</a> | ` +
+      `<a href="/grupo/${encodeURIComponent(group.group_id)}/eliminar">[Eliminar]</a></p>` +
       renderPager(`/grupo/${group.group_id}`, page, totalPages) +
       messagesHtml +
       renderPager(`/grupo/${group.group_id}`, page, totalPages);
 
     sendPage(req, res, 200, group.group_name, body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function toggleGroupMute(req, res, next) {
+  try {
+    const groupId = req.params.id;
+    const group = stmts.getGroupById.get(groupId);
+    if (!group) {
+      sendMissingEntity(req, res, 'Grupo');
+      return;
+    }
+
+    const newState = Number(group.sms_muted) === 1 ? 0 : 1;
+    stmts.setGroupSmsMuted.run(newState, groupId);
+
+    const backUrl = `/grupo/${encodeURIComponent(groupId)}`;
+    const body = `<p><a href="${backUrl}">Volver</a></p>`;
+    sendPage(req, res, 200, 'Nokia', body, `<meta http-equiv="refresh" content="0;url=${backUrl}"/>`);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function confirmDeleteGroup(req, res, next) {
+  try {
+    const groupId = req.params.id;
+    const groupRow = stmts.getGroupById.get(groupId);
+    if (!groupRow) {
+      sendMissingEntity(req, res, 'Grupo');
+      return;
+    }
+    const group = await ensureGroupDisplayName(groupRow);
+
+    const body =
+      `<h1>Eliminar</h1>` +
+      `<p>¿Eliminar el grupo ${escapeXml(group.group_name)}? Se borrará el historial ` +
+      `guardado en el Nokia. El grupo de WhatsApp en el móvil no se ve afectado.</p>` +
+      `<form action="/grupo/${encodeURIComponent(groupId)}/eliminar" method="POST">` +
+      `<p><input type="submit" value="Si, eliminar"/> ` +
+      `<a href="/grupo/${encodeURIComponent(groupId)}">Cancelar</a></p>` +
+      `</form>`;
+
+    sendPage(req, res, 200, 'Eliminar grupo', body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteGroup(req, res, next) {
+  try {
+    const groupId = req.params.id;
+    const group = stmts.getGroupById.get(groupId);
+    if (!group) {
+      sendMissingEntity(req, res, 'Grupo');
+      return;
+    }
+
+    const attachments = stmts.getAttachmentsByGroupId.all(groupId);
+
+    db.exec('BEGIN');
+    try {
+      stmts.deleteAttachmentsByGroupId.run(groupId);
+      stmts.deleteMessagesByGroupId.run(groupId);
+      stmts.deleteParticipantsByGroupId.run(groupId);
+      stmts.deleteGroupRow.run(groupId);
+
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+
+    attachments.forEach((a) => {
+      safeUnlink(resolveMediaFsPath(a.file_path_thumb));
+      safeUnlink(resolveMediaFsPath(a.file_path_full));
+      safeUnlink(resolveMediaFsPath(a.file_path_view));
+    });
+
+    const body =
+      '<h1>Nokia</h1>' +
+      '<p>Eliminado.</p>' +
+      '<p><a href="/grupo">Grupos</a></p>';
+    sendPage(req, res, 200, 'Eliminado', body, '<meta http-equiv="refresh" content="2;url=/grupo"/>');
   } catch (error) {
     next(error);
   }

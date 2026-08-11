@@ -157,6 +157,31 @@ export function renderPager(path, page, totalPages, params = {}) {
   return `<p>${page}/${totalPages} ${links.join(' | ')}</p>`;
 }
 
+export function renderNumberedPager(path, page, totalPages, params = {}) {
+  const maxKeypadPage = Math.min(totalPages, 9);
+  const numberLinks = [];
+  for (let n = 1; n <= maxKeypadPage; n++) {
+    numberLinks.push(
+      n === page
+        ? `<b>${n}</b>`
+        : `<a accesskey="${n}" href="${escapeXml(buildHref(path, { ...params, p: n }))}">${n}</a>`
+    );
+  }
+
+  const navLinks = [];
+  if (page > 1) {
+    navLinks.push(`<a href="${escapeXml(buildHref(path, { ...params, p: page - 1 }))}">Ant</a>`);
+  }
+  if (page < totalPages) {
+    navLinks.push(`<a href="${escapeXml(buildHref(path, { ...params, p: page + 1 }))}">Sig</a>`);
+  }
+
+  const parts = [...numberLinks];
+  if (navLinks.length) parts.push(navLinks.join(' | '));
+
+  return `<p>${parts.join(' | ')}</p>`;
+}
+
 export function renderIndexPager(path, pageKey, page, totalPages, params = {}) {
   const links = [];
 
@@ -179,19 +204,49 @@ export function renderIndexPager(path, pageKey, page, totalPages, params = {}) {
   return `<p>${page}/${totalPages} ${links.join(' | ')}</p>`;
 }
 
-export function renderList(items, hrefFor, textFor, emptyText) {
+const MAX_NAME_LENGTH = 16;
+const DIACRITIC_MARKS_RE = /[\u0300-\u036f]/g;
+
+export function truncateName(name = '', maxLength = MAX_NAME_LENGTH) {
+  const str = String(name);
+  return str.length > maxLength ? `${str.slice(0, maxLength - 1)}…` : str;
+}
+
+export function getLetterBucket(name = '') {
+  const stripped = String(name).normalize('NFD').replace(DIACRITIC_MARKS_RE, '');
+  const ch = stripped.trim().charAt(0).toUpperCase();
+  return /[A-Z]/.test(ch) ? ch : '#';
+}
+
+export function renderList(items, hrefFor, textFor, emptyText, letterFor = null) {
   if (!items.length) {
     return `<p>${escapeXml(emptyText)}</p>`;
   }
 
-  const rows = items
-    .map(
-      (item) =>
-        `<li><a href="${escapeXml(hrefFor(item))}">${escapeXml(textFor(item))}</a></li>`
-    )
-    .join('');
+  let html = '';
+  let currentLetter = null;
+  let listOpen = false;
 
-  return `<ul>${rows}</ul>`;
+  items.forEach((item) => {
+    if (letterFor) {
+      const letter = letterFor(item);
+      if (letter !== currentLetter) {
+        if (listOpen) html += '</ul>';
+        html += `<p><b>[${escapeXml(letter)}]</b>----------</p><ul>`;
+        currentLetter = letter;
+        listOpen = true;
+      }
+    } else if (!listOpen) {
+      html += '<ul>';
+      listOpen = true;
+    }
+
+    html += `<li><a href="${escapeXml(hrefFor(item))}" style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeXml(textFor(item))}</a></li>`;
+  });
+
+  if (listOpen) html += '</ul>';
+
+  return html;
 }
 
 export function renderMessageRows(items, metaFor, emptyText, detailHrefFor = null) {

@@ -80,6 +80,16 @@ try {
 } catch {
   // Columna ya existe, ignorar
 }
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN sms_muted INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE wgroups ADD COLUMN sms_muted INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
 
 export const stmts = {
   upsertUser: db.prepare(`
@@ -89,11 +99,11 @@ export const stmts = {
   `),
 
   getUserByChatId: db.prepare(`
-    SELECT chat_id, username, unseen_count FROM users WHERE chat_id = ? LIMIT 1
+    SELECT chat_id, username, unseen_count, sms_muted FROM users WHERE chat_id = ? LIMIT 1
   `),
 
   getUserByUsername: db.prepare(`
-    SELECT chat_id, username, unseen_count FROM users WHERE username = ? LIMIT 1
+    SELECT chat_id, username, unseen_count, sms_muted FROM users WHERE username = ? LIMIT 1
   `),
 
   updateUserChatId: db.prepare(`
@@ -108,6 +118,38 @@ export const stmts = {
     UPDATE users SET unseen_count = 0 WHERE chat_id = ?
   `),
 
+  setUserSmsMuted: db.prepare(`
+    UPDATE users SET sms_muted = ? WHERE chat_id = ?
+  `),
+
+  countMessagesByUserChatId: db.prepare(`
+    SELECT COUNT(*) AS total FROM messages WHERE user_chat_id = ?
+  `),
+
+  getDmAttachmentsByUserChatId: db.prepare(`
+    SELECT a.* FROM attachments a
+    JOIN messages m ON m.id = a.message_id
+    WHERE m.user_chat_id = ? AND m.group_id IS NULL
+  `),
+
+  deleteDmAttachmentsByUserChatId: db.prepare(`
+    DELETE FROM attachments WHERE message_id IN (
+      SELECT id FROM messages WHERE user_chat_id = ? AND group_id IS NULL
+    )
+  `),
+
+  deleteDmMessagesByUserChatId: db.prepare(`
+    DELETE FROM messages WHERE user_chat_id = ? AND group_id IS NULL
+  `),
+
+  deleteParticipantsByUserChatId: db.prepare(`
+    DELETE FROM group_participants WHERE user_chat_id = ?
+  `),
+
+  deleteUserRow: db.prepare(`
+    DELETE FROM users WHERE chat_id = ?
+  `),
+
   upsertGroup: db.prepare(`
     INSERT INTO wgroups (group_id, group_name, unseen_count)
     VALUES (?, ?, 0)
@@ -115,11 +157,11 @@ export const stmts = {
   `),
 
   getGroupByName: db.prepare(`
-    SELECT group_id, group_name, unseen_count FROM wgroups WHERE group_name = ? LIMIT 1
+    SELECT group_id, group_name, unseen_count, sms_muted FROM wgroups WHERE group_name = ? LIMIT 1
   `),
 
   getGroupById: db.prepare(`
-    SELECT group_id, group_name, unseen_count FROM wgroups WHERE group_id = ? LIMIT 1
+    SELECT group_id, group_name, unseen_count, sms_muted FROM wgroups WHERE group_id = ? LIMIT 1
   `),
 
   incrementGroupUnseen: db.prepare(`
@@ -128,6 +170,34 @@ export const stmts = {
 
   resetGroupUnseen: db.prepare(`
     UPDATE wgroups SET unseen_count = 0 WHERE group_id = ?
+  `),
+
+  setGroupSmsMuted: db.prepare(`
+    UPDATE wgroups SET sms_muted = ? WHERE group_id = ?
+  `),
+
+  getAttachmentsByGroupId: db.prepare(`
+    SELECT a.* FROM attachments a
+    JOIN messages m ON m.id = a.message_id
+    WHERE m.group_id = ?
+  `),
+
+  deleteAttachmentsByGroupId: db.prepare(`
+    DELETE FROM attachments WHERE message_id IN (
+      SELECT id FROM messages WHERE group_id = ?
+    )
+  `),
+
+  deleteMessagesByGroupId: db.prepare(`
+    DELETE FROM messages WHERE group_id = ?
+  `),
+
+  deleteParticipantsByGroupId: db.prepare(`
+    DELETE FROM group_participants WHERE group_id = ?
+  `),
+
+  deleteGroupRow: db.prepare(`
+    DELETE FROM wgroups WHERE group_id = ?
   `),
 
   insertParticipant: db.prepare(`
@@ -230,22 +300,15 @@ export const stmts = {
     SELECT COUNT(*) AS total FROM messages
   `),
 
-  countUsers: db.prepare(`
-    SELECT COUNT(*) AS total FROM users
+  getAllUsers: db.prepare(`
+    SELECT u.chat_id, u.username, u.unseen_count FROM users u
+    WHERE EXISTS (
+      SELECT 1 FROM messages m WHERE m.user_chat_id = u.chat_id AND m.group_id IS NULL
+    )
   `),
 
-  countGroups: db.prepare(`
-    SELECT COUNT(*) AS total FROM wgroups
-  `),
-
-  getAllUsersPaginated: db.prepare(`
-    SELECT chat_id, username, unseen_count
-    FROM users ORDER BY username ASC LIMIT ? OFFSET ?
-  `),
-
-  getAllGroupsPaginated: db.prepare(`
-    SELECT group_id, group_name, unseen_count
-    FROM wgroups ORDER BY group_name ASC LIMIT ? OFFSET ?
+  getAllGroups: db.prepare(`
+    SELECT group_id, group_name, unseen_count FROM wgroups
   `),
 
   deleteMessagesOlderThan: db.prepare(`
