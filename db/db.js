@@ -81,6 +81,11 @@ try {
   // Columna ya existe, ignorar
 }
 try {
+  db.exec(`ALTER TABLE messages ADD COLUMN ack_status INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
   db.exec(`ALTER TABLE users ADD COLUMN sms_muted INTEGER DEFAULT 0`);
 } catch {
   // Columna ya existe, ignorar
@@ -204,18 +209,30 @@ export const stmts = {
     INSERT OR IGNORE INTO group_participants (user_chat_id, group_id) VALUES (?, ?)
   `),
 
+  getParticipantsByGroupId: db.prepare(`
+    SELECT u.chat_id, u.username
+    FROM group_participants gp
+    JOIN users u ON u.chat_id = gp.user_chat_id
+    WHERE gp.group_id = ?
+    ORDER BY u.username ASC
+  `),
+
   insertMessage: db.prepare(`
-    INSERT INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, media_key)
-    VALUES (?, ?, ?, ?, ?, ?, 0, NULL)
+    INSERT INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, media_key, whatsapp_msg_id)
+    VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?)
   `),
 
   insertMessageWithMedia: db.prepare(`
-    INSERT INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, media_key)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+    INSERT INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, media_key, whatsapp_msg_id)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
   `),
 
   findMessageByWhatsappId: db.prepare(`
     SELECT id FROM messages WHERE whatsapp_msg_id = ? LIMIT 1
+  `),
+
+  updateMessageAckByWhatsappId: db.prepare(`
+    UPDATE messages SET ack_status = ? WHERE whatsapp_msg_id = ? AND ack_status < ?
   `),
 
   insertMessageSafe: db.prepare(`
@@ -255,7 +272,7 @@ export const stmts = {
   `),
 
   getUserMessagesPaginated: db.prepare(`
-    SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker,
+    SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.ack_status,
            g.group_name,
            a.file_path_thumb
     FROM messages m
@@ -267,7 +284,7 @@ export const stmts = {
   `),
 
   getGroupMessagesPaginated: db.prepare(`
-    SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker,
+    SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.ack_status,
            u.username, u.chat_id AS user_chat_id,
            a.file_path_thumb
     FROM messages m

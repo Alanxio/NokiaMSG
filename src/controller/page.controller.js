@@ -51,6 +51,45 @@ export function renderPhoneLink(phone) {
   return `<font size="1" color="#666666">(<a href="wtai://wp/mc;${escapeXml(cleanNumber)}"><font color="#666666">${escapeXml(phone)}</font></a>)</font>`;
 }
 
+export function renderAckLabel(ackStatus) {
+  const ack = Number(ackStatus ?? 0);
+  if (ack === -1) return '<font color="#cc0000">[Error]</font> ';
+  if (ack >= 3) return '<font color="#0000cc">[Visto]</font> ';
+  if (ack === 2) return '<font color="#888888">[Entregado]</font> ';
+  return '<font color="#888888">[Enviado]</font> ';
+}
+
+const MEMBER_COLOR_PALETTE = [
+  '#E91E63', '#FF6F00', '#9C27B0', '#00838F', '#F57F17',
+  '#6A1B9A', '#00ACC1', '#AD1457', '#EF6C00', '#5E35B1',
+];
+
+function hashString(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash * 31 + str.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+// Reparto sin colisiones dentro de un mismo grupo: si hay N personas y N <= colores
+// disponibles, cada una se queda con un color distinto (orden estable por id, no por
+// cuándo se procesan). Si sobran personas, se reparten en round-robin, no por hash.
+export function buildMemberColorMap(ids) {
+  const uniqueSorted = [...new Set(ids.filter(Boolean))].sort();
+  const map = new Map();
+  uniqueSorted.forEach((id, i) => {
+    map.set(id, MEMBER_COLOR_PALETTE[i % MEMBER_COLOR_PALETTE.length]);
+  });
+  return map;
+}
+
+export function getMemberColor(id, colorMap = null) {
+  if (!id) return '#000000';
+  if (colorMap && colorMap.has(id)) return colorMap.get(id);
+  return MEMBER_COLOR_PALETTE[hashString(String(id)) % MEMBER_COLOR_PALETTE.length];
+}
+
 // Dominios comunes en España: si un @termina en uno de estos, lo tratamos como correo, no mención.
 const EMAIL_DOMAIN_RE = /\.(com|es|org|net|info|eu)$/i;
 

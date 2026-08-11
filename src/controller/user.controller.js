@@ -9,6 +9,7 @@ import {
   formatPhoneNumber,
   getLetterBucket,
   getTotal,
+  renderAckLabel,
   renderList,
   renderMentions,
   renderNumberedPager,
@@ -114,7 +115,9 @@ export async function showUserMessages(req, res, next) {
 
         // CORRECCIÓN DEFINITIVA: Comprobación numérica estricta para evitar falsos positivos
         const isSaliente = Number(message.from_me) === 1;
-        const fromMeMarker = isSaliente ? '<font color="#006600">[Yo]</font> ' : '';
+        const fromMeMarker = isSaliente
+          ? `<font color="#006600">[Yo]</font> ${renderAckLabel(message.ack_status)}`
+          : '';
 
         messagesHtml +=
           `<p>${unseenMarker}${fromMeMarker}${escapeXml(sentAt)}${groupPart}<br/>` +

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   listGroups,
   showGroupMessages,
+  showGroupDetails,
   toggleGroupMute,
   confirmDeleteGroup,
   deleteGroup,
@@ -10,6 +11,7 @@ import {
 const router = Router();
 
 router.get('/', listGroups);
+router.get('/:id/detalles', showGroupDetails);
 router.get('/:id/silenciar', toggleGroupMute);
 router.get('/:id/eliminar', confirmDeleteGroup);
 router.post('/:id/eliminar', deleteGroup);

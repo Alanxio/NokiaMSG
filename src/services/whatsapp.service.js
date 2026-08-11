@@ -560,6 +560,16 @@ export async function startWhatsappClient(processMessageFn) {
     console.log('[whatsapp] Mensaje cifrado recibido de:', msg.from);
   });
 
+  client.on('message_ack', (message, ack) => {
+    try {
+      const whatsappMsgId = message?.id?._serialized || null;
+      if (!whatsappMsgId) return;
+      stmts.updateMessageAckByWhatsappId.run(ack, whatsappMsgId, ack);
+    } catch (e) {
+      console.error('[whatsapp] Error actualizando estado de mensaje (ack):', e.message);
+    }
+  });
+
   client.on('message_create', async (msg) => {
     const whatsappMsgId = msg.id?._serialized || null;
 

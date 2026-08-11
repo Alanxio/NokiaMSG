@@ -7,9 +7,12 @@ import {
   MESSAGE_PAGE_SIZE,
   escapeXml,
   formatPhoneNumber,
+  buildMemberColorMap,
   getLetterBucket,
+  getMemberColor,
   getTotal,
   isNumericOrJid,
+  renderAckLabel,
   renderList,
   renderMentions,
   renderNumberedPager,
@@ -69,6 +72,56 @@ async function resolveGroupTitleDirectly(groupId) {
     console.warn(`[grupo] resolveGroupTitleDirectly falló para ${groupId}:`, err?.name, err?.message);
   }
   return null;
+}
+
+// Igual que resolveGroupTitleDirectly, pero pidiendo también participantes/admins/
+// descripción. En vez de la colección que revienta ("groupMetadata.update()"), usa el
+// job de red que la propia librería usa internamente antes de añadir participantes
+// (GroupChat.addParticipants()) — es una llamada distinta, no la misma implicada en el
+// bug "r: r", aunque no hay garantía de que esté libre del mismo problema en todos los
+// grupos. Nunca lanza excepción: si algo falla devuelve null y el controlador cae al
+// respaldo con datos locales.
+async function fetchGroupDetailsDirectly(groupId) {
+  if (!client?.pupPage) return null;
+  try {
+    return await client.pupPage.evaluate(async (chatId) => {
+      const chatWid = window.require('WAWebWidFactory').createWid(chatId);
+      let chat = window.require('WAWebCollections').Chat.get(chatWid);
+      if (!chat) {
+        const found = await window
+          .require('WAWebFindChatAction')
+          .findOrCreateLatestChat(chatWid);
+        chat = found?.chat;
+      }
+      if (!chat) return null;
+
+      try {
+        await window
+          .require('WAWebGroupQueryJob')
+          .queryAndUpdateGroupMetadataById({ id: chatId });
+      } catch (e) {
+        // Seguimos con lo que ya hubiera en caché, aunque el refresco fallara.
+      }
+
+      const md = chat.groupMetadata;
+      if (!md) return null;
+      const serialized = typeof md.serialize === 'function' ? md.serialize() : md;
+      return {
+        owner: serialized.owner?._serialized || serialized.owner || null,
+        creation: serialized.creation || null,
+        desc: serialized.desc || null,
+        participants: (serialized.participants || []).map((p) => ({
+          id: p.id?._serialized || p.id,
+          isAdmin: !!p.isAdmin,
+          isSuperAdmin: !!p.isSuperAdmin,
+        })),
+        hasParentCommunity: !!serialized.parentGroupId,
+      };
+    }, groupId);
+  } catch (err) {
+    console.warn(`[grupo] fetchGroupDetailsDirectly falló para ${groupId}:`, err?.name, err?.message);
+    return null;
+  }
 }
 
 export async function resolveGroupNameFromWhatsapp(groupId) {
@@ -188,6 +241,13 @@ export async function showGroupMessages(req, res, next) {
     const messages = stmts.getGroupMessagesPaginated.all(groupId, MESSAGE_PAGE_SIZE, offset);
     const newMessageCount = unseenCount;
 
+    // Reparto de colores sin colisiones para todo el grupo (no solo esta página de
+    // mensajes), así el color de cada persona es el mismo en cualquier página y
+    // coincide con el que se ve en /grupo/:id/detalles.
+    const memberColorMap = buildMemberColorMap(
+      stmts.getParticipantsByGroupId.all(groupId).map((p) => p.chat_id)
+    );
+
     let messagesHtml = '';
     if (messages.length === 0) {
       messagesHtml = '<p>Sin mensajes.</p>';
@@ -207,7 +267,9 @@ export async function showGroupMessages(req, res, next) {
         }
 
         const isSaliente = Number(message.from_me) === 1;
-        const fromMeMarker = isSaliente ? '<font color="#006600">[Yo]</font> ' : '';
+        const fromMeMarker = isSaliente
+          ? `<font color="#006600">[Yo]</font> ${renderAckLabel(message.ack_status)}`
+          : '';
 
         let senderPhone = null;
         if (!isSaliente && message.user_chat_id) {
@@ -218,9 +280,10 @@ export async function showGroupMessages(req, res, next) {
         }
         const phoneLink = senderPhone ? ` ${renderPhoneLink(senderPhone)}` : '';
 
+        const senderColor = getMemberColor(message.user_chat_id, memberColorMap);
         const usernameLine = isSaliente
           ? ''
-          : `<font size="1" color="#000000">[${message.username ? escapeXml(convertEmojisToAscii(message.username)) : 'Desconocido'}]${phoneLink} dice:</font><br/>`;
+          : `<font size="1" color="${senderColor}">[${message.username ? escapeXml(convertEmojisToAscii(message.username)) : 'Desconocido'}]${phoneLink} dice:</font><br/>`;
 
         messagesHtml +=
           `<p>${unseenMarker}${fromMeMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font><br/>` +
@@ -237,13 +300,138 @@ export async function showGroupMessages(req, res, next) {
       `<h1>${escapeXml(group.group_name)}</h1>` +
       '<p><a href="/">Inicio</a> | <a href="/grupo">Grupos</a></p>' +
       `<p><a href="/mensaje/componer?to=${encodeURIComponent(group.group_id)}&type=group"><b>[Enviar mensaje al grupo]</b></a></p>` +
-      `<p><a href="/grupo/${encodeURIComponent(group.group_id)}/silenciar">[${escapeXml(muteLabel)}]</a> | ` +
+      `<p><a href="/grupo/${encodeURIComponent(group.group_id)}/detalles">[Detalles]</a> | ` +
+      `<a href="/grupo/${encodeURIComponent(group.group_id)}/silenciar">[${escapeXml(muteLabel)}]</a> | ` +
       `<a href="/grupo/${encodeURIComponent(group.group_id)}/eliminar">[Eliminar]</a></p>` +
       renderPager(`/grupo/${group.group_id}`, page, totalPages) +
       messagesHtml +
       renderPager(`/grupo/${group.group_id}`, page, totalPages);
 
     sendPage(req, res, 200, group.group_name, body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function showGroupDetails(req, res, next) {
+  try {
+    const groupId = req.params.id;
+    if (!groupId || typeof groupId !== 'string' || groupId.trim() === '') {
+      sendInvalidEntity(req, res, 'Grupo');
+      return;
+    }
+
+    const groupRow = stmts.getGroupById.get(groupId);
+    if (!groupRow) {
+      sendMissingEntity(req, res, 'Grupo');
+      return;
+    }
+    const group = await ensureGroupDisplayName(groupRow);
+
+    const details = await fetchGroupDetailsDirectly(groupId);
+
+    let body =
+      `<h1>${escapeXml(group.group_name)}</h1>` +
+      '<p><a href="/">Inicio</a> | <a href="/grupo">Grupos</a> | ' +
+      `<a href="/grupo/${encodeURIComponent(groupId)}">Mensajes</a></p>`;
+
+    if (!details) {
+      const fallbackParticipants = stmts.getParticipantsByGroupId.all(groupId);
+      body +=
+        '<p>No se han podido obtener los detalles en este momento — puede que WhatsApp ' +
+        'no los tenga cacheados todavía. Prueba a abrir el grupo desde el móvil y vuelve ' +
+        'a intentarlo aquí.</p>' +
+        '<p>Participantes vistos escribiendo en este grupo (lista parcial, sin datos de ' +
+        'quién es admin):</p>';
+      body += fallbackParticipants.length
+        ? '<ul>' + fallbackParticipants.map((p) => `<li>${escapeXml(p.username || p.chat_id)}</li>`).join('') + '</ul>'
+        : '<p>Sin datos.</p>';
+
+      sendPage(req, res, 200, `${group.group_name} - Detalles`, body);
+      return;
+    }
+
+    // Resolver nombres locales de todos los participantes en una sola consulta,
+    // en vez de una llamada async por persona (un grupo puede tener decenas de gente).
+    const ids = details.participants.map((p) => p.id).filter(Boolean);
+    const namesByChatId = new Map();
+    if (ids.length) {
+      const placeholders = ids.map(() => '?').join(',');
+      const rows = db
+        .prepare(`SELECT chat_id, username FROM users WHERE chat_id IN (${placeholders})`)
+        .all(...ids);
+      rows.forEach((r) => namesByChatId.set(r.chat_id, r.username));
+    }
+
+    const resolveDisplay = (id) => namesByChatId.get(id) || formatPhoneNumber(id) || id;
+
+    if (details.desc) {
+      body += `<p>${escapeXml(details.desc)}</p>`;
+    }
+    if (details.creation) {
+      const createdDate = new Date(details.creation * 1000);
+      body += `<p><font size="1" color="#666666">Creado: ${escapeXml(createdDate.toLocaleDateString('es-ES'))}</font></p>`;
+    }
+    if (details.owner) {
+      body += `<p><font size="1" color="#666666">Propietario: ${escapeXml(resolveDisplay(details.owner))}</font></p>`;
+    }
+    if (details.hasParentCommunity) {
+      body += '<p><font size="1" color="#666666">Vinculado a una Comunidad de WhatsApp.</font></p>';
+    }
+
+    // "Anteriores" = gente vista escribiendo en el grupo (tabla local) que ya no
+    // aparece en la lista en vivo de WhatsApp. No hay fecha de salida, solo lo sabemos.
+    const currentIds = new Set(details.participants.map((p) => p.id));
+    const localParticipants = stmts.getParticipantsByGroupId.all(groupId);
+    const pastParticipants = localParticipants.filter((p) => !currentIds.has(p.chat_id));
+
+    // Reparto de colores sin colisiones: actuales + anteriores juntos, y usando el
+    // mismo conjunto que showGroupMessages (participantes locales) para que la misma
+    // persona se vea del mismo color aquí y en el historial de mensajes.
+    const memberColorMap = buildMemberColorMap([
+      ...localParticipants.map((p) => p.chat_id),
+      ...details.participants.map((p) => p.id),
+    ]);
+
+    const sortedParticipants = [...details.participants].sort((a, b) => {
+      const rank = (p) => (p.isSuperAdmin ? 0 : p.isAdmin ? 1 : 2);
+      const rankDiff = rank(a) - rank(b);
+      if (rankDiff !== 0) return rankDiff;
+      return resolveDisplay(a.id).localeCompare(resolveDisplay(b.id), 'es', { sensitivity: 'base' });
+    });
+
+    body += `<p>${sortedParticipants.length} participante${sortedParticipants.length === 1 ? '' : 's'}:</p>`;
+    body +=
+      '<ul>' +
+      sortedParticipants
+        .map((p) => {
+          const roleTag = p.isSuperAdmin
+            ? ' <font color="#cc0000">[Super Admin]</font>'
+            : p.isAdmin
+              ? ' <font color="#0000cc">[Admin]</font>'
+              : '';
+          const nameHtml = `<font color="${getMemberColor(p.id, memberColorMap)}">${escapeXml(resolveDisplay(p.id))}</font>`;
+          return `<li>${nameHtml}${roleTag}</li>`;
+        })
+        .join('') +
+      '</ul>';
+
+    if (pastParticipants.length) {
+      body +=
+        '<p><font size="1" color="#666666">Participantes anteriores (ya no están en el ' +
+        'grupo, vistos en el historial):</font></p>';
+      body +=
+        '<ul>' +
+        pastParticipants
+          .map((p) => {
+            const nameHtml = `<font color="${getMemberColor(p.chat_id, memberColorMap)}">${escapeXml(p.username || p.chat_id)}</font>`;
+            return `<li>${nameHtml}</li>`;
+          })
+          .join('') +
+        '</ul>';
+    }
+
+    sendPage(req, res, 200, `${group.group_name} - Detalles`, body);
   } catch (error) {
     next(error);
   }

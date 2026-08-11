@@ -350,16 +350,18 @@ export async function validateAndCreateChat(req, res, next) {
       }
     }
 
+    let sentMessage = null;
     if (hasImage) {
       const media = new MessageMedia(
         imageFile.mimetype,
         imageFile.buffer.toString('base64'),
         imageFile.originalname
       );
-      await client.sendMessage(targetJid, media, { ...options, caption: processedText });
+      sentMessage = await client.sendMessage(targetJid, media, { ...options, caption: processedText });
     } else {
-      await client.sendMessage(targetJid, processedText, options);
+      sentMessage = await client.sendMessage(targetJid, processedText, options);
     }
+    const whatsappMsgId = sentMessage?.id?._serialized ?? null;
 
     // CONTROL ESTRICTO DE FECHA/HORA EN FORMATO SQLITE ("YYYY-MM-DD HH:MM:SS")
     const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
@@ -382,10 +384,10 @@ export async function validateAndCreateChat(req, res, next) {
         stmts.upsertGroup.run(targetJid, groupName);
       }
       if (hasImage) {
-        const result = stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null);
+        const result = stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null, whatsappMsgId);
         insertedMessageId = result.lastInsertRowid;
       } else {
-        const result = stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid);
+        const result = stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid, whatsappMsgId);
         insertedMessageId = result.lastInsertRowid;
       }
       urlDestino = `/grupo/${encodeURIComponent(targetJid)}`;
@@ -402,10 +404,10 @@ export async function validateAndCreateChat(req, res, next) {
         stmts.upsertUser.run(targetJid, finalName);
       }
       if (hasImage) {
-        const result = stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null);
+        const result = stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null, whatsappMsgId);
         insertedMessageId = result.lastInsertRowid;
       } else {
-        const result = stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null);
+        const result = stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null, whatsappMsgId);
         insertedMessageId = result.lastInsertRowid;
       }
       urlDestino = `/usuario/${encodeURIComponent(targetJid)}`;
