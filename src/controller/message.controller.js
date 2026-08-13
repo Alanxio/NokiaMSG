@@ -7,6 +7,48 @@ import pkg from 'whatsapp-web.js';
 
 const { MessageMedia } = pkg;
 
+// Respaldo para cuando client.sendMessage() no devuelve el Message con su id. Probado en
+// vivo, por este orden, y descartado cada uno:
+//   1. sentMessage?.id (lo que debería devolver la librería) -> siempre vacío.
+//   2. chat.msgs de WWebJS.getChat(jid, {getAsModel:false}) -> colección vacía (0 msgs).
+//   3. client.getChatById(jid) + fetchMessages() -> revienta con el mismo "r: r" ya
+//      documentado para grupos, pero aquí pasa también en chats 1:1 — getChatById() es
+//      frágil en general en esta versión, no solo por groupMetadata.
+// Lo que sí funciona: mirar directamente la colección GLOBAL de mensajes (no la del
+// chat, que va con retraso) y quedarnos con el más reciente saliente de este chat.
+async function getLastSentMessageId(chatId) {
+  if (!client?.pupPage) return null;
+  try {
+    const result = await client.pupPage.evaluate((jid) => {
+      const allMsgs = window.require('WAWebCollections').Msg.getModelsArray();
+      let best = null;
+      const fromMeSample = [];
+      for (const msg of allMsgs) {
+        const remote = msg?.id?.remote;
+        const remoteId = typeof remote === 'object' ? remote?._serialized : remote;
+        if (msg?.id?.fromMe && fromMeSample.length < 5) {
+          fromMeSample.push({ remoteId, t: msg.t });
+        }
+        if (remoteId === jid && msg?.id?.fromMe) {
+          if (!best || (msg.t || 0) > (best.t || 0)) {
+            best = msg;
+          }
+        }
+      }
+      return {
+        total: allMsgs.length,
+        foundId: best?.id?._serialized || null,
+        sample: fromMeSample,
+      };
+    }, chatId);
+    console.log(`[mensaje] getLastSentMessageId: total=${result.total} foundId=${result.foundId} buscabaJid=${chatId} muestra=${JSON.stringify(result.sample)}`);
+    return result.foundId;
+  } catch (err) {
+    console.warn('[mensaje] getLastSentMessageId falló:', err?.name, err?.message);
+    return null;
+  }
+}
+
 function normalizeGroupName(rawName) {
   if (typeof rawName !== 'string' || !rawName.trim()) {
     return null;
@@ -19,8 +61,10 @@ function normalizeGroupName(rawName) {
 }
 
 // Asegúrate de que esta ruta apunte correctamente a donde exportas el cliente
-import { client } from '../services/whatsapp.service.js';
+import { client, resolveContactPhone } from '../services/whatsapp.service.js';
 import { ensureGroupDisplayName } from './group.controller.js';
+
+const EXISTING_CONTACT_ICON_HTML = '<img src="/assets/user.jpeg" alt="Contacto" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
 
 export const upload = multer({
   storage: multer.memoryStorage(),
@@ -129,7 +173,43 @@ export async function renderComposePage(req, res, next) {
       const queryClean = q.trim().toLowerCase();
       body += '<h2>Resultados:</h2>';
 
-      const allContacts = await client.getContacts();
+      // client.getContacts()/getChats() serializan TODA la libreta a través de Puppeteer: en
+      // una cuenta real pueden tardar mucho, quedarse colgados, o (getChats() en concreto,
+      // confirmado en logs) reventar con el mismo "r: r" ya documentado para
+      // groupMetadata/getChatById — frágil en general en este entorno. Antes esa excepción
+      // se colaba sin capturar hasta el manejador de errores (página 500), que el navegador
+      // WAP del Nokia no sabe mostrar bien ("respuesta desconocida"). Aquí se atrapa
+      // cualquier fallo o lentitud y se sigue con lo que ya tengamos de la BD local, en vez
+      // de dejar caer toda la petición.
+      const withTimeout = (promise, ms) =>
+        Promise.race([
+          Promise.resolve(promise).catch((err) => {
+            console.warn('[buscador] llamada en vivo a WhatsApp falló:', err?.name, err?.message);
+            return null;
+          }),
+          new Promise((resolve) => setTimeout(() => resolve(null), ms)),
+        ]);
+
+      // Búsqueda local primero: rápida y siempre disponible. `users.username` se rellena para
+      // cualquiera que haya escrito alguna vez, sea por mensaje directo o dentro de un grupo
+      // (ver upsertUser en notification.controller.js) — así encontramos también a gente sin
+      // historial de mensajes directos, que es justo el caso que fallaba con solo
+      // client.getContacts() (que solo conoce contactos guardados en la agenda del teléfono).
+      const localMatches = db.prepare(`
+        SELECT DISTINCT chat_id, username FROM users
+        WHERE username IS NOT NULL AND username != '' AND LOWER(username) LIKE ?
+        ORDER BY username ASC
+        LIMIT 10
+      `).all(`%${queryClean}%`);
+
+      const localGroupMatches = db.prepare(`
+        SELECT group_id, group_name FROM wgroups
+        WHERE group_name IS NOT NULL AND group_name != '' AND LOWER(group_name) LIKE ?
+        ORDER BY group_name ASC
+        LIMIT 10
+      `).all(`%${queryClean}%`);
+
+      const allContacts = (await withTimeout(client.getContacts(), 8000)) || [];
       const uniqueContactsMap = new Map();
 
       function normalizeContactName(value) {
@@ -176,10 +256,71 @@ export async function renderComposePage(req, res, next) {
         return nameLower.includes(queryClean) || contact.chatId.includes(queryClean);
       });
 
-      const allChats = await client.getChats();
+      // Añadir los resultados de la BD local que la vía en vivo no trajo (gente sin
+      // historial de mensaje directo, o si getContacts() no respondió a tiempo), evitando
+      // duplicar a alguien que ya haya salido por la vía en vivo (mismo chat_id o mismo
+      // nombre).
+      const liveChatIds = new Set(filteredContacts.map(c => c.chatId));
+      const liveNames = new Set(filteredContacts.map(c => normalizeContactName(c.displayName)));
+      localMatches.forEach(u => {
+        if (liveChatIds.has(u.chat_id) || liveNames.has(normalizeContactName(u.username))) return;
+        filteredContacts.push({
+          chatId: u.chat_id,
+          displayName: u.username,
+          hasRealName: true,
+          isBusiness: false,
+          isMyContact: false,
+          isLid: false,
+        });
+      });
+
+      // Si la misma persona aparece con cuenta personal y de empresa bajo nombres distintos
+      // (por lo que el deduplicado de arriba, que compara por nombre, no los une), priorizar
+      // la personal: quien busca casi siempre quiere hablar con la persona, no con el número
+      // de empresa. `sort` es estable, así que dentro de cada grupo se conserva el orden
+      // original.
+      filteredContacts.sort((a, b) => (a.isBusiness === b.isBusiness) ? 0 : (a.isBusiness ? 1 : -1));
+
+      // Número de teléfono por resultado, mismo criterio que ya usa showGroupDetails en
+      // group.controller.js: para @lid (id interno, no son dígitos de un número real) hace
+      // falta resolverlo en vivo; para @c.us los dígitos ya están en el propio chat_id.
+      await Promise.all(filteredContacts.map(async (contact) => {
+        contact.phone = contact.chatId.endsWith('@lid')
+          ? await resolveContactPhone(contact.chatId)
+          : formatPhoneNumber(contact.chatId);
+      }));
+
+      // El icono de "contacto existente" indica que ya está en los Contactos del Nokia (la
+      // BD local), es decir, que tiene historial de mensaje directo — el mismo criterio que
+      // usa la lista de /usuario (getAllUsers). No usar "viene de la vía en vivo": alguien
+      // como Olga puede existir en WhatsApp pero no estar todavía guardada como contacto en
+      // el Nokia, y no debe llevar el icono aunque la búsqueda la haya encontrado en vivo.
+      const candidateIds = filteredContacts.map(c => c.chatId);
+      const existingContactIds = candidateIds.length > 0
+        ? new Set(
+            db.prepare(`
+              SELECT DISTINCT user_chat_id FROM messages
+              WHERE group_id IS NULL AND user_chat_id IN (${candidateIds.map(() => '?').join(',')})
+            `).all(...candidateIds).map(r => r.user_chat_id)
+          )
+        : new Set();
+      filteredContacts.forEach(contact => {
+        contact.isExistingContact = existingContactIds.has(contact.chatId);
+      });
+
+      const allChats = (await withTimeout(client.getChats(), 8000)) || [];
       const filteredGroups = allChats.filter(c => {
         const groupName = (c.name || '').toLowerCase();
         return c.isGroup && groupName.includes(queryClean);
+      });
+
+      const liveGroupIds = new Set(filteredGroups.map(g => g.id._serialized));
+      localGroupMatches.forEach(g => {
+        if (liveGroupIds.has(g.group_id)) return;
+        filteredGroups.push({
+          id: { _serialized: g.group_id },
+          name: g.group_name,
+        });
       });
 
       let coincidenciaEncontrada = false;
@@ -188,7 +329,9 @@ export async function renderComposePage(req, res, next) {
         coincidenciaEncontrada = true;
         body += '<h3>Contactos</h3>';
         filteredContacts.slice(0, 5).forEach(contact => {
-          body += `<p>• <a href="/mensaje/componer?to=${encodeURIComponent(contact.chatId)}&type=user"><b>${escapeXml(contact.displayName)}</b></a></p>`;
+          const iconHtml = contact.isExistingContact ? `${EXISTING_CONTACT_ICON_HTML} ` : '';
+          const phoneHtml = contact.phone ? `<br/>${renderPhoneLink(contact.phone)}` : '';
+          body += `<p>${iconHtml}• <a href="/mensaje/componer?to=${encodeURIComponent(contact.chatId)}&type=user"><b>${escapeXml(contact.displayName)}</b></a>${phoneHtml}</p>`;
         });
       }
 
@@ -350,6 +493,8 @@ export async function validateAndCreateChat(req, res, next) {
       }
     }
 
+    options.waitUntilMsgSent = true;
+
     let sentMessage = null;
     if (hasImage) {
       const media = new MessageMedia(
@@ -361,7 +506,12 @@ export async function validateAndCreateChat(req, res, next) {
     } else {
       sentMessage = await client.sendMessage(targetJid, processedText, options);
     }
-    const whatsappMsgId = sentMessage?.id?._serialized ?? null;
+
+    // En esta versión de whatsapp-web.js, client.sendMessage() puede no devolver el
+    // Message con su id (el mensaje se manda bien de todos modos) — se comprobó en vivo:
+    // sin excepción, sin id. Respaldo: leerlo directamente de la colección de mensajes
+    // del chat en vez de fiarse del valor de retorno de la librería.
+    const whatsappMsgId = sentMessage?.id?._serialized || (await getLastSentMessageId(targetJid));
 
     // CONTROL ESTRICTO DE FECHA/HORA EN FORMATO SQLITE ("YYYY-MM-DD HH:MM:SS")
     const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));

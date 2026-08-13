@@ -1,4 +1,5 @@
 import { stmts } from '../../db/db.js';
+import { renderEmojisHtml } from '../utils/emoji.js';
 
 export const DIRECTORY_PAGE_SIZE = 20;
 export const MESSAGE_PAGE_SIZE = 12;
@@ -97,7 +98,7 @@ export function renderMentions(value = '') {
   if (!value) return '';
   const escaped = escapeXml(value).replace(/\r?\n/g, '<br/>');
 
-  return escaped.replace(
+  const withMentions = escaped.replace(
     /(@[A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,}(?: [A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,})*)/g,
     (match) => {
       if (EMAIL_DOMAIN_RE.test(match)) {
@@ -119,6 +120,10 @@ export function renderMentions(value = '') {
       return `<font color="#000099"><b>${display}</b></font>`;
     }
   );
+
+  // Al final: los caracteres emoji no los toca escapeXml, así que siguen intactos
+  // hasta aquí. Sustituirlos ahora evita que el <img> que insertamos se escape.
+  return renderEmojisHtml(withMentions);
 }
 
 export function toPositiveInt(value, fallback = 1) {

@@ -1,5 +1,4 @@
 import db, { stmts } from '../../db/db.js';
-import { convertEmojisToAscii } from '../utils/emoji.js';
 import { getRequestPayload } from '../utils/request.js';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
@@ -194,7 +193,7 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       console.log('[DB] ¡Hora cazada y corregida de 00:00 a:', correctedTime);
     }
 
-    const processedMessage = convertEmojisToAscii(message.trim().slice(0, 65535));
+    const processedMessage = message.trim().slice(0, 65535);
 
     db.exec('BEGIN');
 
@@ -328,9 +327,16 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       // y el chat no está silenciado (el silencio no afecta al contador de no leídos)
       if (!fromMe && previousUnseen === 0 && !isSmsMuted) {
         console.log(`[SMS] Disparando notificación (previousUnseen=${previousUnseen}, muted=${isSmsMuted})`);
+        // Para el nombre de grupo del SMS, usar el que ya está guardado en wgroups (el
+        // dato fiable, protegido por la lógica de "shouldUpdate" de más arriba) en vez
+        // de nameOrGroupName, que viene directo de la ingesta y puede ser un ID en
+        // crudo si la resolución en vivo falló para este mensaje en concreto.
+        const smsGroupName = isGroup
+          ? (stmts.getGroupById.get(finalGroupId)?.group_name || nameOrGroupName)
+          : nameOrGroupName;
         sendSmsNotification({
           type: isGroup ? 'group' : 'user',
-          groupName: nameOrGroupName,
+          groupName: smsGroupName,
           username: username,
           chatId: isGroup ? finalGroupId : finalUserChatId
         }).catch(err => console.error('[SMS] Fallo al lanzar notificación:', err));

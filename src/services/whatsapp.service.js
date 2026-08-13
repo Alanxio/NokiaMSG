@@ -8,7 +8,7 @@ import { saveInteraction } from '../controller/notification.controller.js';
 import { marcarNovedad } from './polling.service.js';
 import { resolveMentions } from '../utils/mentions.js';
 import { saveImageVersions, processSticker } from '../utils/media.js';
-import { resolvePendingGroupNames } from '../controller/group.controller.js';
+import { resolvePendingGroupNames, resolveGroupNameFromWhatsapp } from '../controller/group.controller.js';
 
 const { Client, LocalAuth } = pkg;
 
@@ -689,7 +689,10 @@ export async function startWhatsappClient(processMessageFn) {
       let title, senderName, groupName;
 
       if (isGroup) {
-        groupName = chat?.name || chatId?.replace(/@.*$/, '') || 'Grupo sin nombre';
+        // chat?.name viene de msg.getChat(), que puede toparse con el mismo bug de
+        // "r: r" ya documentado (groupMetadata.update()) — probamos primero la vía
+        // segura ya usada en el resto de la app antes de caer al ID en crudo.
+        groupName = (await resolveGroupNameFromWhatsapp(chatId)) || chat?.name || chatId?.replace(/@.*$/, '') || 'Grupo sin nombre';
         try {
           const contact = await msg.getContact();
           senderName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || msg.author?.replace(/@.*$/, '') || 'Desconocido';
