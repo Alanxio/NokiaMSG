@@ -60,6 +60,55 @@ export function renderAckLabel(ackStatus) {
   return '<font color="#888888">[Enviado]</font> ';
 }
 
+function formatDurationLabel(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// message: fila con media_type, file_path_full, file_name, duration_sec (getUserMessagesPaginated /
+// getGroupMessagesPaginated / getMessageByIdWithMedia). Devuelve null si no es un tipo de media nuevo
+// (imagen/sticker siguen su propio camino de render, sin pasar por aquí).
+export function renderMediaLine(message, { linkToDetail = null } = {}) {
+  const type = message?.media_type;
+  if (!type) return null;
+
+  const fileName = message.file_path_full ? String(message.file_path_full).split('/').pop() : null;
+  const dur = message.duration_sec ? ` (${formatDurationLabel(message.duration_sec)})` : '';
+  let label, actionHtml;
+
+  switch (type) {
+    case 'ptt':
+      label = `Nota de voz${dur}`;
+      actionHtml = fileName ? `<a href="/descargar/${escapeXml(fileName)}">[Escuchar]</a>` : '';
+      break;
+    case 'audio':
+      label = `Audio${dur}`;
+      actionHtml = fileName ? `<a href="/descargar/${escapeXml(fileName)}">[Escuchar]</a>` : '';
+      break;
+    case 'video':
+      label = `Video${dur}`;
+      actionHtml = fileName ? `<a href="/descargar/${escapeXml(fileName)}">[Descargar]</a>` : '';
+      break;
+    case 'document': {
+      const docName = message.file_name ? truncateName(message.file_name, 40) : 'archivo';
+      label = `Documento: ${escapeXml(docName)}`;
+      actionHtml = fileName ? `<a href="/descargar/${escapeXml(fileName)}">[Descargar]</a>` : '';
+      break;
+    }
+    case 'location': {
+      const place = message.file_name ? truncateName(message.file_name, 40) : 'Ubicación compartida';
+      label = `Ubicación: ${escapeXml(place)}`;
+      actionHtml = message.file_path_full ? `<a href="${escapeXml(message.file_path_full)}">[Ver mapa]</a>` : '';
+      break;
+    }
+    default:
+      return null;
+  }
+
+  const verLink = linkToDetail ? ` <a href="${escapeXml(linkToDetail)}">[Ver]</a>` : '';
+  return `<i>[${label}]</i> ${actionHtml}${verLink}`;
+}
+
 const MEMBER_COLOR_PALETTE = [
   '#E91E63', '#FF6F00', '#9C27B0', '#00838F', '#F57F17',
   '#6A1B9A', '#00ACC1', '#AD1457', '#EF6C00', '#5E35B1',

@@ -1,53 +1,11 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { escapeXml, formatPhoneNumber, isNumericOrJid, renderMentions, renderPhoneLink, sendPage } from './page.controller.js';
+import { escapeXml, formatPhoneNumber, isNumericOrJid, renderMediaLine, renderMentions, renderPhoneLink, sendPage } from './page.controller.js';
 import { processAndAttachMedia } from '../utils/media.js';
 import multer from 'multer';
 import pkg from 'whatsapp-web.js';
 
 const { MessageMedia } = pkg;
-
-// Respaldo para cuando client.sendMessage() no devuelve el Message con su id. Probado en
-// vivo, por este orden, y descartado cada uno:
-//   1. sentMessage?.id (lo que debería devolver la librería) -> siempre vacío.
-//   2. chat.msgs de WWebJS.getChat(jid, {getAsModel:false}) -> colección vacía (0 msgs).
-//   3. client.getChatById(jid) + fetchMessages() -> revienta con el mismo "r: r" ya
-//      documentado para grupos, pero aquí pasa también en chats 1:1 — getChatById() es
-//      frágil en general en esta versión, no solo por groupMetadata.
-// Lo que sí funciona: mirar directamente la colección GLOBAL de mensajes (no la del
-// chat, que va con retraso) y quedarnos con el más reciente saliente de este chat.
-async function getLastSentMessageId(chatId) {
-  if (!client?.pupPage) return null;
-  try {
-    const result = await client.pupPage.evaluate((jid) => {
-      const allMsgs = window.require('WAWebCollections').Msg.getModelsArray();
-      let best = null;
-      const fromMeSample = [];
-      for (const msg of allMsgs) {
-        const remote = msg?.id?.remote;
-        const remoteId = typeof remote === 'object' ? remote?._serialized : remote;
-        if (msg?.id?.fromMe && fromMeSample.length < 5) {
-          fromMeSample.push({ remoteId, t: msg.t });
-        }
-        if (remoteId === jid && msg?.id?.fromMe) {
-          if (!best || (msg.t || 0) > (best.t || 0)) {
-            best = msg;
-          }
-        }
-      }
-      return {
-        total: allMsgs.length,
-        foundId: best?.id?._serialized || null,
-        sample: fromMeSample,
-      };
-    }, chatId);
-    console.log(`[mensaje] getLastSentMessageId: total=${result.total} foundId=${result.foundId} buscabaJid=${chatId} muestra=${JSON.stringify(result.sample)}`);
-    return result.foundId;
-  } catch (err) {
-    console.warn('[mensaje] getLastSentMessageId falló:', err?.name, err?.message);
-    return null;
-  }
-}
 
 function normalizeGroupName(rawName) {
   if (typeof rawName !== 'string' || !rawName.trim()) {
@@ -63,6 +21,7 @@ function normalizeGroupName(rawName) {
 // Asegúrate de que esta ruta apunte correctamente a donde exportas el cliente
 import { client, resolveContactPhone } from '../services/whatsapp.service.js';
 import { ensureGroupDisplayName } from './group.controller.js';
+import { registerPendingOutgoing } from '../services/pending-outgoing.service.js';
 
 const EXISTING_CONTACT_ICON_HTML = '<img src="/assets/user.jpeg" alt="Contacto" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
 
@@ -508,10 +467,11 @@ export async function validateAndCreateChat(req, res, next) {
     }
 
     // En esta versión de whatsapp-web.js, client.sendMessage() puede no devolver el
-    // Message con su id (el mensaje se manda bien de todos modos) — se comprobó en vivo:
-    // sin excepción, sin id. Respaldo: leerlo directamente de la colección de mensajes
-    // del chat en vez de fiarse del valor de retorno de la librería.
-    const whatsappMsgId = sentMessage?.id?._serialized || (await getLastSentMessageId(targetJid));
+    // Message con su id (el mensaje se manda bien de todos modos) — comprobado en vivo:
+    // sin excepción, sin id. Si no llega aquí, se enlaza más tarde de forma asíncrona
+    // cuando WhatsApp confirme el envío por su cuenta vía el evento message_create (ver
+    // registerPendingOutgoing más abajo y su consumo en whatsapp.service.js).
+    const whatsappMsgId = sentMessage?.id?._serialized || null;
 
     // CONTROL ESTRICTO DE FECHA/HORA EN FORMATO SQLITE ("YYYY-MM-DD HH:MM:SS")
     const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
@@ -561,6 +521,10 @@ export async function validateAndCreateChat(req, res, next) {
         insertedMessageId = result.lastInsertRowid;
       }
       urlDestino = `/usuario/${encodeURIComponent(targetJid)}`;
+    }
+
+    if (!whatsappMsgId && insertedMessageId) {
+      registerPendingOutgoing(targetJid, insertedMessageId);
     }
 
     if (hasImage && insertedMessageId && imageFile?.buffer) {
@@ -638,21 +602,24 @@ export async function showMessageDetail(req, res, next) {
       : escapeXml(sentAt);
 
     const isSticker = Number(message.is_sticker) === 1;
+    const mediaType = message.media_type || null;
     let contentHtml = '';
 
     if (isSticker && attachment?.file_path_thumb) {
       contentHtml += `<p><img src="${escapeXml(attachment.file_path_thumb)}" alt="Sticker" width="40"/></p>`;
     } else if (attachment?.file_path_view) {
       contentHtml += `<p><img src="${escapeXml(attachment.file_path_view)}" alt="Imagen" width="${attachment.view_width || 120}" height="${attachment.view_height || 90}"/></p>`;
+    } else if (mediaType) {
+      contentHtml += `<p>${renderMediaLine(message, {})}</p>`;
     }
 
     if (message.text && message.text !== '[Imagen]') {
       contentHtml += `<p>${renderMentions(message.text)}</p>`;
-    } else if (!attachment?.file_path_view && !isSticker) {
+    } else if (!attachment?.file_path_view && !isSticker && !mediaType) {
       contentHtml += `<p>${renderMentions(message.text || '')}</p>`;
     }
 
-    if (!isSticker && attachment?.file_path_full) {
+    if (!isSticker && !mediaType && attachment?.file_path_full) {
       const fileName = attachment.file_path_full.split('/').pop();
       contentHtml += `<p><a href="/descargar/${escapeXml(fileName)}">Descargar imagen</a></p>`;
     }

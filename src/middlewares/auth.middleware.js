@@ -27,6 +27,14 @@ function wapDeny(req, res) {
   return res.send(page);
 }
 
+// Última vez que el Nokia cargó una página autenticada — usado para saber si "sigue en la
+// web" y así no mandarle un SMS de aviso que ya es redundante.
+let lastActivityAt = 0;
+
+export function getLastActivityAt() {
+  return lastActivityAt;
+}
+
 export function requireAuth(req, res, next) {
   const cookies = parseCookies(req.headers.cookie);
   const sessionId  = cookies['session_id'];
@@ -35,11 +43,13 @@ export function requireAuth(req, res, next) {
 
   // 1. Sesión activa válida
   if (sessionId && isValidSession(sessionId, ip)) {
+    lastActivityAt = Date.now();
     return next();
   }
 
   // 2. Token de "Recordarme" de larga duración (no depende de la IP)
   if (isValidTrustToken(trustToken)) {
+    lastActivityAt = Date.now();
     return next();
   }
 

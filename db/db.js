@@ -95,6 +95,51 @@ try {
 } catch {
   // Columna ya existe, ignorar
 }
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN sms_notified INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE wgroups ADD COLUMN sms_notified INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN quoted_text TEXT`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN quoted_sender TEXT`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN is_deleted INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN is_edited INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN is_system INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN media_type TEXT`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE attachments ADD COLUMN duration_sec INTEGER`);
+} catch {
+  // Columna ya existe, ignorar
+}
 
 export const stmts = {
   upsertUser: db.prepare(`
@@ -104,11 +149,11 @@ export const stmts = {
   `),
 
   getUserByChatId: db.prepare(`
-    SELECT chat_id, username, unseen_count, sms_muted FROM users WHERE chat_id = ? LIMIT 1
+    SELECT chat_id, username, unseen_count, sms_muted, sms_notified FROM users WHERE chat_id = ? LIMIT 1
   `),
 
   getUserByUsername: db.prepare(`
-    SELECT chat_id, username, unseen_count, sms_muted FROM users WHERE username = ? LIMIT 1
+    SELECT chat_id, username, unseen_count, sms_muted, sms_notified FROM users WHERE username = ? LIMIT 1
   `),
 
   updateUserChatId: db.prepare(`
@@ -120,11 +165,15 @@ export const stmts = {
   `),
 
   resetUserUnseen: db.prepare(`
-    UPDATE users SET unseen_count = 0 WHERE chat_id = ?
+    UPDATE users SET unseen_count = 0, sms_notified = 0 WHERE chat_id = ?
   `),
 
   setUserSmsMuted: db.prepare(`
     UPDATE users SET sms_muted = ? WHERE chat_id = ?
+  `),
+
+  setUserSmsNotified: db.prepare(`
+    UPDATE users SET sms_notified = 1 WHERE chat_id = ?
   `),
 
   countMessagesByUserChatId: db.prepare(`
@@ -162,11 +211,11 @@ export const stmts = {
   `),
 
   getGroupByName: db.prepare(`
-    SELECT group_id, group_name, unseen_count, sms_muted FROM wgroups WHERE group_name = ? LIMIT 1
+    SELECT group_id, group_name, unseen_count, sms_muted, sms_notified FROM wgroups WHERE group_name = ? LIMIT 1
   `),
 
   getGroupById: db.prepare(`
-    SELECT group_id, group_name, unseen_count, sms_muted FROM wgroups WHERE group_id = ? LIMIT 1
+    SELECT group_id, group_name, unseen_count, sms_muted, sms_notified FROM wgroups WHERE group_id = ? LIMIT 1
   `),
 
   incrementGroupUnseen: db.prepare(`
@@ -174,11 +223,15 @@ export const stmts = {
   `),
 
   resetGroupUnseen: db.prepare(`
-    UPDATE wgroups SET unseen_count = 0 WHERE group_id = ?
+    UPDATE wgroups SET unseen_count = 0, sms_notified = 0 WHERE group_id = ?
   `),
 
   setGroupSmsMuted: db.prepare(`
     UPDATE wgroups SET sms_muted = ? WHERE group_id = ?
+  `),
+
+  setGroupSmsNotified: db.prepare(`
+    UPDATE wgroups SET sms_notified = 1 WHERE group_id = ?
   `),
 
   getAttachmentsByGroupId: db.prepare(`
@@ -235,6 +288,18 @@ export const stmts = {
     UPDATE messages SET ack_status = ? WHERE whatsapp_msg_id = ? AND ack_status < ?
   `),
 
+  setMessageWhatsappId: db.prepare(`
+    UPDATE messages SET whatsapp_msg_id = ? WHERE id = ?
+  `),
+
+  markMessageDeleted: db.prepare(`
+    UPDATE messages SET text = ?, is_deleted = 1 WHERE whatsapp_msg_id = ?
+  `),
+
+  markMessageEdited: db.prepare(`
+    UPDATE messages SET text = ?, is_edited = 1 WHERE whatsapp_msg_id = ?
+  `),
+
   insertMessageSafe: db.prepare(`
     INSERT OR IGNORE INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, media_key, whatsapp_msg_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -273,8 +338,10 @@ export const stmts = {
 
   getUserMessagesPaginated: db.prepare(`
     SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.ack_status,
+           m.quoted_text, m.quoted_sender, m.is_deleted, m.is_edited, m.is_system,
+           m.media_type,
            g.group_name,
-           a.file_path_thumb
+           a.file_path_thumb, a.file_path_full, a.file_name, a.duration_sec
     FROM messages m
     LEFT JOIN wgroups g ON g.group_id = m.group_id
     LEFT JOIN attachments a ON a.message_id = m.id
@@ -285,8 +352,10 @@ export const stmts = {
 
   getGroupMessagesPaginated: db.prepare(`
     SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.ack_status,
+           m.quoted_text, m.quoted_sender, m.is_deleted, m.is_edited, m.is_system,
+           m.media_type,
            u.username, u.chat_id AS user_chat_id,
-           a.file_path_thumb
+           a.file_path_thumb, a.file_path_full, a.file_name, a.duration_sec
     FROM messages m
     LEFT JOIN users u ON u.chat_id = m.user_chat_id
     LEFT JOIN attachments a ON a.message_id = m.id
@@ -358,8 +427,8 @@ export const stmts = {
   `),
 
   insertAttachment: db.prepare(`
-    INSERT INTO attachments (message_id, media_key, mime_type, file_name, file_size, file_path_full, file_path_view, file_path_thumb, album_order, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO attachments (message_id, media_key, mime_type, file_name, file_size, file_path_full, file_path_view, file_path_thumb, duration_sec, album_order, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
 
   getLastMessageWithMedia: db.prepare(`
@@ -406,9 +475,10 @@ export const stmts = {
 
   getMessageByIdWithMedia: db.prepare(`
     SELECT m.id, m.text, m.day_send, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.media_key,
+           m.media_type,
            u.username, u.chat_id AS user_chat_id,
            g.group_name, m.group_id,
-           a.file_path_full, a.file_path_view, a.file_path_thumb, a.mime_type
+           a.file_path_full, a.file_path_view, a.file_path_thumb, a.mime_type, a.file_name, a.duration_sec
     FROM messages m
     LEFT JOIN users   u ON u.chat_id  = m.user_chat_id
     LEFT JOIN wgroups g ON g.group_id = m.group_id
@@ -434,11 +504,11 @@ export const stmts = {
   `),
 
   resetAllUsersUnseen: db.prepare(`
-    UPDATE users SET unseen_count = 0
+    UPDATE users SET unseen_count = 0, sms_notified = 0
   `),
 
   resetAllGroupsUnseen: db.prepare(`
-    UPDATE wgroups SET unseen_count = 0
+    UPDATE wgroups SET unseen_count = 0, sms_notified = 0
   `),
 
   getUsersWithUnseen: db.prepare(`
@@ -449,12 +519,17 @@ export const stmts = {
     SELECT group_id FROM wgroups WHERE unseen_count > 0
   `),
 
+  // sms_notified solo se resetea aquí cuando WhatsApp reporta el chat como leído (0) desde
+  // otro dispositivo — si el valor que llega es mayor que 0 se deja tal cual, para no pisar
+  // la marca de "ya avisé por SMS" que pone saveInteraction.
   updateUserUnseen: db.prepare(`
-    UPDATE users SET unseen_count = ? WHERE chat_id = ? OR chat_id LIKE ?
+    UPDATE users SET unseen_count = ?, sms_notified = CASE WHEN ? = 0 THEN 0 ELSE sms_notified END
+    WHERE chat_id = ? OR chat_id LIKE ?
   `),
 
   updateGroupUnseen: db.prepare(`
-    UPDATE wgroups SET unseen_count = ? WHERE group_id = ?
+    UPDATE wgroups SET unseen_count = ?, sms_notified = CASE WHEN ? = 0 THEN 0 ELSE sms_notified END
+    WHERE group_id = ?
   `),
 
   getUserByPhonePattern: db.prepare(`

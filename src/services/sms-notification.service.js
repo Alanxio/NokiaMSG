@@ -61,23 +61,7 @@ export function getSmsNotificationStatus() {
   return { enabled: true, status: 'enabled', missing: [] };
 }
 
-export async function sendSmsNotification(payload) {
-  const config = getSmsConfig();
-  const status = getSmsNotificationStatus();
-
-  if (!status.enabled) {
-    return { status: status.status, missing: status.missing };
-  }
-
-  const sourceName = payload.type === 'group'
-    ? payload.groupName
-    : payload.username;
-
-  const chatUrl = buildChatUrl(payload);
-  const smsText = chatUrl
-    ? `¡Tienes un mensaje de ${normalizeAsciiText(sourceName, 'Desconocido')}! ${chatUrl}`
-    : `¡Tienes un mensaje de ${normalizeAsciiText(sourceName, 'Desconocido')}!`;
-
+async function sendRawSms(config, smsText) {
   try {
     const client = twilio(config.accountSid, config.authToken);
     const message = await client.messages.create({
@@ -91,4 +75,40 @@ export async function sendSmsNotification(payload) {
     console.error(`[SMS] Error enviando con Twilio SDK (code: ${err.code}):`, err.message);
     return { status: 'failed', error: err.message };
   }
+}
+
+export async function sendSmsNotification(payload) {
+  const config = getSmsConfig();
+  const status = getSmsNotificationStatus();
+
+  if (!status.enabled) {
+    return { status: status.status, missing: status.missing };
+  }
+
+  const sourceName = payload.type === 'group'
+    ? payload.groupName
+    : payload.username;
+
+  const chatUrl = buildChatUrl(payload);
+  // Saltos de línea entre el mensaje y el link: así el preview de notificación del
+  // smartphone (que solo muestra las primeras líneas) enseña el texto, no el link — y el
+  // link se puede seguir usando al abrir el SMS completo.
+  const smsText = chatUrl
+    ? `¡Tienes un mensaje de ${normalizeAsciiText(sourceName, 'Desconocido')}!\n\n\n${chatUrl}`
+    : `¡Tienes un mensaje de ${normalizeAsciiText(sourceName, 'Desconocido')}!`;
+
+  return sendRawSms(config, smsText);
+}
+
+// Alerta genérica de infraestructura (p.ej. WhatsApp lleva mucho desconectado) — mismo canal
+// Twilio ya configurado, sin el enlace al chat que sí lleva sendSmsNotification.
+export async function sendInfraAlertSms(text) {
+  const config = getSmsConfig();
+  const status = getSmsNotificationStatus();
+
+  if (!status.enabled) {
+    return { status: status.status, missing: status.missing };
+  }
+
+  return sendRawSms(config, text);
 }

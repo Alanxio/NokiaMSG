@@ -7,6 +7,9 @@ import {
   sendSmsNotification,
 } from '../services/sms-notification.service.js';
 import { isNumericOrJid } from './page.controller.js';
+import { getLastActivityAt } from '../middlewares/auth.middleware.js';
+
+const SMS_SKIP_IF_ACTIVE_WITHIN_MS = 30_000;
 
 function normalizeGroupName(rawName) {
   if (typeof rawName !== 'string' || !rawName.trim()) {
@@ -113,6 +116,16 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
     let whatsappMsgId = payload.whatsapp_msg_id || null;
     let fromMe = payload.from_me ?? 0;
     let isSticker = payload.is_sticker ?? 0;
+    const isSystem = payload.is_system ?? 0;
+    const mediaType = (typeof payload.media_type === 'string' && payload.media_type.trim())
+      ? payload.media_type.trim().slice(0, 20)
+      : null;
+    const quotedText = typeof payload.quoted_text === 'string' && payload.quoted_text.trim()
+      ? payload.quoted_text.trim().slice(0, 300)
+      : null;
+    const quotedSender = typeof payload.quoted_sender === 'string' && payload.quoted_sender.trim()
+      ? payload.quoted_sender.trim().slice(0, 100)
+      : null;
 
     // =========================================================================
     // SEGURIDAD RADICAL: Forzar from_me a 0 o 1 basándonos en el ID oficial
@@ -267,8 +280,8 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       // SOLUCIÓN AL [Yo]: Inserción segura con parámetros explícitos y nombrados
       // =========================================================================
       const msgResult = db.prepare(`
-        INSERT OR IGNORE INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, is_sticker, media_key, whatsapp_msg_id)
-        VALUES (@text, @day_send, @hour_send, @from_me, @user_chat_id, @group_id, @has_media, @is_sticker, @media_key, @whatsapp_msg_id)
+        INSERT OR IGNORE INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, is_sticker, media_key, whatsapp_msg_id, quoted_text, quoted_sender, is_system, media_type)
+        VALUES (@text, @day_send, @hour_send, @from_me, @user_chat_id, @group_id, @has_media, @is_sticker, @media_key, @whatsapp_msg_id, @quoted_text, @quoted_sender, @is_system, @media_type)
       `).run({
         text: processedMessage,
         day_send: daySend,
@@ -279,7 +292,11 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
         has_media: hasMedia ? 1 : 0,
         is_sticker: isSticker ? 1 : 0,
         media_key: mediaKey,
-        whatsapp_msg_id: whatsappMsgId
+        whatsapp_msg_id: whatsappMsgId,
+        quoted_text: quotedText,
+        quoted_sender: quotedSender,
+        is_system: isSystem ? 1 : 0,
+        media_type: mediaType
       });
 
       if (msgResult.changes === 0) {
@@ -291,18 +308,26 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
 
       const messageId = msgResult.lastInsertRowid;
 
-      // Consultar unseen ANTES de incrementar para decidir si enviar SMS
+      // sms_notified (no unseen_count) decide si toca SMS: unseen_count también lo escribe
+      // por su cuenta el listener de unreadCount de WhatsApp (ver applyChatUnreadCount en
+      // whatsapp.service.js), y esa escritura puede adelantarse a esta — sobre todo con
+      // media, que tarda en descargarse antes de llegar aquí — dejando previousUnseen en 1
+      // aunque sea el primer mensaje real. sms_notified es un estado que solo esta función
+      // controla, así que no sufre esa carrera.
       let previousUnseen = 0;
       let isSmsMuted = false;
+      let alreadyNotified = false;
       if (isGroup) {
         const groupRow = stmts.getGroupById.get(finalGroupId);
         previousUnseen = groupRow?.unseen_count || 0;
         isSmsMuted = Number(groupRow?.sms_muted) === 1;
+        alreadyNotified = Number(groupRow?.sms_notified) === 1;
         stmts.incrementGroupUnseen.run(finalGroupId);
       } else {
         const userRow = stmts.getUserByChatId.get(finalUserChatId);
         previousUnseen = userRow?.unseen_count || 0;
         isSmsMuted = Number(userRow?.sms_muted) === 1;
+        alreadyNotified = Number(userRow?.sms_notified) === 1;
         stmts.incrementUserUnseen.run(finalUserChatId);
       }
 
@@ -316,6 +341,7 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
           mediaInfo.filePathFull || mediaInfo.originalPath,
           mediaInfo.filePathView || null,
           mediaInfo.filePathThumb || null,
+          mediaInfo.durationSec ?? null,
           0,
           Math.floor(Date.now() / 1000)
         );
@@ -323,10 +349,19 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
 
       db.exec('COMMIT');
 
-      // Disparar la notificación SMS solo si pasamos de 0 a 1 mensaje no visto
-      // y el chat no está silenciado (el silencio no afecta al contador de no leídos)
-      if (!fromMe && previousUnseen === 0 && !isSmsMuted) {
+      // Disparar la notificación SMS solo si: no la hemos mandado ya para esta racha de no
+      // leídos, el chat no está silenciado, y el Nokia no ha cargado ninguna página hace
+      // muy poco (si sigue en la web, ya se enterará por ahí).
+      const msSinceActivity = Date.now() - getLastActivityAt();
+      const isActiveOnWeb = msSinceActivity < SMS_SKIP_IF_ACTIVE_WITHIN_MS;
+
+      if (!fromMe && !alreadyNotified && !isSmsMuted && !isActiveOnWeb) {
         console.log(`[SMS] Disparando notificación (previousUnseen=${previousUnseen}, muted=${isSmsMuted})`);
+        // Marcar ANTES de lanzar el envío (que es async) para no dejar ventana en la que
+        // dos mensajes casi simultáneos disparen dos SMS para la misma racha.
+        if (isGroup) stmts.setGroupSmsNotified.run(finalGroupId);
+        else stmts.setUserSmsNotified.run(finalUserChatId);
+
         // Para el nombre de grupo del SMS, usar el que ya está guardado en wgroups (el
         // dato fiable, protegido por la lógica de "shouldUpdate" de más arriba) en vez
         // de nameOrGroupName, que viene directo de la ingesta y puede ser un ID en
@@ -341,7 +376,8 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
           chatId: isGroup ? finalGroupId : finalUserChatId
         }).catch(err => console.error('[SMS] Fallo al lanzar notificación:', err));
       } else if (!fromMe) {
-        console.log(`[SMS] Omitido (previousUnseen=${previousUnseen}, muted=${isSmsMuted})`);
+        const motivo = alreadyNotified ? 'ya notificado' : isSmsMuted ? 'silenciado' : isActiveOnWeb ? 'activo en la web' : 'desconocido';
+        console.log(`[SMS] Omitido (motivo=${motivo}, previousUnseen=${previousUnseen})`);
       }
 
       res.status(201).json({ success: true, messageId });

@@ -11,6 +11,7 @@ import {
   getTotal,
   renderAckLabel,
   renderList,
+  renderMediaLine,
   renderMentions,
   renderNumberedPager,
   renderPager,
@@ -102,15 +103,38 @@ export async function showUserMessages(req, res, next) {
         const isNew = index < newMessageCount;
         const unseenMarker = isNew ? '<font color="#cc0000">[!]</font> ' : '';
         const sentAt = formatHourSend(message.hour_send);
+
+        if (Number(message.is_system) === 1) {
+          messagesHtml += `<p align="center">${unseenMarker}<i><font size="1" color="#888888">${escapeXml(sentAt)} — ${renderMentions(message.text)}</font></i></p>`;
+          return;
+        }
+
         const groupPart = message.group_name ? ` | ${escapeXml(message.group_name)}` : '';
 
+        const mediaLine = renderMediaLine(message, { linkToDetail: `/mensaje/${message.id}` });
         let contentPart;
-        if (message.has_media && message.file_path_thumb) {
+        if (Number(message.is_deleted) === 1) {
+          contentPart = `<i><font color="#888888">${escapeXml(message.text)}</font></i>`;
+        } else if (mediaLine) {
+          contentPart = mediaLine;
+        } else if (message.has_media && message.file_path_thumb) {
           contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
         } else if (Number(message.is_sticker) === 1) {
           contentPart = '<i>[Sticker]</i>';
         } else {
           contentPart = renderMentions(message.text);
+        }
+        const editedTag = (Number(message.is_deleted) !== 1 && Number(message.is_edited) === 1)
+          ? ' <font size="1" color="#888888">(editado)</font>'
+          : '';
+
+        let quotedBlock = '';
+        if (message.quoted_text || message.quoted_sender) {
+          const quotedTag = message.quoted_sender ? `R-${escapeXml(message.quoted_sender)}` : 'R';
+          const quotedPreview = message.quoted_text
+            ? escapeXml(truncateName(message.quoted_text, 80))
+            : '(no disponible)';
+          quotedBlock = `<i><font size="1" color="#888888">[${quotedTag}]-&quot;${quotedPreview}&quot;</font></i><br/>`;
         }
 
         // CORRECCIÓN DEFINITIVA: Comprobación numérica estricta para evitar falsos positivos
@@ -120,8 +144,8 @@ export async function showUserMessages(req, res, next) {
           : '';
 
         messagesHtml +=
-          `<p>${unseenMarker}${fromMeMarker}${escapeXml(sentAt)}${groupPart}<br/>` +
-          `${contentPart}<br/>----------</p>`;
+          `<p>${unseenMarker}${fromMeMarker}${escapeXml(sentAt)}${groupPart}${editedTag}<br/>` +
+          `${quotedBlock}${contentPart}<br/>----------</p>`;
       });
     }
 

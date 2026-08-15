@@ -14,6 +14,7 @@ import {
   isNumericOrJid,
   renderAckLabel,
   renderList,
+  renderMediaLine,
   renderMentions,
   renderNumberedPager,
   renderPager,
@@ -257,14 +258,28 @@ export async function showGroupMessages(req, res, next) {
         const isNew = index < newMessageCount;
         const unseenMarker = isNew ? '<font color="#cc0000">[!]</font> ' : '';
         const sentAt = formatHourSend(message.hour_send);
+
+        if (Number(message.is_system) === 1) {
+          messagesHtml += `<p align="center">${unseenMarker}<i><font size="1" color="#888888">${escapeXml(sentAt)} — ${renderMentions(message.text)}</font></i></p>`;
+          continue;
+        }
+
+        const mediaLine = renderMediaLine(message, { linkToDetail: `/mensaje/${message.id}` });
         let contentPart;
-        if (message.has_media && message.file_path_thumb) {
+        if (Number(message.is_deleted) === 1) {
+          contentPart = `<i><font color="#888888">${escapeXml(message.text)}</font></i>`;
+        } else if (mediaLine) {
+          contentPart = mediaLine;
+        } else if (message.has_media && message.file_path_thumb) {
           contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
         } else if (Number(message.is_sticker) === 1) {
           contentPart = '<i>[Sticker]</i>';
         } else {
           contentPart = renderMentions(message.text);
         }
+        const editedTag = (Number(message.is_deleted) !== 1 && Number(message.is_edited) === 1)
+          ? ' <font size="1" color="#888888">(editado)</font>'
+          : '';
 
         const isSaliente = Number(message.from_me) === 1;
         const fromMeMarker = isSaliente
@@ -276,9 +291,19 @@ export async function showGroupMessages(req, res, next) {
           ? ''
           : `<font size="1" color="${senderColor}">[${message.username ? escapeXml(truncateName(convertEmojisToAscii(message.username))) : 'Desconocido'}] dice:</font><br/>`;
 
+        let quotedBlock = '';
+        if (message.quoted_text || message.quoted_sender) {
+          const quotedTag = message.quoted_sender ? `R-${escapeXml(message.quoted_sender)}` : 'R';
+          const quotedPreview = message.quoted_text
+            ? escapeXml(truncateName(message.quoted_text, 80))
+            : '(no disponible)';
+          quotedBlock = `<i><font size="1" color="#888888">[${quotedTag}]-&quot;${quotedPreview}&quot;</font></i><br/>`;
+        }
+
         messagesHtml +=
-          `<p>${unseenMarker}${fromMeMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font><br/>` +
+          `<p>${unseenMarker}${fromMeMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font>${editedTag}<br/>` +
           usernameLine +
+          quotedBlock +
           `<font size="1" color="#000000">${contentPart}</font><br/>` +
           `----------</p>`;
       }
@@ -286,14 +311,18 @@ export async function showGroupMessages(req, res, next) {
 
     const isMuted = Number(group.sms_muted) === 1;
     const muteLabel = isMuted ? 'Activar SMS' : 'Silenciar SMS';
+    const muteIcon = isMuted ? 'Bell_Red.png' : 'Bell_Green.png';
+
+    const iconTag = (file, alt) =>
+      `<img src="/assets/groups_icons/${file}" alt="${escapeXml(alt)}" height="24" width="24" style="vertical-align:middle;"/>`;
 
     const body =
       `<h1>${escapeXml(group.group_name)}</h1>` +
       '<p><a href="/">Inicio</a> | <a href="/grupo">Grupos</a></p>' +
-      `<p><a href="/mensaje/componer?to=${encodeURIComponent(group.group_id)}&type=group"><b>[Enviar mensaje al grupo]</b></a></p>` +
-      `<p><a href="/grupo/${encodeURIComponent(group.group_id)}/detalles">[Detalles]</a> | ` +
-      `<a href="/grupo/${encodeURIComponent(group.group_id)}/silenciar">[${escapeXml(muteLabel)}]</a> | ` +
-      `<a href="/grupo/${encodeURIComponent(group.group_id)}/eliminar">[Eliminar]</a></p>` +
+      `<p><a href="/mensaje/componer?to=${encodeURIComponent(group.group_id)}&type=group">${iconTag('Writing_Lightgreen.png', 'Enviar mensaje al grupo')}</a> ` +
+      `<a href="/grupo/${encodeURIComponent(group.group_id)}/silenciar">${iconTag(muteIcon, muteLabel)}</a> ` +
+      `<a href="/grupo/${encodeURIComponent(group.group_id)}/detalles">${iconTag('Questionmark_Blue.png', 'Detalles')}</a> ` +
+      `<a href="/grupo/${encodeURIComponent(group.group_id)}/eliminar">${iconTag('Warning_Red.png', 'Eliminar')}</a></p>` +
       renderPager(`/grupo/${group.group_id}`, page, totalPages) +
       messagesHtml +
       renderPager(`/grupo/${group.group_id}`, page, totalPages);

@@ -120,6 +120,7 @@ export function insertAttachment(messageId, mediaInfo) {
     mediaInfo.filePathFull || mediaInfo.fullRel,
     mediaInfo.filePathView || mediaInfo.viewRel,
     mediaInfo.filePathThumb || mediaInfo.thumbRel,
+    mediaInfo.durationSec ?? null,
     0,
     nowSeconds
   );
@@ -143,6 +144,45 @@ export async function processAndAttachMedia(messageId, buffer, options = {}) {
   });
 
   return saved;
+}
+
+const EXT_BY_MIME = {
+  'audio/ogg': '.ogg',
+  'audio/opus': '.ogg',
+  'audio/mpeg': '.mp3',
+  'audio/mp4': '.m4a',
+  'audio/aac': '.aac',
+  'audio/amr': '.amr',
+  'video/mp4': '.mp4',
+  'video/3gpp': '.3gp',
+  'video/quicktime': '.mov',
+  'application/pdf': '.pdf',
+};
+
+function guessExtension(mimeType, filename) {
+  if (filename && filename.includes('.')) {
+    return filename.slice(filename.lastIndexOf('.'));
+  }
+  const bareMime = (mimeType || '').split(';')[0].trim();
+  return EXT_BY_MIME[bareMime] || '.bin';
+}
+
+export function saveRawMediaFile(mediaKey, buffer, options = {}) {
+  const dir = ensureMediaDir();
+  const safeKey = sanitizeMediaKey(mediaKey);
+  const ext = guessExtension(options.mimeType, options.filename);
+  const fullFile = `full_${safeKey}${ext}`;
+  const fullPath = join(dir, fullFile);
+  const fullRel = `/media/${fullFile}`;
+
+  writeFileSync(fullPath, buffer);
+
+  return {
+    mediaKey: safeKey,
+    fullPath,
+    fullRel,
+    fullSize: buffer.length,
+  };
 }
 
 export function cleanupOrphanMediaFiles() {

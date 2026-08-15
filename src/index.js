@@ -5,7 +5,7 @@ import dotenv from 'dotenv';
 import router from './routes/index.js';
 import { notFound, serverError } from './controller/page.controller.js';
 import { startDailyCleanup, stopDailyCleanup } from './services/cleanup.service.js';
-import { startWhatsappClient, stopWhatsappClient } from './services/whatsapp.service.js';
+import { startWhatsappClient, stopWhatsappClient, getConnectionStatus } from './services/whatsapp.service.js';
 import { saveInteraction } from './controller/notification.controller.js';
 import { requireAuth } from './middlewares/auth.middleware.js';
 import { cleanupOrphanMediaFiles, migrateAttachmentsToView } from './utils/media.js';
@@ -33,6 +33,16 @@ app.get('/descargar/:file', requireAuth, (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+// Sin requireAuth a propósito: lo consulta el healthcheck de Docker desde dentro del
+// contenedor, que no puede autenticarse con cookies. "Sano" = Express vivo y WhatsApp
+// conectado, o desconectado hace poco (una reconexión normal tarda segundos, no minutos).
+app.get('/healthz', (req, res) => {
+  const status = getConnectionStatus();
+  const msSinceChange = status.lastChange ? Date.now() - new Date(status.lastChange).getTime() : 0;
+  const isHealthy = status.status === 'connected' || msSinceChange < 5 * 60 * 1000;
+  res.status(isHealthy ? 200 : 503).json({ healthy: isHealthy, ...status });
 });
 
 app.use('/sounds', express.static(join(process.cwd(), 'public/sounds'), {
