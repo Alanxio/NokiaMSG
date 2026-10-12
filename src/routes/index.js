@@ -5,6 +5,7 @@ import groupRoutes from './group.routes.js';
 import messageRoutes from './message.routes.js';
 import whatsappRoutes from './whatsapp.routes.js';
 import pollingRoutes from './polling.routes.js';
+import mobileRoutes from './mobile.routes.js';
 
 import authRoutes from './auth.routes.js';
 import { requireAuth } from '../middlewares/auth.middleware.js';
@@ -14,6 +15,9 @@ const router = Router();
 
 // Rutas sin protección
 router.use('/', authRoutes);
+
+// API JSON para el cliente Java2ME — auth propia (X-Nokia-Token), no la cookie de requireAuth.
+router.use('/mobile', mobileRoutes);
 
 // Rutas protegidas
 router.use('/whatsapp', requireAuth, whatsappRoutes);

@@ -53,6 +53,29 @@ export function requireAuth(req, res, next) {
     return next();
   }
 
+  // 3. Mismo token de "Recordarme", enviado como header en vez de cookie — así el
+  // cliente Java2ME (sin cookie jar) puede reutilizar /media y /descargar/:file con
+  // el token que ya recibió de POST /mobile/login.
+  if (isValidTrustToken(req.headers['x-nokia-token'])) {
+    lastActivityAt = Date.now();
+    return next();
+  }
+
   console.log(`[Auth] Acceso denegado en ${req.originalUrl} desde ${ip}`);
   return wapDeny(req, res);
+}
+
+// Auth para la API JSON /mobile: solo el token largo de "Recordarme", enviado por
+// header (nunca por cookie) — el MIDlet no tiene concepto de sesión corta atada a IP.
+// A diferencia de requireAuth, en fallo responde JSON 401, no la página XHTML de
+// wapDeny (pensada para el navegador WAP, no para un cliente que parsea JSON).
+export function requireMobileAuth(req, res, next) {
+  const token = req.headers['x-nokia-token'];
+
+  if (isValidTrustToken(token)) {
+    lastActivityAt = Date.now();
+    return next();
+  }
+
+  return res.status(401).json({ error: { code: 'UNAUTHENTICATED', message: 'Token invalido o caducado' } });
 }

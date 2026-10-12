@@ -109,6 +109,23 @@ export function renderMediaLine(message, { linkToDetail = null } = {}) {
   return `<i>[${label}]</i> ${actionHtml}${verLink}`;
 }
 
+// message: fila con media_type === 'poll' y text = "[Encuesta] <pregunta>" (puesto por
+// whatsapp.service.js). optionsWithCounts: filas de stmts.getPollOptionCountsByMessageId,
+// pedidas por el llamador SOLO para mensajes de encuesta — esta función no toca la BD.
+// Devuelve null si el mensaje no es una encuesta.
+export function renderPollLine(message, optionsWithCounts, { linkToDetail = null } = {}) {
+  if (message?.media_type !== 'poll') return null;
+
+  const question = message.text
+    ? String(message.text).replace(/^\[Encuesta\]\s*/, '')
+    : 'Encuesta';
+  const rows = optionsWithCounts || [];
+  const totalVotes = rows.reduce((sum, o) => sum + Number(o.vote_count || 0), 0);
+
+  const verLink = linkToDetail ? ` <a href="${escapeXml(linkToDetail)}">[Ver/Votar]</a>` : '';
+  return `<i>[Encuesta]</i> ${escapeXml(truncateName(question, 60))} (${rows.length} opciones, ${totalVotes} votos)${verLink}`;
+}
+
 const MEMBER_COLOR_PALETTE = [
   '#E91E63', '#FF6F00', '#9C27B0', '#00838F', '#F57F17',
   '#6A1B9A', '#00ACC1', '#AD1457', '#EF6C00', '#5E35B1',
@@ -422,6 +439,12 @@ export function serverError(error, req, res, next) {
   console.error(error);
   if (res.headersSent) {
     next(error);
+    return;
+  }
+
+  if (req.path && req.path.startsWith('/mobile')) {
+    res.status(error.status || error.statusCode || 500);
+    res.json({ error: { code: 'INTERNAL_ERROR', message: 'Error interno o solicitud invalida.' } });
     return;
   }
 

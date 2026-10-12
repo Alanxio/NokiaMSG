@@ -27,6 +27,10 @@ WORKDIR /usr/src/app
 
 COPY package*.json ./
 
+# patch-package se ejecuta durante `npm install` (postinstall), así que los
+# parches deben estar presentes antes de instalar las dependencias.
+COPY patches ./patches
+
 # npm install estándar saltándose auditorías y bloqueos estrictos del lockfile
 RUN npm install --omit=dev --no-audit --no-fund
 

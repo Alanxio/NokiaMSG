@@ -16,6 +16,7 @@ import {
   renderList,
   renderMediaLine,
   renderMentions,
+  renderPollLine,
   renderNumberedPager,
   renderPager,
   renderPhoneLink,
@@ -265,11 +266,16 @@ export async function showGroupMessages(req, res, next) {
         }
 
         const mediaLine = renderMediaLine(message, { linkToDetail: `/mensaje/${message.id}` });
+        const pollLine = message.media_type === 'poll'
+          ? renderPollLine(message, stmts.getPollOptionCountsByMessageId.all(message.id), { linkToDetail: `/mensaje/${message.id}` })
+          : null;
         let contentPart;
         if (Number(message.is_deleted) === 1) {
           contentPart = `<i><font color="#888888">${escapeXml(message.text)}</font></i>`;
         } else if (mediaLine) {
           contentPart = mediaLine;
+        } else if (pollLine) {
+          contentPart = pollLine;
         } else if (message.has_media && message.file_path_thumb) {
           contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
         } else if (Number(message.is_sticker) === 1) {

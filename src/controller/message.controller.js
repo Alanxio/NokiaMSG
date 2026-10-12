@@ -1,6 +1,6 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { escapeXml, formatPhoneNumber, isNumericOrJid, renderMediaLine, renderMentions, renderPhoneLink, sendPage } from './page.controller.js';
+import { escapeXml, formatPhoneNumber, isNumericOrJid, renderMediaLine, renderMentions, renderPhoneLink, sendInvalidEntity, sendMissingEntity, sendPage } from './page.controller.js';
 import { processAndAttachMedia } from '../utils/media.js';
 import multer from 'multer';
 import pkg from 'whatsapp-web.js';
@@ -19,7 +19,7 @@ function normalizeGroupName(rawName) {
 }
 
 // Asegúrate de que esta ruta apunte correctamente a donde exportas el cliente
-import { client, resolveContactPhone } from '../services/whatsapp.service.js';
+import { castPollVote, client, refreshPollVotesFromWhatsapp, resolveContactPhone, resolveMyVoterIds } from '../services/whatsapp.service.js';
 import { ensureGroupDisplayName } from './group.controller.js';
 import { registerPendingOutgoing } from '../services/pending-outgoing.service.js';
 
@@ -603,9 +603,50 @@ export async function showMessageDetail(req, res, next) {
 
     const isSticker = Number(message.is_sticker) === 1;
     const mediaType = message.media_type || null;
+    const isPoll = mediaType === 'poll';
     let contentHtml = '';
 
-    if (isSticker && attachment?.file_path_thumb) {
+    if (isPoll && message.whatsapp_msg_id) {
+      const refreshResult = await refreshPollVotesFromWhatsapp(message.whatsapp_msg_id, message.id);
+      if (!refreshResult.success) {
+        console.warn(`[poll] No se pudo refrescar votos del mensaje ${message.id}:`, refreshResult.code || refreshResult.error);
+      }
+    }
+
+    if (isPoll) {
+      const pollOptions = stmts.getPollOptionCountsByMessageId.all(message.id);
+      const totalVotes = pollOptions.reduce((sum, o) => sum + Number(o.vote_count || 0), 0);
+      const pollQuestion = message.text ? String(message.text).replace(/^\[Encuesta\]\s*/, '') : 'Encuesta';
+      const myId = client?.info?.wid?._serialized || null;
+      // La propia cuenta puede quedar registrada como votante en formato @lid o en formato
+      // PN según la migración de identidad de WhatsApp (ver resolveMyVoterIds) — se compara
+      // contra ambas variantes en vez de solo client.info.wid._serialized.
+      const myIds = myId ? await resolveMyVoterIds(myId) : null;
+
+      contentHtml += `<p><b>${escapeXml(pollQuestion)}</b></p>`;
+
+      pollOptions.forEach((option, index) => {
+        const voters = stmts.getVotersForOption.all(option.option_id);
+        const isMine = myIds ? voters.some((v) => myIds.has(v.voter_chat_id)) : false;
+        const voterNames = voters.map((v) => {
+          const user = stmts.getUserByChatId.get(v.voter_chat_id);
+          const display = user?.username || formatPhoneNumber(v.voter_chat_id) || v.voter_chat_id.replace(/@.*$/, '');
+          return escapeXml(display);
+        });
+
+        const accesskeyAttr = index < 9 ? ` accesskey="${index + 1}"` : '';
+        const actionHtml = isMine
+          ? '<font color="#006600">[Tu voto]</font>'
+          : `<a${accesskeyAttr} href="/mensaje/${message.id}/votar/${option.option_id}">[Votar]</a>`;
+        const votersLine = voterNames.length
+          ? `<br/><font size="1" color="#888888">Votos: ${voterNames.join(', ')}</font>`
+          : '<br/><font size="1" color="#888888">Sin votos aún</font>';
+
+        contentHtml += `<p>${escapeXml(option.option_name)} — ${option.vote_count} voto(s) ${actionHtml}${votersLine}</p>`;
+      });
+
+      contentHtml += `<p><font size="1" color="#888888">Total: ${totalVotes} voto(s)</font></p>`;
+    } else if (isSticker && attachment?.file_path_thumb) {
       contentHtml += `<p><img src="${escapeXml(attachment.file_path_thumb)}" alt="Sticker" width="40"/></p>`;
     } else if (attachment?.file_path_view) {
       contentHtml += `<p><img src="${escapeXml(attachment.file_path_view)}" alt="Imagen" width="${attachment.view_width || 120}" height="${attachment.view_height || 90}"/></p>`;
@@ -613,7 +654,7 @@ export async function showMessageDetail(req, res, next) {
       contentHtml += `<p>${renderMediaLine(message, {})}</p>`;
     }
 
-    if (message.text && message.text !== '[Imagen]') {
+    if (message.text && message.text !== '[Imagen]' && !isPoll) {
       contentHtml += `<p>${renderMentions(message.text)}</p>`;
     } else if (!attachment?.file_path_view && !isSticker && !mediaType) {
       contentHtml += `<p>${renderMentions(message.text || '')}</p>`;
@@ -631,6 +672,36 @@ export async function showMessageDetail(req, res, next) {
       `<p><a href="${backUrl}">Volver a la conversacion</a></p>`;
 
     sendPage(req, res, 200, 'Mensaje', body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function voteOnPoll(req, res, next) {
+  try {
+    const messageId = Number.parseInt(req.params.id, 10);
+    const optionId = Number.parseInt(req.params.optionId, 10);
+    if (Number.isNaN(messageId) || Number.isNaN(optionId)) {
+      return sendInvalidEntity(req, res, 'Encuesta');
+    }
+
+    const message = stmts.getMessageByIdWithMedia.get(messageId);
+    if (!message || message.media_type !== 'poll' || !message.whatsapp_msg_id) {
+      return sendMissingEntity(req, res, 'Encuesta');
+    }
+
+    const option = stmts.getPollOptionById.get(optionId);
+    if (!option || option.message_id !== messageId) {
+      return sendMissingEntity(req, res, 'Opción de encuesta');
+    }
+
+    const result = await castPollVote(message.whatsapp_msg_id, messageId, option.local_id, option.option_name);
+
+    const backUrl = `/mensaje/${messageId}`;
+    const body = result.success
+      ? `<p>Voto registrado.</p><p><a href="${backUrl}">Volver</a></p>`
+      : `<p>No se pudo registrar el voto${result.error ? `: ${escapeXml(result.error)}` : ''}.</p><p><a href="${backUrl}">Volver</a></p>`;
+    sendPage(req, res, 200, 'Nokia', body, `<meta http-equiv="refresh" content="0;url=${backUrl}"/>`);
   } catch (error) {
     next(error);
   }

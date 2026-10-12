@@ -1,6 +1,6 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { getUsersPresence, sendWhatsappSeen, resolveContactPhone } from '../services/whatsapp.service.js';
+import { getUsersPresence, sendWhatsappSeen, resolveContactPhone, getContactProfileInfo, getProfilePicUrlFresh } from '../services/whatsapp.service.js';
 import { resolveMediaFsPath, safeUnlink } from '../services/cleanup.service.js';
 import {
   DIRECTORY_PAGE_SIZE,
@@ -13,6 +13,7 @@ import {
   renderList,
   renderMediaLine,
   renderMentions,
+  renderPollLine,
   renderNumberedPager,
   renderPager,
   renderPhoneLink,
@@ -112,11 +113,16 @@ export async function showUserMessages(req, res, next) {
         const groupPart = message.group_name ? ` | ${escapeXml(message.group_name)}` : '';
 
         const mediaLine = renderMediaLine(message, { linkToDetail: `/mensaje/${message.id}` });
+        const pollLine = message.media_type === 'poll'
+          ? renderPollLine(message, stmts.getPollOptionCountsByMessageId.all(message.id), { linkToDetail: `/mensaje/${message.id}` })
+          : null;
         let contentPart;
         if (Number(message.is_deleted) === 1) {
           contentPart = `<i><font color="#888888">${escapeXml(message.text)}</font></i>`;
         } else if (mediaLine) {
           contentPart = mediaLine;
+        } else if (pollLine) {
+          contentPart = pollLine;
         } else if (message.has_media && message.file_path_thumb) {
           contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
         } else if (Number(message.is_sticker) === 1) {
@@ -160,14 +166,19 @@ export async function showUserMessages(req, res, next) {
 
     const isMuted = Number(user.sms_muted) === 1;
     const muteLabel = isMuted ? 'Activar SMS' : 'Silenciar SMS';
+    const muteIcon = isMuted ? 'Bell_Red.png' : 'Bell_Green.png';
+
+    const iconTag = (file, alt) =>
+      `<img src="/assets/groups_icons/${file}" alt="${escapeXml(alt)}" height="24" width="24" style="vertical-align:middle;"/>`;
 
     const body =
       `<h1>${escapeXml(user.username)}${onlineTag}</h1>` +
       phoneHtml +
       '<p><a href="/">Inicio</a> | <a href="/usuario">Usuarios</a></p>' +
-      `<p><a href="/mensaje/componer?to=${encodeURIComponent(user.chat_id)}&type=user"><b>[Enviar mensaje]</b></a></p>` +
-      `<p><a href="/usuario/${encodeURIComponent(user.chat_id)}/silenciar">[${escapeXml(muteLabel)}]</a> | ` +
-      `<a href="/usuario/${encodeURIComponent(user.chat_id)}/eliminar">[Eliminar]</a></p>` +
+      `<p><a href="/mensaje/componer?to=${encodeURIComponent(user.chat_id)}&type=user">${iconTag('Writing_Lightgreen.png', 'Enviar mensaje')}</a> ` +
+      `<a href="/usuario/${encodeURIComponent(user.chat_id)}/silenciar">${iconTag(muteIcon, muteLabel)}</a> ` +
+      `<a href="/usuario/${encodeURIComponent(user.chat_id)}/detalles">${iconTag('Questionmark_Blue.png', 'Detalles')}</a> ` +
+      `<a href="/usuario/${encodeURIComponent(user.chat_id)}/eliminar">${iconTag('Warning_Red.png', 'Eliminar')}</a></p>` +
       renderPager(`/usuario/${user.chat_id}`, page, totalPages) +
       messagesHtml +
       renderPager(`/usuario/${user.chat_id}`, page, totalPages);
@@ -175,6 +186,105 @@ export async function showUserMessages(req, res, next) {
     sendPage(req, res, 200, `${user.username}${onlineTag}`, body);
   } catch (error) {
     next(error);
+  }
+}
+
+export async function showUserDetails(req, res, next) {
+  try {
+    const chatId = req.params.id;
+    if (!chatId || typeof chatId !== 'string' || chatId.trim() === '') {
+      sendInvalidEntity(req, res, 'Usuario');
+      return;
+    }
+
+    const user = stmts.getUserByChatId.get(chatId);
+    if (!user) {
+      sendMissingEntity(req, res, 'Usuario');
+      return;
+    }
+
+    const [profileInfo, presenceMap] = await Promise.all([
+      getContactProfileInfo(user.chat_id),
+      getUsersPresence([user.chat_id]),
+    ]);
+    const presence = presenceMap.get(user.chat_id);
+
+    let phone = null;
+    if (user.chat_id.endsWith('@lid')) {
+      phone = await resolveContactPhone(user.chat_id);
+    }
+    if (!phone) {
+      phone = formatPhoneNumber(user.chat_id, user.username);
+    }
+    const phoneHtml = phone ? `<p>${renderPhoneLink(phone)}</p>` : '';
+
+    const photoHtml = profileInfo.hasPhoto
+      ? `<p><img src="/usuario/${encodeURIComponent(user.chat_id)}/foto" width="100" alt="Foto de perfil"/></p>`
+      : '<p>Sin foto de perfil.</p>';
+
+    let estadoText;
+    if (presence?.isOnline) {
+      estadoText = 'En línea ahora';
+    } else if (presence?.lastSeen) {
+      const lastSeenDate = new Date(presence.lastSeen * 1000);
+      estadoText = `Última conexión: ${lastSeenDate.toLocaleDateString('es-ES')} ${lastSeenDate.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}`;
+    } else {
+      estadoText = 'Última conexión desconocida';
+    }
+
+    const isMuted = Number(user.sms_muted) === 1;
+    const aboutHtml = profileInfo.about ? `<p>Acerca de: ${escapeXml(profileInfo.about)}</p>` : '';
+
+    const commonGroupNames = profileInfo.commonGroupIds
+      .map((gid) => {
+        const g = stmts.getGroupById.get(gid);
+        return g ? `<a href="/grupo/${encodeURIComponent(gid)}">${escapeXml(g.group_name)}</a>` : null;
+      })
+      .filter(Boolean);
+    const commonGroupsHtml = commonGroupNames.length
+      ? `<ul>${commonGroupNames.map((n) => `<li>${n}</li>`).join('')}</ul>`
+      : '<p>Ninguno en común.</p>';
+
+    const body =
+      `<h1>${escapeXml(user.username)} - Detalles</h1>` +
+      '<p><a href="/">Inicio</a> | <a href="/usuario">Usuarios</a> | ' +
+      `<a href="/usuario/${encodeURIComponent(user.chat_id)}">Mensajes</a></p>` +
+      photoHtml +
+      phoneHtml +
+      `<p>${escapeXml(estadoText)}</p>` +
+      `<p>Silenciado: ${isMuted ? 'Sí' : 'No'}</p>` +
+      aboutHtml +
+      '<p>Grupos en común:</p>' +
+      commonGroupsHtml;
+
+    sendPage(req, res, 200, `${user.username} - Detalles`, body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function showUserAvatar(req, res) {
+  try {
+    const chatId = req.params.id;
+    const url = await getProfilePicUrlFresh(chatId);
+    if (!url) {
+      res.status(404).end();
+      return;
+    }
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      res.status(404).end();
+      return;
+    }
+
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    const buffer = Buffer.from(await response.arrayBuffer());
+    res.set('Content-Type', contentType);
+    res.set('Cache-Control', 'no-store');
+    res.send(buffer);
+  } catch {
+    res.status(404).end();
   }
 }
 

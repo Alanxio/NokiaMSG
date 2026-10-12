@@ -62,11 +62,32 @@ db.exec(`
     FOREIGN KEY (message_id) REFERENCES messages(id)
   );
 
+  CREATE TABLE IF NOT EXISTS poll_options (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    local_id INTEGER NOT NULL,
+    option_name TEXT NOT NULL,
+    option_order INTEGER DEFAULT 0,
+    FOREIGN KEY (message_id) REFERENCES messages(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS poll_votes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    option_id INTEGER NOT NULL,
+    voter_chat_id TEXT NOT NULL,
+    voted_at_ts INTEGER,
+    FOREIGN KEY (option_id) REFERENCES poll_options(id)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_messages_user_chat_id ON messages(user_chat_id);
   CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id);
   CREATE INDEX IF NOT EXISTS idx_messages_media_key ON messages(media_key);
   CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments(message_id);
   CREATE INDEX IF NOT EXISTS idx_attachments_media_key ON attachments(media_key);
+  CREATE INDEX IF NOT EXISTS idx_poll_options_message_id ON poll_options(message_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_poll_options_message_local ON poll_options(message_id, local_id);
+  CREATE INDEX IF NOT EXISTS idx_poll_votes_option_id ON poll_votes(option_id);
+  CREATE INDEX IF NOT EXISTS idx_poll_votes_voter ON poll_votes(voter_chat_id);
 `);
 
 // Migración suave: añadir columnas si la BD es antigua
@@ -475,7 +496,7 @@ export const stmts = {
 
   getMessageByIdWithMedia: db.prepare(`
     SELECT m.id, m.text, m.day_send, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.media_key,
-           m.media_type,
+           m.media_type, m.whatsapp_msg_id,
            u.username, u.chat_id AS user_chat_id,
            g.group_name, m.group_id,
            a.file_path_full, a.file_path_view, a.file_path_thumb, a.mime_type, a.file_name, a.duration_sec
@@ -492,6 +513,43 @@ export const stmts = {
     INNER JOIN messages m ON m.id = a.message_id
     WHERE m.media_key = ? AND m.media_key IS NOT NULL
     ORDER BY a.album_order
+  `),
+
+  insertPollOption: db.prepare(`
+    INSERT INTO poll_options (message_id, local_id, option_name, option_order)
+    VALUES (?, ?, ?, ?)
+  `),
+
+  insertPollVote: db.prepare(`
+    INSERT INTO poll_votes (option_id, voter_chat_id, voted_at_ts)
+    VALUES (?, ?, ?)
+  `),
+
+  deleteVotesForVoterInPoll: db.prepare(`
+    DELETE FROM poll_votes
+    WHERE voter_chat_id = ? AND option_id IN (SELECT id FROM poll_options WHERE message_id = ?)
+  `),
+
+  getPollOptionByMessageAndLocalId: db.prepare(`
+    SELECT * FROM poll_options WHERE message_id = ? AND local_id = ? LIMIT 1
+  `),
+
+  getPollOptionById: db.prepare(`
+    SELECT * FROM poll_options WHERE id = ? LIMIT 1
+  `),
+
+  getPollOptionCountsByMessageId: db.prepare(`
+    SELECT po.id AS option_id, po.local_id, po.option_name, po.option_order,
+           COUNT(pv.id) AS vote_count
+    FROM poll_options po
+    LEFT JOIN poll_votes pv ON pv.option_id = po.id
+    WHERE po.message_id = ?
+    GROUP BY po.id
+    ORDER BY po.option_order ASC
+  `),
+
+  getVotersForOption: db.prepare(`
+    SELECT voter_chat_id, voted_at_ts FROM poll_votes WHERE option_id = ? ORDER BY voted_at_ts ASC
   `),
 
   // Añade esto justo al final de tu objeto stmts en db.js

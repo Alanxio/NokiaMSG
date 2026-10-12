@@ -630,6 +630,31 @@ export async function startWhatsappClient(processMessageFn) {
     }
   });
 
+  // vote_update trae SIEMPRE la selección COMPLETA actual de un votante (nunca un delta) —
+  // se borra su estado anterior en esta encuesta y se reinserta desde cero lo que diga el
+  // evento. parentMessage es el propio mensaje de creación de la encuesta.
+  client.on('vote_update', (vote) => {
+    try {
+      const whatsappMsgId = vote?.parentMessage?.id?._serialized || null;
+      const voterChatId = vote?.voter || null;
+      if (!whatsappMsgId || !voterChatId) return;
+
+      const localRow = stmts.findMessageByWhatsappId.get(whatsappMsgId);
+      if (!localRow) return;
+      const messageId = localRow.id;
+
+      // interractedAtTs viene en milisegundos (campo origen: senderTimestampMs) — convertir
+      // a segundos para que sea consistente con el resto de timestamps de la app.
+      const votedAtTs = Number.isFinite(vote.interractedAtTs)
+        ? Math.floor(vote.interractedAtTs / 1000)
+        : Math.floor(Date.now() / 1000);
+      const selected = Array.isArray(vote.selectedOptions) ? vote.selectedOptions : [];
+      applyPollVoteSelection(messageId, voterChatId, selected, votedAtTs);
+    } catch (e) {
+      console.error('[whatsapp] Error procesando vote_update:', e.message);
+    }
+  });
+
   // Las llamadas de WhatsApp no se pueden "reenviar" a una llamada real (son audio/vídeo
   // en directo por WebRTC) — lo único posible es dejar constancia en el chat de que han
   // llamado, igual que ya se hace con los stickers.
@@ -820,7 +845,24 @@ export async function startWhatsappClient(processMessageFn) {
   });
 
   client.on('message_create', async (msg) => {
-    const whatsappMsgId = msg.id?._serialized || null;
+    // msg._data.id a veces llega sin ._serialized poblado (mismo entorno inestable de
+    // siempre) pero SÍ trae el id ya serializado bajo la clave interna '$1' — nunca usar el
+    // objeto crudo tal cual (rompería el INSERT en SQLite, que solo admite texto/números).
+    const rawIdCandidate = msg.id?._serialized
+      || msg._data?.id?._serialized
+      || msg._data?.id?.['$1']
+      || null;
+    const whatsappMsgId = typeof rawIdCandidate === 'string' && rawIdCandidate ? rawIdCandidate : null;
+    if (!whatsappMsgId) {
+      console.warn(`[whatsapp] No se pudo determinar whatsapp_msg_id para un mensaje de ${msg.from} (tipo ${msg.type}) — el voto/edición en vivo no funcionará para este mensaje si es una encuesta.`);
+    }
+
+    // saveInteraction() llama a next(error) si falla el guardado — antes se le pasaba
+    // () => {} (un no-op), así que cualquier error real (p.ej. un bind inválido en SQLite)
+    // quedaba completamente invisible, sin log ni rastro. Con esto queda registrado.
+    const logSaveInteractionError = (err) => {
+      if (err) console.error('[whatsapp] Error en saveInteraction:', err.message || err);
+    };
 
     if (msg.fromMe) {
       // La fila ya la insertó validateAndCreateChat (message.controller.js) al enviar, pero
@@ -863,9 +905,14 @@ export async function startWhatsappClient(processMessageFn) {
     // Los mensajes de ubicación no traen directPath, así que msg.hasMedia es false para
     // ellos — no se descargan con downloadMedia(), se leen directamente de msg.location.
     const esLocation = msg.type === 'location';
-    const esMediaReal = esImagenReal || esSticker || esOtroMedia || esLocation;
+    const esPoll = msg.type === 'poll_creation';
+    // esPoll se suma a esMediaReal aunque no tenga media real (msg.hasMedia es false para
+    // encuestas, igual que en location): si no, la guarda de "sin texto y sin media" de más
+    // abajo descartaría toda encuesta entrante antes de llegar al bloque que le pone body.
+    const esMediaReal = esImagenReal || esSticker || esOtroMedia || esLocation || esPoll;
 
-    const mediaType = esPtt ? 'ptt'
+    const mediaType = esPoll ? 'poll'
+      : esPtt ? 'ptt'
       : esAudio ? 'audio'
       : esVideo ? 'video'
       : esDocument ? 'document'
@@ -907,6 +954,10 @@ export async function startWhatsappClient(processMessageFn) {
       if (!msg.body) {
         msg.body = `[Ubicación] ${mediaInfo.filename}`;
       }
+    }
+
+    if (esPoll && !msg.body) {
+      msg.body = `[Encuesta] ${msg.pollName || ''}`.trim();
     }
 
     try {
@@ -1042,7 +1093,26 @@ export async function startWhatsappClient(processMessageFn) {
         json(data) { this._json = data; },
       };
 
-      if (esSticker) {
+      if (esPoll) {
+        // Igual que el sticker: mediaInfo=null para que saveInteraction NO pase por el alta
+        // genérica de attachments — una encuesta no tiene fichero, tiene opciones.
+        const messageId = await saveInteraction(fakeReq, mockRes, logSaveInteractionError, null);
+
+        if (messageId && Array.isArray(msg.pollOptions)) {
+          try {
+            msg.pollOptions.forEach((opt, idx) => {
+              // opt es {name, localId} en runtime (el .d.ts empaquetado dice string[], pero
+              // ya está confirmado por inspección directa que es un objeto).
+              const localId = typeof opt?.localId === 'number' ? opt.localId : idx;
+              const name = typeof opt?.name === 'string' ? opt.name : String(opt ?? '');
+              stmts.insertPollOption.run(messageId, localId, name.trim().slice(0, 200), idx);
+            });
+            console.log(`[whatsapp] Encuesta "${msg.pollName}" guardada con ${msg.pollOptions.length} opciones (mensaje #${messageId}).`);
+          } catch (pollErr) {
+            console.error('[whatsapp] Error guardando opciones de encuesta:', pollErr.message);
+          }
+        }
+      } else if (esSticker) {
         // Guardar mensaje de sticker primero (sin media), luego procesar y adjuntar
         const stickerReq = {
           body: {
@@ -1050,7 +1120,7 @@ export async function startWhatsappClient(processMessageFn) {
             is_sticker: 1,
           },
         };
-        const messageId = await saveInteraction(stickerReq, mockRes, () => { }, null);
+        const messageId = await saveInteraction(stickerReq, mockRes, logSaveInteractionError, null);
 
         if (messageId) {
           try {
@@ -1068,7 +1138,7 @@ export async function startWhatsappClient(processMessageFn) {
           }
         }
       } else {
-        await saveInteraction(fakeReq, mockRes, () => { }, mediaInfo);
+        await saveInteraction(fakeReq, mockRes, logSaveInteractionError, mediaInfo);
       }
 
       marcarNovedad(resolvedBody);
@@ -1316,6 +1386,51 @@ export async function getUsersPresence(chatIds) {
   return results;
 }
 
+// Sin caché: se pide todo en fresco en cada carga de la página de detalles, igual que
+// getUsersPresence de arriba. La URL de la foto no se expone aquí (caduca enseguida) — solo
+// si hay foto o no; para servir la imagen en sí se usa getProfilePicUrlFresh, que la vuelve a
+// pedir en el momento exacto de la petición.
+export async function getContactProfileInfo(chatId) {
+  if (!client || connectionStatus !== 'connected' || !chatId) {
+    return { hasPhoto: false, about: null, commonGroupIds: [] };
+  }
+
+  try {
+    const contact = await client.getContactById(chatId);
+    if (!contact) {
+      return { hasPhoto: false, about: null, commonGroupIds: [] };
+    }
+
+    const [photoResult, aboutResult, groupsResult] = await Promise.allSettled([
+      contact.getProfilePicUrl(),
+      contact.getAbout(),
+      contact.getCommonGroups(),
+    ]);
+
+    const hasPhoto = photoResult.status === 'fulfilled' && Boolean(photoResult.value);
+    const about = aboutResult.status === 'fulfilled' && aboutResult.value ? aboutResult.value : null;
+    const commonGroupIds = groupsResult.status === 'fulfilled' && Array.isArray(groupsResult.value)
+      ? groupsResult.value.map((g) => g?._serialized || g?.id?._serialized || (typeof g === 'string' ? g : null)).filter(Boolean)
+      : [];
+
+    return { hasPhoto, about, commonGroupIds };
+  } catch {
+    return { hasPhoto: false, about: null, commonGroupIds: [] };
+  }
+}
+
+export async function getProfilePicUrlFresh(chatId) {
+  if (!client || connectionStatus !== 'connected' || !chatId) return null;
+  try {
+    const contact = await client.getContactById(chatId);
+    if (!contact) return null;
+    const url = await contact.getProfilePicUrl();
+    return url || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function sendWhatsappMessage(chatId, messageText) {
   if (!client || connectionStatus !== 'connected') {
     return {
@@ -1373,5 +1488,272 @@ export async function sendWhatsappSeen(chatId) {
   } catch (err) {
     console.warn(`[whatsapp] No se pudo enviar visto a ${chatId}:`, err?.message || err);
     return { success: false, error: err.message || 'Error desconocido', code: 'SEND_ERROR' };
+  }
+}
+
+// Aplica la selección COMPLETA y actual de un votante en una encuesta: borra su estado
+// anterior en esa encuesta y reinserta desde cero lo que indique `selectedOptions`. Usado
+// tanto por el evento en vivo `vote_update` como por el refresco/confirmación manual, para
+// que ambos caminos mantengan el mismo invariante (nunca aplican un delta).
+function applyPollVoteSelection(messageId, voterChatId, selectedOptions, votedAtTs) {
+  stmts.deleteVotesForVoterInPoll.run(voterChatId, messageId);
+  for (const opt of Array.isArray(selectedOptions) ? selectedOptions : []) {
+    const localId = opt?.localId ?? opt?.id;
+    if (localId === undefined || localId === null) continue;
+    const optionRow = stmts.getPollOptionByMessageAndLocalId.get(messageId, localId);
+    if (optionRow) stmts.insertPollVote.run(optionRow.id, voterChatId, votedAtTs);
+  }
+}
+
+// Reimplementación de Client.prototype.getPollVotes() de whatsapp-web.js@1.34.7. La versión
+// original pasa la instancia completa de Message a pupPage.evaluate() y hace
+// `msg.id._serialized` ya DENTRO del navegador — pero Puppeteer no serializa esa instancia de
+// clase igual que el resto de la librería (que siempre pasa `msg.id._serialized` ya como
+// string), y `_serialized` llega vacío al otro lado, lo que hace fallar a
+// `WAWebMsgKey.fromString()` con "str is not null or not a string". Aquí se pasa directamente
+// el id como string, igual que en el resto de la librería, evitando el bug.
+async function fetchPollVotesFromWhatsapp(whatsappMsgId) {
+  if (!client?.pupPage) return [];
+  const result = await client.pupPage.evaluate(async (msgId) => {
+    try {
+      const msgKey = window.require('WAWebMsgKey').fromString(msgId);
+      const keyStr = msgKey.toString();
+      const table = window.require('WAWebPollsVotesSchema').getTable();
+
+      let rows = await table.equals(['parentMsgKey'], keyStr);
+      let matchMode = 'exact';
+      let availableMethods = null;
+
+      if (!rows || rows.length === 0) {
+        // La consulta indexada por parentMsgKey no encontró nada. En vez de adivinar un
+        // método de escaneo completo (ya falló toArray en un intento previo), se listan los
+        // métodos reales que expone el objeto devuelto por getTable() en ESTA versión de
+        // WhatsApp Web, para saber con qué API real se puede hacer un escaneo de respaldo.
+        matchMode = 'exact_empty';
+        const methodSet = new Set();
+        let proto = table;
+        while (proto && proto !== Object.prototype) {
+          Object.getOwnPropertyNames(proto).forEach((k) => {
+            try {
+              if (typeof table[k] === 'function') methodSet.add(k);
+            } catch {
+              // Algunas propiedades son getters que pueden lanzar; se ignoran.
+            }
+          });
+          proto = Object.getPrototypeOf(proto);
+        }
+        availableMethods = [...methodSet];
+      }
+
+      return {
+        keyStr,
+        matchMode,
+        availableMethods,
+        votes: (rows || []).map((item) => ({
+          sender: item.sender,
+          senderTimestampMs: item.senderTimestampMs,
+          selectedOptionLocalIds: Array.from(new Uint8Array(item.selectedOptionLocalIds)),
+        })),
+      };
+    } catch (err) {
+      return { error: err?.message || String(err) };
+    }
+  }, whatsappMsgId);
+
+  if (result?.error) {
+    console.error(`[whatsapp] fetchPollVotesFromWhatsapp: error evaluando en la página para ${whatsappMsgId}:`, result.error);
+    return [];
+  }
+
+  console.debug(
+    `[whatsapp] fetchPollVotesFromWhatsapp ${whatsappMsgId}: keyStr=${result.keyStr} matchMode=${result.matchMode} votos=${result.votes.length}`
+    + (result.availableMethods ? ` métodosDisponiblesEnTable=${JSON.stringify(result.availableMethods)}` : ''),
+  );
+
+  return result.votes.map((v) => ({
+    voter: v.sender,
+    interractedAtTs: v.senderTimestampMs,
+    selectedOptions: v.selectedOptionLocalIds.map((localId) => ({ localId })),
+  }));
+}
+
+// La propia cuenta puede aparecer como "sender" de un voto en formato @lid o en formato
+// PN (@c.us / @s.whatsapp.net) según la migración de identidad de WhatsApp, y no siempre
+// coincide con client.info.wid._serialized (mismo caso ya conocido en este archivo para
+// unread counts y autor de mensajes citados — ver applyChatUnreadCount). Se resuelven ambas
+// variantes de la identidad propia para no comparar solo contra una.
+export async function resolveMyVoterIds(myId) {
+  const ids = new Set([myId]);
+  try {
+    if (typeof client?.getContactLidAndPhone === 'function') {
+      const [result] = await client.getContactLidAndPhone([myId]);
+      const lid = typeof result?.lid === 'string' ? result.lid : result?.lid?._serialized;
+      const pn = typeof result?.pn === 'string' ? result.pn : result?.pn?._serialized;
+      if (lid) ids.add(lid);
+      if (pn) ids.add(pn);
+    }
+  } catch {
+    // Seguir solo con myId si no se puede resolver lid/pn.
+  }
+  return ids;
+}
+
+// Reimplementación de Message.prototype.vote() de whatsapp-web.js@1.34.7. La versión original
+// busca el mensaje dentro del navegador vía WAWebCollections.Msg.get()/getMessagesById(), y si
+// no lo encuentra retorna en silencio sin enviar nada ni avisar — y además empareja la opción
+// por NOMBRE (msg.pollOptions.find(a => a.name === option)), que puede fallar si dos opciones
+// comparten texto. Aquí se hace la misma llamada a WAWebPollsSendVoteMsgAction pero emparejando
+// por optionLocalId (ya conocido desde nuestra BD) y devolviendo diagnóstico de cada paso en
+// vez de fallar en silencio.
+async function castPollVoteOnWhatsapp(whatsappMsgId, optionLocalId) {
+  if (!client?.pupPage) return { error: 'pupPage no disponible' };
+  return client.pupPage.evaluate(async (msgId, localId) => {
+    try {
+      const collections = window.require('WAWebCollections');
+      let msg = collections.Msg.get(msgId);
+      if (!msg) {
+        const fetched = await collections.Msg.getMessagesById([msgId]);
+        msg = fetched?.messages?.[0] || null;
+      }
+      if (!msg) return { found: false };
+
+      const pollOptions = (msg.pollOptions || []).map((o) => ({ localId: o.localId, name: o.name }));
+      if (!pollOptions.some((o) => o.localId === localId)) {
+        return { found: true, pollOptions, matchExists: false };
+      }
+
+      // Msg.get()/getMessagesById() pueden devolver un mensaje "suelto", sin vincular a su
+      // Chat (msg.chat vacío) — y sendVote() lo necesita para saber a quién cifrar/enviar el
+      // voto, fallando con el genérico "Vote send error" si falta. Se reconstruye el mismo
+      // camino de bajo nivel que usa la propia librería en getChat() (WWebJS.getChat), sin
+      // pasar por getChatModel()/metadata de grupo (esa parte sí es la que falla con el bug
+      // "r: r" ya conocido en este entorno).
+      const hadChatBefore = !!msg.chat;
+      let chatAttachError = null;
+      if (!msg.chat) {
+        try {
+          const remote = msgId.split('_')[1];
+          if (remote) {
+            const chatWid = window.require('WAWebWidFactory').createWid(remote);
+            const chat =
+              window.require('WAWebCollections').Chat.get(chatWid) ||
+              (await window.require('WAWebFindChatAction').findOrCreateLatestChat(chatWid))?.chat;
+            if (chat) msg.chat = chat;
+          }
+        } catch (err) {
+          chatAttachError = err?.message || String(err);
+        }
+      }
+
+      const msgDiagnostics = {
+        type: msg.type,
+        hasMessageSecret: !!(msg.messageSecret && msg.messageSecret.length),
+        hasPollAdditionalData: !!msg.pollAdditionalData,
+        pollInvalidated: !!msg.pollInvalidated,
+        hadChatBefore,
+        hasChat: !!msg.chat,
+        chatAttachError,
+        isNewMsg: !!msg.isNewMsg,
+        ack: msg.ack,
+      };
+
+      try {
+        await window.require('WAWebPollsSendVoteMsgAction').sendVote(msg, new Set([localId]));
+      } catch (sendErr) {
+        return { found: true, pollOptions, matchExists: true, msgDiagnostics, sendError: sendErr?.message || String(sendErr) };
+      }
+      return { found: true, pollOptions, matchExists: true, msgDiagnostics, sent: true };
+    } catch (err) {
+      return { error: err?.message || String(err) };
+    }
+  }, whatsappMsgId, optionLocalId);
+}
+
+export async function castPollVote(whatsappMsgId, messageId, optionLocalId, optionName) {
+  if (!client || connectionStatus !== 'connected' || !whatsappMsgId || !messageId || !optionName) {
+    return { success: false, code: 'NOT_CONNECTED' };
+  }
+  try {
+    const voteResult = await castPollVoteOnWhatsapp(whatsappMsgId, optionLocalId);
+    if (!voteResult || voteResult.error) {
+      console.error(`[whatsapp] Error enviando voto a WhatsApp para ${whatsappMsgId}:`, voteResult?.error);
+      return { success: false, code: 'VOTE_ERROR', error: voteResult?.error || 'Error desconocido enviando el voto' };
+    }
+    if (!voteResult.found || !voteResult.matchExists) {
+      console.warn(
+        `[whatsapp] No se pudo enviar el voto a WhatsApp para ${whatsappMsgId}: found=${voteResult.found} matchExists=${voteResult.matchExists} optionLocalId=${optionLocalId} pollOptions=${JSON.stringify(voteResult.pollOptions)}`,
+      );
+      return {
+        success: false,
+        code: voteResult.found ? 'OPTION_NOT_FOUND' : 'MESSAGE_NOT_IN_COLLECTION',
+        error: 'WhatsApp no encontró la encuesta o la opción para enviar el voto',
+      };
+    }
+    if (voteResult.sendError) {
+      console.warn(
+        `[whatsapp] sendVote() falló para ${whatsappMsgId}: ${voteResult.sendError} — diagnóstico del mensaje: ${JSON.stringify(voteResult.msgDiagnostics)}`,
+      );
+      return { success: false, code: 'VOTE_SEND_ERROR', error: voteResult.sendError };
+    }
+    console.debug(`[whatsapp] sendVote() OK para ${whatsappMsgId} — diagnóstico del mensaje: ${JSON.stringify(voteResult.msgDiagnostics)}`);
+
+    // sendVote() no confirma nada por sí mismo. Se relee la encuesta y solo se da el voto por
+    // bueno (y se persiste) si aparece confirmado desde WhatsApp. La escritura del voto en la
+    // tabla interna de WhatsApp Web puede tardar un instante en aparecer tras que sendVote()
+    // resuelve, así que se reintenta unas pocas veces antes de darlo por no confirmado.
+    const myId = client?.info?.wid?._serialized || null;
+    if (!myId) return { success: false, code: 'VOTE_NOT_CONFIRMED', error: 'WhatsApp no confirmó el voto' };
+    const myIds = await resolveMyVoterIds(myId);
+
+    let myVote = null;
+    let lastVotes = null;
+    for (let attempt = 0; attempt < 4 && !myVote; attempt++) {
+      if (attempt > 0) await delay(400);
+      lastVotes = await fetchPollVotesFromWhatsapp(whatsappMsgId);
+      const candidate = Array.isArray(lastVotes) ? lastVotes.find((v) => myIds.has(v.voter)) : null;
+      const confirmed = candidate?.selectedOptions?.some((opt) => (opt?.localId ?? opt?.id) === optionLocalId);
+      if (confirmed) myVote = candidate;
+    }
+    if (!myVote) {
+      console.warn(
+        `[whatsapp] Voto no confirmado en encuesta ${whatsappMsgId}. myIds=${JSON.stringify([...myIds])} optionLocalId=${optionLocalId} votosVistos=${JSON.stringify(lastVotes)}`,
+      );
+      return { success: false, code: 'VOTE_NOT_CONFIRMED', error: 'WhatsApp no confirmó el voto' };
+    }
+
+    const votedAtTs = Number.isFinite(myVote.interractedAtTs)
+      ? Math.floor(myVote.interractedAtTs / 1000)
+      : Math.floor(Date.now() / 1000);
+    // Se persiste bajo el mismo identificador con el que WhatsApp reportó el voto
+    // (myVote.voter), no bajo myId — así los eventos vote_update/refresh que lleguen luego
+    // para este mismo votante (que también usan el valor "en crudo" reportado por WhatsApp)
+    // encuentran y sobrescriben la fila correcta en vez de crear una fila duplicada bajo
+    // otra variante (@lid vs @c.us) de la misma identidad.
+    applyPollVoteSelection(messageId, myVote.voter, myVote.selectedOptions, votedAtTs);
+    return { success: true };
+  } catch (err) {
+    console.error(`[whatsapp] Error votando en encuesta ${whatsappMsgId}:`, err.message);
+    return { success: false, error: err.message || 'Error desconocido', code: 'VOTE_ERROR' };
+  }
+}
+
+export async function refreshPollVotesFromWhatsapp(whatsappMsgId, messageId) {
+  if (!client || connectionStatus !== 'connected' || !whatsappMsgId || !messageId) {
+    return { success: false, code: 'NOT_CONNECTED' };
+  }
+  try {
+    const votes = await fetchPollVotesFromWhatsapp(whatsappMsgId);
+    for (const vote of Array.isArray(votes) ? votes : []) {
+      const voterChatId = vote?.voter || null;
+      if (!voterChatId) continue;
+      const votedAtTs = Number.isFinite(vote.interractedAtTs)
+        ? Math.floor(vote.interractedAtTs / 1000)
+        : Math.floor(Date.now() / 1000);
+      applyPollVoteSelection(messageId, voterChatId, vote.selectedOptions, votedAtTs);
+    }
+    return { success: true };
+  } catch (err) {
+    console.error(`[whatsapp] Error refrescando votos de encuesta ${whatsappMsgId}:`, err.message);
+    return { success: false, error: err.message || 'Error desconocido', code: 'REFRESH_ERROR' };
   }
 }
