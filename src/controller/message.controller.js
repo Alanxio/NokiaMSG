@@ -2,6 +2,7 @@ import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
 import { escapeXml, formatPhoneNumber, isNumericOrJid, renderMediaLine, renderMentions, renderPhoneLink, sendInvalidEntity, sendMissingEntity, sendPage } from './page.controller.js';
 import { processAndAttachMedia } from '../utils/media.js';
+import { getMessageQuotePreview } from '../utils/message-preview.js';
 import multer from 'multer';
 import pkg from 'whatsapp-web.js';
 
@@ -25,6 +26,24 @@ import { registerPendingOutgoing } from '../services/pending-outgoing.service.js
 
 const EXISTING_CONTACT_ICON_HTML = '<img src="/assets/user.jpeg" alt="Contacto" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
 
+function getReplyMessageForTarget(messageId, targetJid) {
+  if (typeof messageId !== 'string' || !/^[1-9]\d*$/.test(messageId)) {
+    return null;
+  }
+
+  const message = stmts.getReplyMessageById.get(Number(messageId));
+  const messageChatId = message?.group_id || message?.user_chat_id;
+  if (
+    !message ||
+    !message.whatsapp_msg_id ||
+    Number(message.is_deleted) === 1 ||
+    messageChatId !== targetJid
+  ) {
+    return null;
+  }
+  return message;
+}
+
 export const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
@@ -40,7 +59,7 @@ export const upload = multer({
 
 export async function renderComposePage(req, res, next) {
   try {
-    const { q, to, type } = req.query;
+    const { q, to, type, replyTo } = req.query;
 
     // =========================================================================
     // CASO 1: FORMULARIO DE ESCRITURA (Estilo clásico limpio)
@@ -70,7 +89,25 @@ export async function renderComposePage(req, res, next) {
         }
       }
 
+      const replyMessage = replyTo === undefined
+        ? null
+        : getReplyMessageForTarget(replyTo, to);
+      if (replyTo !== undefined && !replyMessage) {
+        return sendPage(
+          req,
+          res,
+          400,
+          'No se puede responder',
+          '<p>El mensaje original ya no está disponible para responder.</p><p><a href="/">Inicio</a></p>'
+        );
+      }
+
       let body = `<h1>Para: ${escapeXml(destinoNombre)}</h1>`;
+      if (replyMessage) {
+        const quotedText = getMessageQuotePreview(replyMessage).slice(0, 120);
+        const quotedSender = Number(replyMessage.from_me) === 1 ? 'Yo' : (replyMessage.username || 'Desconocido');
+        body += `<p><font size="1" color="#555555">Respondiendo a ${escapeXml(quotedSender)}:</font><br/><i>${escapeXml(quotedText)}</i></p>`;
+      }
 
       if (type === 'group') {
         try {
@@ -86,7 +123,8 @@ export async function renderComposePage(req, res, next) {
             body += `<p><font size="1" color="#555555">Mencionar en grupo:</font><br/>`;
             body += participants.map(p => {
               const textWithMention = (textoPrevio ? textoPrevio + ' ' : '') + '@' + p.username + ' ';
-              return `<a href="/mensaje/componer?to=${encodeURIComponent(to)}&type=group&text=${encodeURIComponent(textWithMention)}">@${escapeXml(p.username)}</a>`;
+              const replyParam = replyMessage ? `&replyTo=${replyMessage.id}` : '';
+              return `<a href="/mensaje/componer?to=${encodeURIComponent(to)}&type=group&text=${encodeURIComponent(textWithMention)}${replyParam}">@${escapeXml(p.username)}</a>`;
             }).join(' | ');
             body += `</p>`;
           }
@@ -97,14 +135,19 @@ export async function renderComposePage(req, res, next) {
         <form action="/mensaje/validar-y-crear" method="POST" enctype="multipart/form-data">
           <input type="hidden" name="phone" value="${escapeXml(to)}"/>
           <input type="hidden" name="type" value="${escapeXml(type)}"/>
+          ${replyMessage ? `<input type="hidden" name="replyTo" value="${replyMessage.id}"/>` : ''}
           <p>
             <textarea name="text" rows="5" cols="22">${escapeXml(textoPrevio)}</textarea>
           </p>
           <p>
+            Foto 1:<br/>
             <input type="file" name="image" accept="image/jpeg,image/png"/>
+            Foto 2:<br/>
+            <input type="file" name="image2" accept="image/jpeg,image/png"/>
           </p>
           <p>
-            <input type="submit" value="Enviar"/> <a href="${urlCancelar}">Cancelar</a>
+            <input type="submit" value="Enviar"/>
+            <a href="${urlCancelar}">Cancelar</a>
           </p>
         </form>
       `;
@@ -330,11 +373,14 @@ export async function renderComposePage(req, res, next) {
 
 export async function validateAndCreateChat(req, res, next) {
   // ===========================================================================
-  // 1. Procesar posible imagen adjunta con multer
+  // 1. Procesar hasta dos imágenes adjuntas con multer
   // ===========================================================================
   try {
     await new Promise((resolve, reject) => {
-      upload.single('image')(req, res, (err) => {
+      upload.fields([
+        { name: 'image', maxCount: 1 },
+        { name: 'image2', maxCount: 1 },
+      ])(req, res, (err) => {
         if (err) reject(err);
         else resolve();
       });
@@ -342,7 +388,7 @@ export async function validateAndCreateChat(req, res, next) {
   } catch (err) {
     let message = 'Error al procesar la imagen.';
     if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
-      message = 'La imagen es demasiado grande. Maximo 5 MB.';
+      message = 'Cada imagen puede ocupar como máximo 5 MB.';
     } else if (err.message === 'Solo se permiten imagenes JPG o PNG') {
       message = err.message;
     }
@@ -356,14 +402,14 @@ export async function validateAndCreateChat(req, res, next) {
   }
 
   try {
-    const { phone, text, type } = req.body;
-    const imageFile = req.file;
+    const { phone, text, type, replyTo } = req.body;
+    const imageFiles = ['image', 'image2'].flatMap((field) => req.files?.[field] || []);
 
     const trimmedText = typeof text === 'string' ? text.trim() : '';
     const hasText = trimmedText !== '';
-    const hasImage = !!imageFile;
+    const hasImages = imageFiles.length > 0;
 
-    if (!phone || (!hasText && !hasImage)) {
+    if (!phone || (!hasText && !hasImages)) {
       return sendPage(
         req,
         res,
@@ -389,6 +435,19 @@ export async function validateAndCreateChat(req, res, next) {
         );
       }
       targetJid = numberDetails._serialized;
+    }
+
+    const replyMessage = replyTo === undefined
+      ? null
+      : getReplyMessageForTarget(replyTo, targetJid);
+    if (replyTo !== undefined && !replyMessage) {
+      return sendPage(
+        req,
+        res,
+        400,
+        'No se puede responder',
+        '<p>El mensaje original ya no está disponible para responder.</p><p><a href="/mensaje/componer">Volver</a></p>'
+      );
     }
 
     // =========================================================================
@@ -452,90 +511,133 @@ export async function validateAndCreateChat(req, res, next) {
       }
     }
 
+    if (replyMessage) {
+      options.quotedMessageId = replyMessage.whatsapp_msg_id;
+      options.ignoreQuoteErrors = false;
+    }
+
     options.waitUntilMsgSent = true;
+    const urlDestino = type === 'group' || targetJid.endsWith('@g.us')
+      ? `/grupo/${encodeURIComponent(targetJid)}`
+      : `/usuario/${encodeURIComponent(targetJid)}`;
+    const outgoingMessages = hasImages
+      ? imageFiles.map((imageFile, index) => ({
+        imageFile,
+        text: index === 0 ? processedText : '',
+      }))
+      : [{ imageFile: null, text: processedText }];
 
-    let sentMessage = null;
-    if (hasImage) {
-      const media = new MessageMedia(
-        imageFile.mimetype,
-        imageFile.buffer.toString('base64'),
-        imageFile.originalname
-      );
-      sentMessage = await client.sendMessage(targetJid, media, { ...options, caption: processedText });
-    } else {
-      sentMessage = await client.sendMessage(targetJid, processedText, options);
-    }
-
-    // En esta versión de whatsapp-web.js, client.sendMessage() puede no devolver el
-    // Message con su id (el mensaje se manda bien de todos modos) — comprobado en vivo:
-    // sin excepción, sin id. Si no llega aquí, se enlaza más tarde de forma asíncrona
-    // cuando WhatsApp confirme el envío por su cuenta vía el evento message_create (ver
-    // registerPendingOutgoing más abajo y su consumo en whatsapp.service.js).
-    const whatsappMsgId = sentMessage?.id?._serialized || null;
-
-    // CONTROL ESTRICTO DE FECHA/HORA EN FORMATO SQLITE ("YYYY-MM-DD HH:MM:SS")
-    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
-    const pad = (n) => String(n).padStart(2, '0');
-    const daySend = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-    const hourSend = `${daySend} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-
-    const finalText = processedText || '[Imagen]';
-    let urlDestino = '/';
-    let insertedMessageId = null;
-
-    if (type === 'group' || targetJid.endsWith('@g.us')) {
-      const g = db.prepare('SELECT group_id FROM wgroups WHERE group_id = ?').get(targetJid);
-      if (!g) {
-        let groupName = 'Grupo sin nombre';
+    for (const { imageFile, text: messageText } of outgoingMessages) {
+      const hasImage = !!imageFile;
+      let sentMessage;
+      if (imageFile) {
+        const media = new MessageMedia(
+          imageFile.mimetype,
+          imageFile.buffer.toString('base64'),
+          imageFile.originalname
+        );
+        const mediaOptions = {
+          ...options,
+          caption: messageText,
+        };
+        if (!messageText) delete mediaOptions.mentions;
         try {
-          const chat = await client.getChatById(targetJid);
-          if (chat && chat.name) groupName = chat.name;
-        } catch (e) {}
-        stmts.upsertGroup.run(targetJid, groupName);
-      }
-      if (hasImage) {
-        const result = stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null, whatsappMsgId);
-        insertedMessageId = result.lastInsertRowid;
-      } else {
-        const result = stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid, whatsappMsgId);
-        insertedMessageId = result.lastInsertRowid;
-      }
-      urlDestino = `/grupo/${encodeURIComponent(targetJid)}`;
-    } else {
-      const u = db.prepare('SELECT chat_id FROM users WHERE chat_id = ?').get(targetJid);
-      if (!u) {
-        let finalName = `+${targetJid.split('@')[0]}`;
-        try {
-          const contact = await client.getContactById(targetJid);
-          if (contact) {
-            finalName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || finalName;
+          sentMessage = await client.sendMessage(targetJid, media, mediaOptions);
+        } catch (error) {
+          if (replyMessage) {
+            console.error('[mensaje] No se pudo enviar la respuesta:', error?.message || error);
+            return sendPage(
+              req,
+              res,
+              409,
+              'No se pudo responder',
+              '<p>WhatsApp no pudo vincular la respuesta al mensaje original; no se ha enviado como mensaje normal.</p><p><a href="/mensaje/componer">Volver</a></p>'
+            );
           }
-        } catch (e) {}
-        stmts.upsertUser.run(targetJid, finalName);
+          throw error;
+        }
+      } else {
+        try {
+          sentMessage = await client.sendMessage(targetJid, messageText, options);
+        } catch (error) {
+          if (replyMessage) {
+            console.error('[mensaje] No se pudo enviar la respuesta:', error?.message || error);
+            return sendPage(
+              req,
+              res,
+              409,
+              'No se pudo responder',
+              '<p>WhatsApp no pudo vincular la respuesta al mensaje original; no se ha enviado como mensaje normal.</p><p><a href="/mensaje/componer">Volver</a></p>'
+            );
+          }
+          throw error;
+        }
       }
-      if (hasImage) {
-        const result = stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null, whatsappMsgId);
+
+      // whatsapp-web.js puede no devolver el id, así que se enlaza después del evento
+      // message_create cuando WhatsApp confirme el envío.
+      const whatsappMsgId = sentMessage?.id?._serialized || null;
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
+      const pad = (n) => String(n).padStart(2, '0');
+      const daySend = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+      const hourSend = `${daySend} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+      const finalText = messageText || '[Imagen]';
+      let insertedMessageId;
+
+      if (type === 'group' || targetJid.endsWith('@g.us')) {
+        const group = db.prepare('SELECT group_id FROM wgroups WHERE group_id = ?').get(targetJid);
+        if (!group) {
+          let groupName = 'Grupo sin nombre';
+          try {
+            const chat = await client.getChatById(targetJid);
+            if (chat && chat.name) groupName = chat.name;
+          } catch (e) {}
+          stmts.upsertGroup.run(targetJid, groupName);
+        }
+        const result = hasImage
+          ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null, whatsappMsgId)
+          : stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid, whatsappMsgId);
         insertedMessageId = result.lastInsertRowid;
       } else {
-        const result = stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null, whatsappMsgId);
+        const user = db.prepare('SELECT chat_id FROM users WHERE chat_id = ?').get(targetJid);
+        if (!user) {
+          let finalName = `+${targetJid.split('@')[0]}`;
+          try {
+            const contact = await client.getContactById(targetJid);
+            if (contact) {
+              finalName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || finalName;
+            }
+          } catch (e) {}
+          stmts.upsertUser.run(targetJid, finalName);
+        }
+        const result = hasImage
+          ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null, whatsappMsgId)
+          : stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null, whatsappMsgId);
         insertedMessageId = result.lastInsertRowid;
       }
-      urlDestino = `/usuario/${encodeURIComponent(targetJid)}`;
-    }
 
-    if (!whatsappMsgId && insertedMessageId) {
-      registerPendingOutgoing(targetJid, insertedMessageId);
-    }
+      if (replyMessage && insertedMessageId) {
+        stmts.updateMessageQuote.run(
+          getMessageQuotePreview(replyMessage),
+          (Number(replyMessage.from_me) === 1 ? 'Yo' : (replyMessage.username || 'Desconocido')).slice(0, 100),
+          insertedMessageId
+        );
+      }
 
-    if (hasImage && insertedMessageId && imageFile?.buffer) {
-      try {
-        await processAndAttachMedia(insertedMessageId, imageFile.buffer, {
-          mediaKey: `out_${insertedMessageId}_${Date.now()}`,
-          filename: imageFile.originalname || `out_${insertedMessageId}.jpg`,
-          mimeType: imageFile.mimetype || 'image/jpeg',
-        });
-      } catch (mediaErr) {
-        console.error('[mensaje] Error guardando attachment saliente:', mediaErr.message);
+      if (!whatsappMsgId && insertedMessageId) {
+        registerPendingOutgoing(targetJid, insertedMessageId);
+      }
+
+      if (imageFile && insertedMessageId) {
+        try {
+          await processAndAttachMedia(insertedMessageId, imageFile.buffer, {
+            mediaKey: `out_${insertedMessageId}_${Date.now()}`,
+            filename: imageFile.originalname || `out_${insertedMessageId}.jpg`,
+            mimeType: imageFile.mimetype || 'image/jpeg',
+          });
+        } catch (mediaErr) {
+          console.error('[mensaje] Error guardando attachment saliente:', mediaErr.message);
+        }
       }
     }
 
@@ -646,8 +748,13 @@ export async function showMessageDetail(req, res, next) {
       });
 
       contentHtml += `<p><font size="1" color="#888888">Total: ${totalVotes} voto(s)</font></p>`;
-    } else if (isSticker && attachment?.file_path_thumb) {
-      contentHtml += `<p><img src="${escapeXml(attachment.file_path_thumb)}" alt="Sticker" width="40"/></p>`;
+    } else if (
+      isSticker
+      && (attachment?.file_path_view || attachment?.file_path_full || attachment?.file_path_thumb)
+    ) {
+      const stickerPath = attachment.file_path_view || attachment.file_path_full || attachment.file_path_thumb;
+      const stickerWidth = attachment.file_path_view || attachment.file_path_full ? 120 : 40;
+      contentHtml += `<p><img src="${escapeXml(stickerPath)}" alt="Sticker" width="${stickerWidth}"/></p>`;
     } else if (attachment?.file_path_view) {
       contentHtml += `<p><img src="${escapeXml(attachment.file_path_view)}" alt="Imagen" width="${attachment.view_width || 120}" height="${attachment.view_height || 90}"/></p>`;
     } else if (mediaType) {

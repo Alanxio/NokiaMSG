@@ -5,11 +5,15 @@
 const pendingByChatId = new Map();
 
 export function registerPendingOutgoing(chatId, messageRowId) {
-  pendingByChatId.set(chatId, messageRowId);
+  const queue = pendingByChatId.get(chatId) || [];
+  queue.push(messageRowId);
+  pendingByChatId.set(chatId, queue);
 }
 
 export function takePendingOutgoing(chatId) {
-  const rowId = pendingByChatId.get(chatId);
-  if (rowId !== undefined) pendingByChatId.delete(chatId);
+  const queue = pendingByChatId.get(chatId);
+  if (!queue || queue.length === 0) return null;
+  const rowId = queue.shift();
+  if (queue.length === 0) pendingByChatId.delete(chatId);
   return rowId ?? null;
 }

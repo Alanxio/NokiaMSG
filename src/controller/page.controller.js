@@ -52,6 +52,18 @@ export function renderPhoneLink(phone) {
   return `<font size="1" color="#666666">(<a href="wtai://wp/mc;${escapeXml(cleanNumber)}"><font color="#666666">${escapeXml(phone)}</font></a>)</font>`;
 }
 
+export function renderReplyLink(message, chatId, type) {
+  if (
+    !message.whatsapp_msg_id ||
+    Number(message.is_deleted) === 1 ||
+    Number(message.is_system) === 1
+  ) {
+    return '';
+  }
+
+  return `<a href="/mensaje/componer?to=${encodeURIComponent(chatId)}&amp;type=${type}&amp;replyTo=${message.id}" title="Responder a este mensaje" style="display:inline-block; padding:5px; vertical-align:middle;"><span style="display:block; width:10px; height:10px; overflow:hidden;"><img src="/assets/Chat.png" alt="Responder" width="12" height="12" style="position:relative; left:-28px; top:-67px;"/></span></a>`;
+}
+
 export function renderAckLabel(ackStatus) {
   const ack = Number(ackStatus ?? 0);
   if (ack === -1) return '<font color="#cc0000">[Error]</font> ';

@@ -359,7 +359,7 @@ export const stmts = {
 
   getUserMessagesPaginated: db.prepare(`
     SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.ack_status,
-           m.quoted_text, m.quoted_sender, m.is_deleted, m.is_edited, m.is_system,
+           m.quoted_text, m.quoted_sender, m.whatsapp_msg_id, m.is_deleted, m.is_edited, m.is_system,
            m.media_type,
            g.group_name,
            a.file_path_thumb, a.file_path_full, a.file_name, a.duration_sec
@@ -373,7 +373,7 @@ export const stmts = {
 
   getGroupMessagesPaginated: db.prepare(`
     SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.ack_status,
-           m.quoted_text, m.quoted_sender, m.is_deleted, m.is_edited, m.is_system,
+           m.quoted_text, m.quoted_sender, m.whatsapp_msg_id, m.is_deleted, m.is_edited, m.is_system,
            m.media_type,
            u.username, u.chat_id AS user_chat_id,
            a.file_path_thumb, a.file_path_full, a.file_name, a.duration_sec
@@ -383,6 +383,19 @@ export const stmts = {
     WHERE m.group_id = ?
     ORDER BY m.hour_send DESC, m.id DESC
     LIMIT ? OFFSET ?
+  `),
+
+  getReplyMessageById: db.prepare(`
+    SELECT m.id, m.text, m.from_me, m.whatsapp_msg_id, m.user_chat_id, m.group_id,
+           m.is_deleted, m.has_media, m.is_sticker, m.media_type, u.username
+    FROM messages m
+    LEFT JOIN users u ON u.chat_id = m.user_chat_id
+    WHERE m.id = ?
+    LIMIT 1
+  `),
+
+  updateMessageQuote: db.prepare(`
+    UPDATE messages SET quoted_text = ?, quoted_sender = ? WHERE id = ?
   `),
 
   getAllMessagesPaginated: db.prepare(`
@@ -447,6 +460,16 @@ export const stmts = {
     )
   `),
 
+  deleteParticipantsWithoutMessages: db.prepare(`
+    DELETE FROM group_participants
+    WHERE user_chat_id NOT IN (
+      SELECT DISTINCT user_chat_id FROM messages WHERE user_chat_id IS NOT NULL
+    )
+    OR group_id NOT IN (
+      SELECT DISTINCT group_id FROM messages WHERE group_id IS NOT NULL
+    )
+  `),
+
   insertAttachment: db.prepare(`
     INSERT INTO attachments (message_id, media_key, mime_type, file_name, file_size, file_path_full, file_path_view, file_path_thumb, duration_sec, album_order, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -484,10 +507,35 @@ export const stmts = {
     UPDATE messages SET has_media = 1 WHERE id = ?
   `),
 
-  getAttachmentsByCreatedAt: db.prepare(`
-    SELECT id, file_path_full, file_path_view, file_path_thumb, file_name, created_at
-    FROM attachments
-    WHERE created_at < (CAST(strftime('%s', 'now') AS INTEGER) - ?)
+  getAttachmentsByMessageCutoff: db.prepare(`
+    SELECT a.id, a.file_path_full, a.file_path_view, a.file_path_thumb
+    FROM attachments a
+    JOIN messages m ON m.id = a.message_id
+    WHERE m.hour_send IS NOT NULL AND m.hour_send <= ?
+  `),
+
+  deletePollVotesByMessageCutoff: db.prepare(`
+    DELETE FROM poll_votes
+    WHERE option_id IN (
+      SELECT po.id
+      FROM poll_options po
+      JOIN messages m ON m.id = po.message_id
+      WHERE m.hour_send IS NOT NULL AND m.hour_send <= ?
+    )
+  `),
+
+  deletePollOptionsByMessageCutoff: db.prepare(`
+    DELETE FROM poll_options
+    WHERE message_id IN (
+      SELECT id FROM messages WHERE hour_send IS NOT NULL AND hour_send <= ?
+    )
+  `),
+
+  deleteAttachmentsByMessageCutoff: db.prepare(`
+    DELETE FROM attachments
+    WHERE message_id IN (
+      SELECT id FROM messages WHERE hour_send IS NOT NULL AND hour_send <= ?
+    )
   `),
 
   updateAttachmentMessageId: db.prepare(`

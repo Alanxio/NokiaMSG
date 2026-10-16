@@ -17,6 +17,7 @@ import {
   renderNumberedPager,
   renderPager,
   renderPhoneLink,
+  renderReplyLink,
   sendInvalidEntity,
   sendMissingEntity,
   sendPage,
@@ -150,7 +151,7 @@ export async function showUserMessages(req, res, next) {
           : '';
 
         messagesHtml +=
-          `<p>${unseenMarker}${fromMeMarker}${escapeXml(sentAt)}${groupPart}${editedTag}<br/>` +
+          `<p>${unseenMarker}${fromMeMarker}${escapeXml(sentAt)}${groupPart}${editedTag}${renderReplyLink(message, user.chat_id, 'user')}<br/>` +
           `${quotedBlock}${contentPart}<br/>----------</p>`;
       });
     }

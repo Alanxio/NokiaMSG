@@ -24,8 +24,8 @@ function getMadridDateParts(date = new Date()) {
 
 function getMessageRetentionDays() {
   const raw = (
-    process.env.RETENTION_DAYS ??
     process.env.MESSAGE_RETENTION_DAYS ??
+    process.env.RETENTION_DAYS ??
     `${DEFAULT_MESSAGE_RETENTION_DAYS}`
   ).trim();
   const parsed = Number.parseInt(raw, 10);
@@ -121,9 +121,7 @@ export function safeUnlink(filePath) {
   }
 }
 
-function cleanupMedia(retentionDays) {
-  const cutoffSeconds = Math.floor(Date.now() / 1000) - (retentionDays * 86400);
-  const attachments = stmts.getAttachmentsByCreatedAt.all(cutoffSeconds);
+function cleanupMedia(attachments) {
   if (attachments.length === 0) return;
 
   console.log(`[cleanup] Limpiando ${attachments.length} adjuntos antiguos...`);
@@ -132,12 +130,6 @@ function cleanupMedia(retentionDays) {
     safeUnlink(resolveMediaFsPath(a.file_path_thumb));
     safeUnlink(resolveMediaFsPath(a.file_path_full));
     safeUnlink(resolveMediaFsPath(a.file_path_view));
-  }
-
-  if (attachments.length > 0) {
-    const ids = attachments.map(a => a.id);
-    const placeholders = ids.map(() => '?').join(',');
-    db.prepare(`DELETE FROM attachments WHERE id IN (${placeholders})`).run(...ids);
   }
 }
 
@@ -160,10 +152,16 @@ function cleanupPuppeteerCache() {
 }
 
 async function runCleanup() {
+  if (!isCleanupEnabled()) {
+    console.log('[cleanup] Limpieza omitida: borrado automatico desactivado');
+    return;
+  }
+
   const startedAt = new Date().toISOString();
   const retentionDays = getMessageRetentionDays();
   const cutoffDate = getCleanupCutoffDate(retentionDays);
   const cutoffTimestamp = `${cutoffDate} 23:59:59`;
+  let expiredAttachments = [];
 
   console.log(
     `[cleanup] Iniciando limpieza diaria a las ${startedAt} ` +
@@ -173,7 +171,10 @@ async function runCleanup() {
   try {
     db.exec('BEGIN');
 
-    cleanupMedia(retentionDays);
+    expiredAttachments = stmts.getAttachmentsByMessageCutoff.all(cutoffTimestamp);
+    stmts.deletePollVotesByMessageCutoff.run(cutoffTimestamp);
+    stmts.deletePollOptionsByMessageCutoff.run(cutoffTimestamp);
+    stmts.deleteAttachmentsByMessageCutoff.run(cutoffTimestamp);
 
     const deleteResult = stmts.deleteMessagesOlderThan.run(cutoffTimestamp);
 
@@ -187,23 +188,33 @@ async function runCleanup() {
       stmts.adjustGroupUnseen.run(group.group_id);
     }
 
+    stmts.deleteParticipantsWithoutMessages.run();
     stmts.deleteUsersWithoutMessages.run();
     stmts.deleteGroupsWithoutMessages.run();
 
     db.exec('COMMIT');
 
+    cleanupMedia(expiredAttachments);
     cleanupPuppeteerCache();
 
     console.log(
       `[cleanup] Limpieza completada: ${deleteResult.changes} mensajes eliminados`
     );
   } catch (err) {
-    db.exec('ROLLBACK');
+    if (db.inTransaction) {
+      db.exec('ROLLBACK');
+    }
     console.error('[cleanup] Error durante la limpieza:', err.message);
   }
 }
 
 let _cleanupTimer = null;
+
+function isCleanupEnabled() {
+  return ['1', 'true', 'yes', 'on'].includes(
+    (process.env.DAILY_CLEANUP_ENABLED || 'true').trim().toLowerCase()
+  );
+}
 
 function scheduleNext() {
   const delay = msUntilNextCleanup();
@@ -223,12 +234,9 @@ function scheduleNext() {
 }
 
 export function startDailyCleanup() {
-  const enabled = ['1', 'true', 'yes', 'on'].includes(
-    (process.env.DAILY_CLEANUP_ENABLED || 'true').trim().toLowerCase()
-  );
   const retentionDays = getMessageRetentionDays();
 
-  if (!enabled) {
+  if (!isCleanupEnabled()) {
     console.log('[cleanup] Limpieza diaria desactivada (DAILY_CLEANUP_ENABLED=false)');
     return;
   }

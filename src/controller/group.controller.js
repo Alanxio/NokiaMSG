@@ -20,6 +20,7 @@ import {
   renderNumberedPager,
   renderPager,
   renderPhoneLink,
+  renderReplyLink,
   sendInvalidEntity,
   sendMissingEntity,
   sendPage,
@@ -307,7 +308,7 @@ export async function showGroupMessages(req, res, next) {
         }
 
         messagesHtml +=
-          `<p>${unseenMarker}${fromMeMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font>${editedTag}<br/>` +
+          `<p>${unseenMarker}${fromMeMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font>${editedTag}${renderReplyLink(message, group.group_id, 'group')}<br/>` +
           usernameLine +
           quotedBlock +
           `<font size="1" color="#000000">${contentPart}</font><br/>` +

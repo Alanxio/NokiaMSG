@@ -35,7 +35,7 @@ export function showSettings(req, res, next) {
   const readReceiptsChecked = readReceiptsCurrent === 'true' ? 'checked="checked"' : '';
   const cleanupValue = process.env.DAILY_CLEANUP_ENABLED === 'false'
     ? 'never'
-    : process.env.MESSAGE_RETENTION_DAYS || '3';
+    : process.env.MESSAGE_RETENTION_DAYS || process.env.RETENTION_DAYS || '3';
   const cleanupOptionsHtml = CLEANUP_RETENTION_OPTIONS
     .map((option) => {
       const selected = option.value === cleanupValue ? ' selected="selected"' : '';

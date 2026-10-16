@@ -11,6 +11,7 @@ import { saveImageVersions, processSticker, saveRawMediaFile } from '../utils/me
 import { resolvePendingGroupNames, resolveGroupNameFromWhatsapp } from '../controller/group.controller.js';
 import { takePendingOutgoing } from './pending-outgoing.service.js';
 import { sendInfraAlertSms } from './sms-notification.service.js';
+import { getMessageQuotePreview } from '../utils/message-preview.js';
 
 const { Client, LocalAuth } = pkg;
 
@@ -38,6 +39,19 @@ let disconnectAlertTimer = null;
 let disconnectAlertSent = false;
 
 const activeChatsSinceStart = new Set();
+
+function getSerializedId(value) {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object') return null;
+  const serialized = value._serialized || value.$1;
+  return typeof serialized === 'string' && serialized ? serialized : null;
+}
+
+function getWhatsappMessageId(message) {
+  return getSerializedId(message?.id)
+    || getSerializedId(message?._data?.id)
+    || getSerializedId(message?.rawData?.id);
+}
 
 function checkDisconnectAlert() {
   if (connectionStatus === 'connected') {
@@ -588,7 +602,7 @@ export async function startWhatsappClient(processMessageFn) {
 
   client.on('message_ack', (message, ack) => {
     try {
-      const whatsappMsgId = message?.id?._serialized || null;
+      const whatsappMsgId = getWhatsappMessageId(message);
       if (!whatsappMsgId) return;
       stmts.updateMessageAckByWhatsappId.run(ack, whatsappMsgId, ack);
     } catch (e) {
@@ -635,8 +649,10 @@ export async function startWhatsappClient(processMessageFn) {
   // evento. parentMessage es el propio mensaje de creación de la encuesta.
   client.on('vote_update', (vote) => {
     try {
-      const whatsappMsgId = vote?.parentMessage?.id?._serialized || null;
-      const voterChatId = vote?.voter || null;
+      const whatsappMsgId = getWhatsappMessageId(vote?.parentMessage);
+      const voterChatId = getSerializedId(vote?.voter)
+        || getSerializedId(vote?.senderUserJid)
+        || getSerializedId(vote?.sender);
       if (!whatsappMsgId || !voterChatId) return;
 
       const localRow = stmts.findMessageByWhatsappId.get(whatsappMsgId);
@@ -848,11 +864,7 @@ export async function startWhatsappClient(processMessageFn) {
     // msg._data.id a veces llega sin ._serialized poblado (mismo entorno inestable de
     // siempre) pero SÍ trae el id ya serializado bajo la clave interna '$1' — nunca usar el
     // objeto crudo tal cual (rompería el INSERT en SQLite, que solo admite texto/números).
-    const rawIdCandidate = msg.id?._serialized
-      || msg._data?.id?._serialized
-      || msg._data?.id?.['$1']
-      || null;
-    const whatsappMsgId = typeof rawIdCandidate === 'string' && rawIdCandidate ? rawIdCandidate : null;
+    const whatsappMsgId = getWhatsappMessageId(msg);
     if (!whatsappMsgId) {
       console.warn(`[whatsapp] No se pudo determinar whatsapp_msg_id para un mensaje de ${msg.from} (tipo ${msg.type}) — el voto/edición en vivo no funcionará para este mensaje si es una encuesta.`);
     }
@@ -870,17 +882,25 @@ export async function startWhatsappClient(processMessageFn) {
       // entorno. Este evento sí trae el ID real y de forma fiable (msg.id.remote ya viene
       // como string plano, normalizado por la propia librería) — se usa para enlazarlo a
       // posteriori con la fila que quedó pendiente para este mismo chat.
-      const remote = msg.id?.remote;
-      const chatId = typeof remote === 'object' ? remote?._serialized : remote;
-      if (whatsappMsgId && chatId) {
-        const rowId = takePendingOutgoing(chatId);
-        if (rowId) {
-          try {
-            stmts.setMessageWhatsappId.run(whatsappMsgId, rowId);
-            console.log(`[whatsapp] whatsapp_msg_id asignado a posteriori: fila local #${rowId} -> ${whatsappMsgId}`);
-          } catch (err) {
-            console.warn('[whatsapp] No se pudo enlazar whatsapp_msg_id:', err?.message);
+      const chatId = getSerializedId(msg.id?.remote)
+        || getSerializedId(msg._data?.id?.remote)
+        || getSerializedId(msg.to)
+        || getSerializedId(msg._data?.to);
+      if (whatsappMsgId) {
+        if (chatId) {
+          const rowId = takePendingOutgoing(chatId);
+          if (rowId) {
+            try {
+              stmts.setMessageWhatsappId.run(whatsappMsgId, rowId);
+              console.log(`[whatsapp] whatsapp_msg_id asignado a posteriori: fila local #${rowId} -> ${whatsappMsgId}`);
+            } catch (err) {
+              console.warn('[whatsapp] No se pudo enlazar whatsapp_msg_id:', err?.message);
+            }
           }
+        }
+        const currentAck = Number(msg.ack ?? msg._data?.ack);
+        if (Number.isFinite(currentAck) && currentAck > 0) {
+          stmts.updateMessageAckByWhatsappId.run(currentAck, whatsappMsgId, currentAck);
         }
       }
       console.log(`[whatsapp] Mensaje saliente omitido (ya guardado por validateAndCreateChat): ${whatsappMsgId}`);
@@ -1023,19 +1043,20 @@ export async function startWhatsappClient(processMessageFn) {
       // único campo público de la librería para esto — msg.getQuotedMessage() hace una
       // llamada extra en vivo a Puppeteer (misma familia de bug "r: r" ya conocida en este
       // entorno para getChatById/fetchMessages), así que se evita y se lee directamente
-      // msg._data.quotedMsg, que ya viene con el propio evento, sin llamada adicional. La
-      // forma exacta de ese campo no está documentada en esta versión del paquete — de ahí
-      // el log del dato en crudo, por si hay que afinar la extracción con un caso real.
+      // msg._data.quotedMsg, que ya viene con el propio evento, sin llamada adicional.
       let quotedText = null;
       let quotedSender = null;
       if (msg.hasQuotedMsg) {
         try {
           const rawQuoted = msg._data?.quotedMsg || null;
-          console.log('[whatsapp] quotedMsg en crudo:', JSON.stringify(rawQuoted)?.slice(0, 400));
           if (rawQuoted) {
-            quotedText = (typeof rawQuoted.body === 'string' && rawQuoted.body.trim())
-              ? rawQuoted.body.trim().slice(0, 300)
-              : (typeof rawQuoted.caption === 'string' ? rawQuoted.caption.trim().slice(0, 300) : null);
+            quotedText = getMessageQuotePreview({
+              type: rawQuoted.type,
+              caption: rawQuoted.caption,
+              body: rawQuoted.body,
+              isMedia: rawQuoted.isMedia,
+              mimetype: rawQuoted.mimetype,
+            });
 
             // Quien cita puede ser cualquiera del grupo, y a quien cita (el autor original
             // del mensaje citado) también — no tiene por qué ser ni "yo" ni quien responde
@@ -1124,17 +1145,16 @@ export async function startWhatsappClient(processMessageFn) {
 
         if (messageId) {
           try {
-            const stickerMedia = await msg.downloadMedia();
+            const stickerMedia = await downloadMediaWithFallback(msg);
             if (stickerMedia && stickerMedia.data) {
               const buffer = Buffer.from(stickerMedia.data, 'base64');
               await processSticker(messageId, buffer, {
                 mediaKey: msg.mediaKey || `sticker_${msg.id?.id || Date.now()}`,
-                filename: 'sticker.png',
               });
               stmts.markMessageHasMedia.run(messageId);
             }
           } catch (stickerErr) {
-            console.error('[whatsapp] Error procesando sticker:', stickerErr.message);
+            console.error('[whatsapp] Error procesando sticker:', stickerErr?.stack || stickerErr?.message || stickerErr);
           }
         }
       } else {
@@ -1251,7 +1271,7 @@ export async function logoutWhatsapp() {
 
 async function downloadAndProcessMedia(msg) {
   try {
-    const media = await msg.downloadMedia();
+    const media = await downloadMediaWithFallback(msg);
     if (!media || !media.data) {
       console.log('[whatsapp] Media no disponible para msg:', msg.id);
       return null;
@@ -1278,8 +1298,91 @@ async function downloadAndProcessMedia(msg) {
       filePathThumb: saved.thumbRel,
     };
   } catch (err) {
-    console.error('[whatsapp] Error downloadAndProcessMedia:', err.message);
+    console.error('[whatsapp] Error downloadAndProcessMedia:', err?.stack || err?.message || err);
     return null;
+  }
+}
+
+async function downloadMediaWithFallback(msg) {
+  let primaryError = null;
+  const raw = msg.rawData || msg._data || {};
+  const expectedSize = Number(raw.size || msg.size);
+  const isCompleteMedia = (media) => {
+    if (!media?.data) return false;
+    return !Number.isFinite(expectedSize)
+      || expectedSize <= 0
+      || Buffer.byteLength(media.data, 'base64') >= expectedSize * 0.9;
+  };
+
+  try {
+    const media = await msg.downloadMedia();
+    if (isCompleteMedia(media)) return media;
+    if (media?.data && expectedSize > 0) {
+      primaryError = new Error(`descarga incompleta (${Buffer.byteLength(media.data, 'base64')}/${expectedSize} bytes)`);
+    }
+  } catch (err) {
+    primaryError = err;
+  }
+
+  const descriptor = {
+    directPath: raw.directPath,
+    encFilehash: raw.encFilehash,
+    filehash: raw.filehash,
+    mediaKey: raw.mediaKey || msg.mediaKey,
+    mediaKeyTimestamp: raw.mediaKeyTimestamp,
+    type: raw.type || msg.type,
+    mimetype: raw.mimetype || msg.mimetype,
+    filename: raw.filename || msg.filename,
+    filesize: expectedSize || undefined,
+  };
+
+  if (!descriptor.directPath || !descriptor.mediaKey) {
+    if (primaryError) throw primaryError;
+    console.warn(`[whatsapp] Descarga de media vacía y faltan datos para el respaldo directo (tipo ${msg.type}).`);
+    return null;
+  }
+  if (!client?.pupPage) {
+    throw new Error('No hay una página de WhatsApp activa para la descarga directa.');
+  }
+
+  try {
+    const media = await client.pupPage.evaluate(async (details) => {
+      const downloadQpl = {
+        addAnnotations() { return this; },
+        addPoint() { return this; },
+      };
+      const data = await window
+        .require('WAWebDownloadManager')
+        .downloadManager.downloadAndMaybeDecrypt({
+          directPath: details.directPath,
+          encFilehash: details.encFilehash,
+          filehash: details.filehash,
+          mediaKey: details.mediaKey,
+          mediaKeyTimestamp: details.mediaKeyTimestamp,
+          type: details.type,
+          signal: new AbortController().signal,
+          downloadQpl,
+        });
+      return {
+        data: await window.WWebJS.arrayBufferToBase64Async(data),
+        mimetype: details.mimetype,
+        filename: details.filename,
+        filesize: details.filesize,
+      };
+    }, descriptor);
+    if (!isCompleteMedia(media)) {
+      const actualSize = media?.data ? Buffer.byteLength(media.data, 'base64') : 0;
+      throw new Error(`La descarga directa devolvió un archivo incompleto (${actualSize}/${expectedSize || '?'} bytes).`);
+    }
+    if (primaryError) {
+      console.warn(`[whatsapp] msg.downloadMedia falló (${primaryError.message}); se recuperó con descarga directa.`);
+    }
+    return media;
+  } catch (fallbackError) {
+    const reason = primaryError
+      ? `msg.downloadMedia: ${primaryError.message}; descarga directa: ${fallbackError.message}`
+      : fallbackError.message;
+    throw new Error(`No se pudo descargar media (${msg.type}): ${reason}`, { cause: fallbackError });
   }
 }
 
@@ -1292,7 +1395,7 @@ function formatDuration(seconds) {
 
 async function downloadAndProcessOtherMedia(msg, mediaType) {
   try {
-    const media = await msg.downloadMedia();
+    const media = await downloadMediaWithFallback(msg);
     if (!media || !media.data) {
       console.log('[whatsapp] Media no disponible para msg:', msg.id);
       return null;
@@ -1319,7 +1422,7 @@ async function downloadAndProcessOtherMedia(msg, mediaType) {
       durationSec: msg.duration ? Math.round(Number(msg.duration)) : null,
     };
   } catch (err) {
-    console.error(`[whatsapp] Error downloadAndProcessOtherMedia (${mediaType}):`, err.message);
+    console.error(`[whatsapp] Error downloadAndProcessOtherMedia (${mediaType}):`, err?.stack || err?.message || err);
     return null;
   }
 }
@@ -1571,7 +1674,7 @@ async function fetchPollVotesFromWhatsapp(whatsappMsgId) {
   );
 
   return result.votes.map((v) => ({
-    voter: v.sender,
+    voter: getSerializedId(v.sender),
     interractedAtTs: v.senderTimestampMs,
     selectedOptions: v.selectedOptionLocalIds.map((localId) => ({ localId })),
   }));
@@ -1587,8 +1690,8 @@ export async function resolveMyVoterIds(myId) {
   try {
     if (typeof client?.getContactLidAndPhone === 'function') {
       const [result] = await client.getContactLidAndPhone([myId]);
-      const lid = typeof result?.lid === 'string' ? result.lid : result?.lid?._serialized;
-      const pn = typeof result?.pn === 'string' ? result.pn : result?.pn?._serialized;
+      const lid = getSerializedId(result?.lid);
+      const pn = getSerializedId(result?.pn);
       if (lid) ids.add(lid);
       if (pn) ids.add(pn);
     }
@@ -1632,7 +1735,10 @@ async function castPollVoteOnWhatsapp(whatsappMsgId, optionLocalId) {
       let chatAttachError = null;
       if (!msg.chat) {
         try {
-          const remote = msgId.split('_')[1];
+          const remoteId = msg.id?.remote;
+          const remote = typeof remoteId === 'string'
+            ? remoteId
+            : remoteId?._serialized || remoteId?.$1 || msgId.split('_')[1];
           if (remote) {
             const chatWid = window.require('WAWebWidFactory').createWid(remote);
             const chat =
@@ -1701,7 +1807,7 @@ export async function castPollVote(whatsappMsgId, messageId, optionLocalId, opti
     // bueno (y se persiste) si aparece confirmado desde WhatsApp. La escritura del voto en la
     // tabla interna de WhatsApp Web puede tardar un instante en aparecer tras que sendVote()
     // resuelve, así que se reintenta unas pocas veces antes de darlo por no confirmado.
-    const myId = client?.info?.wid?._serialized || null;
+    const myId = getSerializedId(client?.info?.wid);
     if (!myId) return { success: false, code: 'VOTE_NOT_CONFIRMED', error: 'WhatsApp no confirmó el voto' };
     const myIds = await resolveMyVoterIds(myId);
 
@@ -1710,7 +1816,9 @@ export async function castPollVote(whatsappMsgId, messageId, optionLocalId, opti
     for (let attempt = 0; attempt < 4 && !myVote; attempt++) {
       if (attempt > 0) await delay(400);
       lastVotes = await fetchPollVotesFromWhatsapp(whatsappMsgId);
-      const candidate = Array.isArray(lastVotes) ? lastVotes.find((v) => myIds.has(v.voter)) : null;
+        const candidate = Array.isArray(lastVotes)
+          ? lastVotes.find((v) => myIds.has(getSerializedId(v.voter)))
+          : null;
       const confirmed = candidate?.selectedOptions?.some((opt) => (opt?.localId ?? opt?.id) === optionLocalId);
       if (confirmed) myVote = candidate;
     }
@@ -1744,7 +1852,7 @@ export async function refreshPollVotesFromWhatsapp(whatsappMsgId, messageId) {
   try {
     const votes = await fetchPollVotesFromWhatsapp(whatsappMsgId);
     for (const vote of Array.isArray(votes) ? votes : []) {
-      const voterChatId = vote?.voter || null;
+      const voterChatId = getSerializedId(vote?.voter);
       if (!voterChatId) continue;
       const votedAtTs = Number.isFinite(vote.interractedAtTs)
         ? Math.floor(vote.interractedAtTs / 1000)

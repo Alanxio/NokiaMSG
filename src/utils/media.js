@@ -230,49 +230,84 @@ export function cleanupOrphanMediaFiles() {
 
 export async function convertStickerToPng(buffer) {
   const { default: sharp } = await import('sharp');
-  return sharp(buffer, { pages: 1 })
-    .png()
-    .toBuffer();
+  return sharp(buffer, { pages: 1 }).png().toBuffer();
 }
 
 export async function processSticker(messageId, buffer, options = {}) {
   const mediaKey = options.mediaKey || `sticker_${Date.now()}`;
-  const filename = options.filename || 'sticker.png';
-
-  const pngBuffer = await convertStickerToPng(buffer);
-
-  const image = await Jimp.read(pngBuffer);
-  const origWidth = image.bitmap.width;
-  const origHeight = image.bitmap.height;
-
-  // ---- Thumbnail only: 40px wide PNG ----
-  const thumbHeight = Math.max(1, Math.round(THUMB_WIDTH * origHeight / origWidth));
-  const thumbImage = image.clone().resize({ w: THUMB_WIDTH, h: thumbHeight });
-  const thumbBuffer = await thumbImage.getBuffer(JimpMime.png, {});
-
+  const { default: sharp } = await import('sharp');
+  const source = sharp(buffer, { animated: true });
+  const metadata = await source.metadata();
+  const isAnimated = (metadata.pages || 1) > 1;
+  const stats = metadata.hasAlpha && !isAnimated
+    ? await sharp(buffer).stats()
+    : null;
+  const hasTransparency = !isAnimated
+    && metadata.hasAlpha
+    && !stats.isOpaque;
+  const format = isAnimated ? 'gif' : hasTransparency ? 'png' : 'jpeg';
+  const mimeType = `image/${format}`;
+  const extension = format === 'jpeg' ? 'jpg' : format;
+  const filename = options.filename
+    ? options.filename.replace(/\.[^.]+$/, `.${extension}`)
+    : `sticker.${extension}`;
   const dir = ensureMediaDir();
   const safeKey = sanitizeMediaKey(mediaKey);
-  const thumbFile = `thumb_${safeKey}.png`;
+  const fullFile = `full_${safeKey}.${extension}`;
+  const viewFile = `view_${safeKey}.${extension}`;
+  const thumbFile = `thumb_${safeKey}.${extension}`;
+  const fullPath = join(dir, fullFile);
+  const viewPath = join(dir, viewFile);
   const thumbPath = join(dir, thumbFile);
+  const fullRel = `/media/${fullFile}`;
+  const viewRel = `/media/${viewFile}`;
   const thumbRel = `/media/${thumbFile}`;
 
+  const createVersion = async (width, height) => {
+    const image = sharp(buffer, isAnimated ? { animated: true } : {});
+    image.resize({ width, height, fit: 'inside', withoutEnlargement: true });
+    if (format === 'gif') {
+      image.gif({ loop: 0 });
+    } else if (format === 'png') {
+      image.png();
+    } else {
+      image.jpeg({ quality: JPEG_QUALITY });
+    }
+    return image.toBuffer();
+  };
+
+  const [fullBuffer, viewBuffer, thumbBuffer] = await Promise.all([
+    createVersion(FULL_MAX_WIDTH, FULL_MAX_HEIGHT),
+    createVersion(VIEW_MAX_WIDTH, VIEW_MAX_HEIGHT),
+    createVersion(THUMB_WIDTH, THUMB_WIDTH),
+  ]);
+
+  writeFileSync(fullPath, fullBuffer);
+  writeFileSync(viewPath, viewBuffer);
   writeFileSync(thumbPath, thumbBuffer);
 
   insertAttachment(messageId, {
     mediaKey: safeKey,
-    mimeType: 'image/png',
+    mimeType,
     filename,
     bufferLength: buffer.length,
-    filePathFull: null,
-    filePathView: null,
+    filePathFull: fullRel,
+    filePathView: viewRel,
     filePathThumb: thumbRel,
   });
 
   return {
     mediaKey: safeKey,
+    fullPath,
+    viewPath,
     thumbPath,
+    fullRel,
+    viewRel,
     thumbRel,
+    fullSize: fullBuffer.length,
+    viewSize: viewBuffer.length,
     thumbSize: thumbBuffer.length,
+    mimeType,
   };
 }
 
