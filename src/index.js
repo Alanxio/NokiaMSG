@@ -10,8 +10,10 @@ import { saveInteraction } from './controller/notification.controller.js';
 import { requireAuth } from './middlewares/auth.middleware.js';
 import { streamSignedAudio } from './controller/message.controller.js';
 import { cleanupOrphanMediaFiles, migrateAttachmentsToView } from './utils/media.js';
+import { loadPersistedSettings } from './utils/settings-env.js';
 
 dotenv.config();
+loadPersistedSettings();
 
 const PORT = Number.parseInt(process.env.PORT ?? '8080', 10);
 const app = express();

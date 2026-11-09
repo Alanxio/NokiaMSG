@@ -7,7 +7,7 @@ import { stmts } from '../../db/db.js';
 import { saveInteraction } from '../controller/notification.controller.js';
 import { marcarNovedad } from './polling.service.js';
 import { resolveMentions } from '../utils/mentions.js';
-import { saveImageVersions, processSticker, saveRawMediaFile } from '../utils/media.js';
+import { saveImageVersions, processSticker, saveRawMediaFile, getStickerKey, attachExistingSticker } from '../utils/media.js';
 import { resolvePendingGroupNames, resolveGroupNameFromWhatsapp } from '../controller/group.controller.js';
 import {
   rememberPendingOutgoingAck,
@@ -817,86 +817,143 @@ export async function startWhatsappClient(processMessageFn) {
   // Las llamadas de WhatsApp no se pueden "reenviar" a una llamada real (son audio/vídeo
   // en directo por WebRTC) — lo único posible es dejar constancia en el chat de que han
   // llamado, igual que ya se hace con los stickers.
+  // ── Llamadas entrantes ─────────────────────────────────────────────────────
+  // Dos vías, porque ninguna es 100% fiable por separado:
+  //  1. Evento 'call' de whatsapp-web.js (al sonar). OJO: call.from es un objeto Wid
+  //     (peerJid), no un string; antes se usaba tal cual, SQLite rechazaba el bind y
+  //     ninguna llamada llegó a registrarse nunca. En llamadas de grupo peerJid es quien
+  //     llama, no el grupo.
+  //  2. Mensaje 'call_log' que WhatsApp mete en el chat tras la llamada (antes se
+  //     descartaba por no tener texto).
+  // Si llegan las dos para la misma llamada, solo se registra/avisa la primera.
+  const recentCalls = new Map(); // clave de quien llama -> timestamp
+  const CALL_DEDUP_MS = 3 * 60_000;
+
+  async function registerIncomingCall({ callerId, groupId = null, isGroupCall = false, isVideo = false, callKey }) {
+    if (!callerId) return;
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
+    const pad = (n) => String(n).padStart(2, '0');
+    const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+    const timeStr = `${dateStr} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+
+    let phoneNumber = await resolveContactPhone(callerId);
+    if (!phoneNumber && /@(c\.us|s\.whatsapp\.net)$/.test(callerId)) {
+      const digits = callerId.split('@')[0].replace(/\D/g, '');
+      if (digits.length >= 8 && digits.length <= 15) phoneNumber = `+${digits}`;
+    }
+
+    // Misma persona por @lid y por @c.us: se deduplica por teléfono si se conoce.
+    const dedupKey = phoneNumber || callerId;
+    const lastSeen = recentCalls.get(dedupKey);
+    if (lastSeen && Date.now() - lastSeen < CALL_DEDUP_MS) {
+      console.log(`[whatsapp] 📞 Llamada de ${callerId} ya registrada hace ${Math.round((Date.now() - lastSeen) / 1000)}s (${callKey}) — omitida.`);
+      return;
+    }
+    recentCalls.set(dedupKey, Date.now());
+    for (const [key, ts] of recentCalls) if (Date.now() - ts > CALL_DEDUP_MS) recentCalls.delete(key);
+
+    const caller = await resolveDisplayNameForChatId(callerId);
+    const callerName = caller?.name || phoneNumber || 'Desconocido';
+    const kind = isVideo ? 'videollamada' : 'llamada';
+
+    let chatName;
+    if (groupId) {
+      chatName = stmts.getGroupById.get(groupId)?.group_name || null;
+      if (!chatName) {
+        try {
+          chatName = await resolveGroupNameFromWhatsapp(groupId);
+        } catch (err) {
+          console.warn(`[whatsapp] No se pudo resolver el nombre del grupo de llamada ${groupId}:`, err?.message || err);
+        }
+      }
+      chatName ||= 'Grupo de WhatsApp';
+    }
+
+    const message = groupId
+      ? `${callerName} ha hecho una ${kind} grupal`
+      : `${callerName} te ha llamado${isGroupCall ? ` (${kind} grupal)` : isVideo ? ' por videollamada' : ''}${phoneNumber && callerName !== phoneNumber ? ` (${phoneNumber})` : ''}`;
+
+    const fakeReq = {
+      body: {
+        title: groupId ? chatName : callerName,
+        message,
+        date: dateStr,
+        time: timeStr,
+        chat_id: groupId || callerId,
+        sender_chat_id: callerId,
+        whatsapp_msg_id: `call_${callKey}`,
+        from_me: 0,
+        chat_type: groupId ? 'group' : 'user',
+        is_group: groupId ? 1 : 0,
+        sender_name: callerName,
+        group_name: groupId ? chatName : null,
+        is_system: 1,
+        is_call: true,
+        is_video: Boolean(isVideo),
+        phone_number: phoneNumber,
+        call_caller_name: callerName,
+      },
+    };
+    const mockRes = {
+      statusCode: 200,
+      _json: null,
+      status(code) { this.statusCode = code; return this; },
+      json(data) { this._json = data; },
+    };
+
+    const messageId = await saveInteraction(
+      fakeReq,
+      mockRes,
+      (err) => {
+        if (err) console.error('[whatsapp] Error guardando notificación de llamada:', err.message || err);
+      },
+      null
+    );
+    if (messageId) {
+      console.log(`[whatsapp] 📞 ${kind} de ${callerName}${groupId ? ` en ${chatName}` : ''} registrada (${callKey})`);
+    }
+  }
+
   client.on('call', async (call) => {
     try {
-      if (call.fromMe || !call.from) return;
-
-      const isGroup = Boolean(call.isGroup);
-      const chatId = call.from;
-      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
-      const pad = (n) => String(n).padStart(2, '0');
-      const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-      const timeStr = `${dateStr} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-
-      let chatName;
-      let phoneNumber = null;
-      if (isGroup) {
-        const existingGroup = stmts.getGroupById.get(chatId);
-        chatName = existingGroup?.group_name || null;
-        if (!chatName) {
-          try {
-            chatName = await resolveGroupNameFromWhatsapp(chatId);
-          } catch (err) {
-            console.warn(`[whatsapp] No se pudo resolver el nombre del grupo de llamada ${chatId}:`, err?.message || err);
-          }
-        }
-        chatName ||= 'Grupo de WhatsApp';
-      } else {
-        phoneNumber = await resolveContactPhone(chatId);
-        const caller = await resolveDisplayNameForChatId(chatId);
-        chatName = caller.name;
-        if (!phoneNumber && /@(c\.us|s\.whatsapp\.net)$/.test(chatId)) {
-          const digits = chatId.split('@')[0].replace(/\D/g, '');
-          if (digits.length >= 8 && digits.length <= 15) phoneNumber = `+${digits}`;
-        }
+      if (call.fromMe) return;
+      const callerId = getSerializedId(call.from);
+      if (!callerId) {
+        console.warn('[whatsapp] Llamada entrante sin peerJid legible:', call?.id);
+        return;
       }
-
-      const message = isGroup
-        ? `Este grupo ha hecho una llamada grupal${call.isVideo ? ' de video' : ''}: ${chatName}`
-        : `Este usuario te ha llamado${call.isVideo ? ' por videollamada' : ''}: ${chatName}${phoneNumber ? ` (${phoneNumber})` : ''}`;
-
-      const fakeReq = {
-        body: {
-          title: chatName,
-          message,
-          date: dateStr,
-          time: timeStr,
-          chat_id: chatId,
-          sender_chat_id: isGroup ? null : chatId,
-          whatsapp_msg_id: `call_${isGroup ? 'group' : 'user'}_${call.id}`,
-          from_me: 0,
-          chat_type: isGroup ? 'group' : 'user',
-          is_group: isGroup ? 1 : 0,
-          sender_name: isGroup ? null : chatName,
-          group_name: isGroup ? chatName : null,
-          is_system: 1,
-          is_call: true,
-          is_video: Boolean(call.isVideo),
-          phone_number: phoneNumber,
-        },
-      };
-      const mockRes = {
-        statusCode: 200,
-        _json: null,
-        status(code) { this.statusCode = code; return this; },
-        json(data) { this._json = data; },
-      };
-
-      const messageId = await saveInteraction(
-        fakeReq,
-        mockRes,
-        (err) => {
-          if (err) console.error('[whatsapp] Error guardando notificación de llamada:', err.message || err);
-        },
-        null
-      );
-      if (messageId) {
-        console.log(`[whatsapp] 📞 Llamada${isGroup ? ' grupal' : ''}${call.isVideo ? ' de video' : ''} registrada en ${chatId}`);
-      }
+      await registerIncomingCall({
+        callerId,
+        isGroupCall: Boolean(call.isGroup),
+        isVideo: Boolean(call.isVideo),
+        callKey: `evt_${call.id}`,
+      });
     } catch (err) {
-      console.error('[whatsapp] Error registrando llamada:', err.message);
+      console.error('[whatsapp] Error registrando llamada:', err?.stack || err?.message || err);
     }
   });
+
+  async function handleCallLogMessage(msg, whatsappMsgId) {
+    try {
+      if (msg.fromMe) return;
+      const age = Math.floor(Date.now() / 1000) - Number(msg.timestamp || 0);
+      if (age > 300) {
+        console.log(`[whatsapp] 📞 call_log antiguo omitido (edad ${age}s) de ${msg.from}`);
+        return;
+      }
+      const chatId = getSerializedId(msg.from);
+      const isGroupChat = Boolean(chatId?.endsWith('@g.us'));
+      const callerId = isGroupChat ? getSerializedId(msg.author) : chatId;
+      await registerIncomingCall({
+        callerId,
+        groupId: isGroupChat ? chatId : null,
+        isVideo: Boolean(msg._data?.isVideoCall),
+        callKey: `log_${whatsappMsgId || `${chatId}_${msg.timestamp}`}`,
+      });
+    } catch (err) {
+      console.error('[whatsapp] Error registrando call_log:', err?.stack || err?.message || err);
+    }
+  }
 
   // Cambios de grupo (entra/sale/admin/nombre/foto) — mismo patrón que las llamadas: un
   // mensaje sintético dentro del propio chat de grupo vía saveInteraction, marcado
@@ -1085,6 +1142,13 @@ export async function startWhatsappClient(processMessageFn) {
     const logSaveInteractionError = (err) => {
       if (err) console.error('[whatsapp] Error en saveInteraction:', err.message || err);
     };
+
+    // Registro de llamada que WhatsApp mete en el chat: se trata como llamada, no como
+    // mensaje (si no, se descartaba por no tener texto).
+    if (msg.type === 'call_log') {
+      await handleCallLogMessage(msg, whatsappMsgId);
+      return;
+    }
 
     if (msg.fromMe) {
       // La fila ya la insertó validateAndCreateChat (message.controller.js) al enviar, pero
@@ -1387,13 +1451,25 @@ export async function startWhatsappClient(processMessageFn) {
 
         if (messageId) {
           try {
-            const stickerMedia = await downloadMediaWithFallback(msg);
-            if (stickerMedia && stickerMedia.data) {
-              const buffer = Buffer.from(stickerMedia.data, 'base64');
-              await processSticker(messageId, buffer, {
-                mediaKey: msg.mediaKey || `sticker_${msg.id?.id || Date.now()}`,
-              });
+            // Mismo sticker ya guardado: se enlaza a sus archivos sin descargar ni convertir.
+            const knownKey = getStickerKey({ filehash: msg._data?.filehash || msg.rawData?.filehash });
+            if (knownKey && attachExistingSticker(messageId, knownKey)) {
               stmts.markMessageHasMedia.run(messageId);
+              console.log(`[whatsapp] Sticker reutilizado (${knownKey}) para el mensaje ${messageId}`);
+            } else {
+              const stickerMedia = await downloadMediaWithFallback(msg);
+              if (stickerMedia && stickerMedia.data) {
+                const buffer = Buffer.from(stickerMedia.data, 'base64');
+                const stickerKey = getStickerKey({ buffer });
+                if (stickerKey && attachExistingSticker(messageId, stickerKey)) {
+                  console.log(`[whatsapp] Sticker reutilizado (${stickerKey}) para el mensaje ${messageId}`);
+                } else {
+                  await processSticker(messageId, buffer, {
+                    mediaKey: stickerKey || msg.mediaKey || `sticker_${msg.id?.id || Date.now()}`,
+                  });
+                }
+                stmts.markMessageHasMedia.run(messageId);
+              }
             }
           } catch (stickerErr) {
             console.error('[whatsapp] Error procesando sticker:', stickerErr?.stack || stickerErr?.message || stickerErr);

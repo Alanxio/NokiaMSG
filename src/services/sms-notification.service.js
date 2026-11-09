@@ -108,10 +108,8 @@ export async function sendCallSmsNotification(payload) {
     return { status: status.status, missing: status.missing };
   }
 
-  const name = normalizeAsciiText(
-    payload.name,
-    payload.type === 'group' ? 'Grupo de WhatsApp' : 'Desconocido'
-  );
+  const name = normalizeAsciiText(payload.callerName || payload.name, 'Desconocido');
+  const groupName = normalizeAsciiText(payload.groupName, 'un grupo');
   const phoneDigits = typeof payload.phoneNumber === 'string'
     ? payload.phoneNumber.replace(/\D/g, '')
     : '';
@@ -124,8 +122,8 @@ export async function sendCallSmsNotification(payload) {
   const videoText = payload.isVideo ? ' por videollamada' : '';
 
   const smsText = payload.type === 'group'
-    ? `Este grupo ha hecho una llamada grupal${payload.isVideo ? ' de video' : ''}: ${name}`
-    : `Este usuario te ha llamado${videoText}: ${name}${phoneSuffix}`;
+    ? `${name}${phoneSuffix} ha hecho una llamada grupal${payload.isVideo ? ' de video' : ''} en ${groupName}`
+    : `Te ha llamado${videoText}: ${name}${phoneSuffix}`;
 
   return sendRawSms(config, smsText);
 }

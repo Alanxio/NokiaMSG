@@ -121,16 +121,25 @@ export function safeUnlink(filePath) {
   }
 }
 
+// Borra los archivos de adjuntos YA eliminados de la BD, salvo los que otro adjunto siga
+// usando (los stickers repetidos comparten archivos). Llamar después del DELETE.
+export function releaseAttachmentFiles(attachments) {
+  const seen = new Set();
+  for (const a of attachments) {
+    for (const rel of [a.file_path_thumb, a.file_path_full, a.file_path_view]) {
+      if (!rel || seen.has(rel)) continue;
+      seen.add(rel);
+      if (stmts.isMediaPathReferenced.get({ path: rel })) continue;
+      safeUnlink(resolveMediaFsPath(rel));
+    }
+  }
+}
+
 function cleanupMedia(attachments) {
   if (attachments.length === 0) return;
 
   console.log(`[cleanup] Limpiando ${attachments.length} adjuntos antiguos...`);
-
-  for (const a of attachments) {
-    safeUnlink(resolveMediaFsPath(a.file_path_thumb));
-    safeUnlink(resolveMediaFsPath(a.file_path_full));
-    safeUnlink(resolveMediaFsPath(a.file_path_view));
-  }
+  releaseAttachmentFiles(attachments);
 }
 
 function cleanupPuppeteerCache() {

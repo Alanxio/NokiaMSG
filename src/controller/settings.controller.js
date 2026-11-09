@@ -1,9 +1,9 @@
 import fs from 'fs';
-import path from 'path';
 import { sendPage } from './page.controller.js';
 import { startDailyCleanup, stopDailyCleanup } from '../services/cleanup.service.js';
+import { SETTINGS_ENV_PATH } from '../utils/settings-env.js';
 
-const envPath = process.env.ENV_FILE_PATH || path.resolve(process.cwd(), '.env');
+const envPath = SETTINGS_ENV_PATH;
 const CLEANUP_RETENTION_OPTIONS = [
   { value: '1', label: '1 dia' },
   { value: '3', label: '3 dias' },

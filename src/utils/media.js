@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { Jimp, JimpMime } from 'jimp';
 import db, { stmts } from '../../db/db.js';
 
@@ -342,6 +343,42 @@ export function cleanupOrphanMediaFiles() {
 export async function convertStickerToPng(buffer) {
   const { default: sharp } = await import('sharp');
   return sharp(buffer, { pages: 1 }).png().toBuffer();
+}
+
+// Clave de un sticker por su contenido: el mismo sticker (aunque llegue de otra
+// persona o reenviado) da siempre la misma clave, y se reutilizan sus archivos.
+// WhatsApp ya trae `filehash` = SHA-256 (base64) del archivo descifrado, que es
+// exactamente lo que daría hashear el buffer descargado.
+export function getStickerKey({ filehash = null, buffer = null } = {}) {
+  let hex = null;
+  if (typeof filehash === 'string' && filehash) {
+    try { hex = Buffer.from(filehash, 'base64').toString('hex'); } catch { hex = null; }
+  }
+  if (!hex && buffer) hex = createHash('sha256').update(buffer).digest('hex');
+  return hex && hex.length >= 32 ? `stk_${hex.slice(0, 40)}` : null;
+}
+
+// Si ese sticker ya está procesado y sus archivos siguen en disco, enlaza el mensaje a
+// ellos sin descargar ni convertir nada. Devuelve true si lo ha reutilizado.
+export function attachExistingSticker(messageId, stickerKey) {
+  if (!messageId || !stickerKey) return false;
+  const existing = stmts.getAttachmentByMediaKey.get(stickerKey);
+  if (!existing) return false;
+  const dir = getMediaDir();
+  const allFilesPresent = [existing.file_path_full, existing.file_path_view, existing.file_path_thumb]
+    .every((rel) => rel && existsSync(join(dir, rel.split('/').pop())));
+  if (!allFilesPresent) return false;
+
+  insertAttachment(messageId, {
+    mediaKey: existing.media_key,
+    mimeType: existing.mime_type,
+    filename: existing.file_name,
+    bufferLength: existing.file_size,
+    filePathFull: existing.file_path_full,
+    filePathView: existing.file_path_view,
+    filePathThumb: existing.file_path_thumb,
+  });
+  return true;
 }
 
 export async function processSticker(messageId, buffer, options = {}) {

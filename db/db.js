@@ -239,6 +239,10 @@ export const stmts = {
     UPDATE users SET sms_notified = 1 WHERE chat_id = ?
   `),
 
+  clearUserSmsNotified: db.prepare(`
+    UPDATE users SET sms_notified = 0 WHERE chat_id = ?
+  `),
+
   countMessagesByUserChatId: db.prepare(`
     SELECT COUNT(*) AS total FROM messages WHERE user_chat_id = ?
   `),
@@ -295,6 +299,10 @@ export const stmts = {
 
   setGroupSmsNotified: db.prepare(`
     UPDATE wgroups SET sms_notified = 1 WHERE group_id = ?
+  `),
+
+  clearGroupSmsNotified: db.prepare(`
+    UPDATE wgroups SET sms_notified = 0 WHERE group_id = ?
   `),
 
   getAttachmentsByGroupId: db.prepare(`
@@ -538,6 +546,20 @@ export const stmts = {
     OR group_id NOT IN (
       SELECT DISTINCT group_id FROM messages WHERE group_id IS NOT NULL
     )
+  `),
+
+  // Stickers deduplicados: varios adjuntos comparten los mismos archivos (media_key
+  // = hash del contenido), así que antes de borrar un archivo hay que ver si alguien
+  // más lo sigue usando.
+  getAttachmentByMediaKey: db.prepare(`
+    SELECT media_key, mime_type, file_name, file_size, file_path_full, file_path_view, file_path_thumb
+    FROM attachments WHERE media_key = ? ORDER BY id DESC LIMIT 1
+  `),
+
+  isMediaPathReferenced: db.prepare(`
+    SELECT 1 FROM attachments
+    WHERE file_path_full = @path OR file_path_view = @path OR file_path_thumb = @path
+    LIMIT 1
   `),
 
   insertAttachment: db.prepare(`

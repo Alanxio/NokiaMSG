@@ -10,7 +10,100 @@ import {
 import { isNumericOrJid } from './page.controller.js';
 import { getLastActivityAt } from '../middlewares/auth.middleware.js';
 
-const SMS_SKIP_IF_ACTIVE_WITHIN_MS = 30_000;
+// Si el Nokia ha cargado una página hace menos de esto, el SMS se aplaza (estás en la web).
+function getActiveWindowMs() {
+  const seconds = Number.parseInt(process.env.SMS_ACTIVE_WINDOW_SECONDS || '15', 10);
+  return (Number.isFinite(seconds) && seconds >= 0 ? seconds : 15) * 1000;
+}
+const SMS_RETRY_DELAY_MS = 5_000;
+// Un aviso aplazado se sigue reintentando mientras sigas en la web, hasta este límite.
+const SMS_DEFERRED_MAX_MS = 10 * 60_000;
+
+function readChatSmsState(isGroup, chatId) {
+  const row = isGroup ? stmts.getGroupById.get(chatId) : stmts.getUserByChatId.get(chatId);
+  return {
+    unseen: Number(row?.unseen_count) || 0,
+    muted: Number(row?.sms_muted) === 1,
+    notified: Number(row?.sms_notified) === 1,
+  };
+}
+
+function markSmsNotified(isGroup, chatId, value) {
+  if (isGroup) (value ? stmts.setGroupSmsNotified : stmts.clearGroupSmsNotified).run(chatId);
+  else (value ? stmts.setUserSmsNotified : stmts.clearUserSmsNotified).run(chatId);
+}
+
+// Envía el SMS de la racha con un reintento. Si Twilio falla dos veces se quita la marca
+// «ya avisado»: si no, ese chat no volvería a avisar hasta que se leyera.
+async function deliverChatSms(isGroup, chatId, payload) {
+  markSmsNotified(isGroup, chatId, true);
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const result = await sendSmsNotification(payload);
+    if (result?.status === 'sent') return;
+    if (result?.status !== 'failed') {
+      // Desactivado o mal configurado: no es un fallo puntual, no reintentar.
+      markSmsNotified(isGroup, chatId, false);
+      console.log(`[SMS] No enviado (${result?.status}${result?.missing?.length ? `, falta ${result.missing.join(', ')}` : ''})`);
+      return;
+    }
+    if (attempt === 1) {
+      console.warn(`[SMS] Fallo enviando aviso de ${chatId}, reintento en ${SMS_RETRY_DELAY_MS / 1000}s`);
+      await new Promise((resolve) => setTimeout(resolve, SMS_RETRY_DELAY_MS));
+    }
+  }
+  markSmsNotified(isGroup, chatId, false);
+  console.error(`[SMS] Aviso de ${chatId} no enviado tras 2 intentos; el próximo mensaje lo volverá a intentar.`);
+}
+
+async function deliverCallSms(payload) {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const result = await sendCallSmsNotification(payload);
+    if (result?.status === 'sent') return;
+    if (result?.status !== 'failed') {
+      console.log(`[SMS] Aviso de llamada no enviado (${result?.status}${result?.missing?.length ? `, falta ${result.missing.join(', ')}` : ''})`);
+      return;
+    }
+    if (attempt === 1) {
+      console.warn(`[SMS] Fallo enviando aviso de llamada, reintento en ${SMS_RETRY_DELAY_MS / 1000}s`);
+      await new Promise((resolve) => setTimeout(resolve, SMS_RETRY_DELAY_MS));
+    }
+  }
+  console.error('[SMS] Aviso de llamada no enviado tras 2 intentos.');
+}
+
+// Avisos omitidos por estar activo en la web: se revisan al acabar la ventana para que
+// un mensaje que llega justo al dejar el Nokia no se quede sin SMS.
+const deferredSmsChecks = new Map();
+
+function scheduleDeferredSms(isGroup, chatId, payload, startedAt = Date.now()) {
+  if (deferredSmsChecks.has(chatId)) return;
+  const waitMs = Math.max(1_000, getActiveWindowMs() - (Date.now() - getLastActivityAt()) + 1_000);
+  const timer = setTimeout(() => {
+    deferredSmsChecks.delete(chatId);
+    try {
+      const state = readChatSmsState(isGroup, chatId);
+      if (state.unseen === 0 || state.notified || state.muted) {
+        console.log(`[SMS] Aviso aplazado de ${chatId} descartado (${state.unseen === 0 ? 'ya leído' : state.notified ? 'ya notificado' : 'silenciado'})`);
+        return;
+      }
+      if (Date.now() - getLastActivityAt() < getActiveWindowMs()) {
+        if (Date.now() - startedAt < SMS_DEFERRED_MAX_MS) {
+          scheduleDeferredSms(isGroup, chatId, payload, startedAt);
+        } else {
+          console.log(`[SMS] Aviso aplazado de ${chatId} descartado (sigues en la web desde hace 10 min)`);
+        }
+        return;
+      }
+      console.log(`[SMS] Enviando aviso aplazado de ${chatId} (${state.unseen} sin leer)`);
+      deliverChatSms(isGroup, chatId, payload)
+        .catch((err) => console.error('[SMS] Fallo al lanzar aviso aplazado:', err));
+    } catch (err) {
+      console.error('[SMS] Error revisando aviso aplazado:', err);
+    }
+  }, waitMs);
+  timer.unref?.();
+  deferredSmsChecks.set(chatId, timer);
+}
 
 function normalizeGroupName(rawName) {
   if (typeof rawName !== 'string' || !rawName.trim()) {
@@ -354,33 +447,29 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
 
       db.exec('COMMIT');
 
-      if (isCall) {
-        if (isSmsMuted) {
-          console.log(`[SMS] Aviso de llamada omitido (chat silenciado, ${isGroup ? finalGroupId : finalUserChatId})`);
-        } else {
-          const callName = isGroup
-            ? (stmts.getGroupById.get(finalGroupId)?.group_name || nameOrGroupName)
-            : username;
-          sendCallSmsNotification({
-            type: isGroup ? 'group' : 'user',
-            name: callName,
-            phoneNumber: payload.phone_number,
-            isVideo: payload.is_video === true || payload.is_video === 1 || payload.is_video === 'true',
-          }).catch(err => console.error('[SMS] Fallo al lanzar aviso de llamada:', err));
-        }
+      if (isCall && isSmsMuted) {
+        console.log(`[SMS] Aviso de llamada omitido (chat silenciado, ${isGroup ? finalGroupId : finalUserChatId})`);
+      } else if (isCall) {
+        // Las llamadas tienen prioridad: SMS siempre que el chat no esté silenciado, sin
+        // mirar mensajes sin leer, si ya se avisó de la racha ni si estás en la web.
+        const callPayload = {
+          type: isGroup ? 'group' : 'user',
+          callerName: (typeof payload.call_caller_name === 'string' && payload.call_caller_name.trim()) || username,
+          groupName: isGroup ? (stmts.getGroupById.get(finalGroupId)?.group_name || nameOrGroupName) : null,
+          phoneNumber: payload.phone_number,
+          isVideo: payload.is_video === true || payload.is_video === 1 || payload.is_video === 'true',
+        };
+        console.log(`[SMS] Aviso de llamada de ${callPayload.callerName}`);
+        deliverCallSms(callPayload)
+          .catch(err => console.error('[SMS] Fallo al lanzar aviso de llamada:', err));
       } else {
         // Los mensajes normales respetan la racha de no leídos, el silencio del chat y la
         // actividad reciente en la web. Las llamadas solo omiten esos límites, no el silencio.
         const msSinceActivity = Date.now() - getLastActivityAt();
-        const isActiveOnWeb = msSinceActivity < SMS_SKIP_IF_ACTIVE_WITHIN_MS;
+        const isActiveOnWeb = msSinceActivity < getActiveWindowMs();
+        const smsChatId = isGroup ? finalGroupId : finalUserChatId;
 
-        if (!fromMe && !alreadyNotified && !isSmsMuted && !isActiveOnWeb) {
-          console.log(`[SMS] Disparando notificación (previousUnseen=${previousUnseen}, muted=${isSmsMuted})`);
-          // Marcar ANTES de lanzar el envío (que es async) para no dejar ventana en la que
-          // dos mensajes casi simultáneos disparen dos SMS para la misma racha.
-          if (isGroup) stmts.setGroupSmsNotified.run(finalGroupId);
-          else stmts.setUserSmsNotified.run(finalUserChatId);
-
+        if (!fromMe && !alreadyNotified && !isSmsMuted) {
           // Para el nombre de grupo del SMS, usar el que ya está guardado en wgroups (el
           // dato fiable, protegido por la lógica de "shouldUpdate" de más arriba) en vez
           // de nameOrGroupName, que viene directo de la ingesta y puede ser un ID en
@@ -388,14 +477,24 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
           const smsGroupName = isGroup
             ? (stmts.getGroupById.get(finalGroupId)?.group_name || nameOrGroupName)
             : nameOrGroupName;
-          sendSmsNotification({
+          const smsPayload = {
             type: isGroup ? 'group' : 'user',
             groupName: smsGroupName,
             username: username,
-            chatId: isGroup ? finalGroupId : finalUserChatId
-          }).catch(err => console.error('[SMS] Fallo al lanzar notificación:', err));
+            chatId: smsChatId,
+          };
+          if (isActiveOnWeb) {
+            console.log(`[SMS] Aplazado (activo en la web hace ${Math.round(msSinceActivity / 1000)}s), se revisará al acabar la ventana`);
+            scheduleDeferredSms(isGroup, smsChatId, smsPayload);
+          } else {
+            console.log(`[SMS] Disparando notificación (previousUnseen=${previousUnseen})`);
+            // deliverChatSms marca «ya avisado» de forma síncrona antes del primer await,
+            // así dos mensajes casi simultáneos no disparan dos SMS para la misma racha.
+            deliverChatSms(isGroup, smsChatId, smsPayload)
+              .catch(err => console.error('[SMS] Fallo al lanzar notificación:', err));
+          }
         } else if (!fromMe) {
-          const motivo = alreadyNotified ? 'ya notificado' : isSmsMuted ? 'silenciado' : isActiveOnWeb ? 'activo en la web' : 'desconocido';
+          const motivo = alreadyNotified ? 'ya notificado' : isSmsMuted ? 'silenciado' : 'desconocido';
           console.log(`[SMS] Omitido (motivo=${motivo}, previousUnseen=${previousUnseen})`);
         }
       }

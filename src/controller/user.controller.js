@@ -1,7 +1,9 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { getUsersPresence, sendWhatsappSeen, resolveContactPhone, getContactProfileInfo, getProfilePicUrlFresh, syncChatUnreadCountFromWhatsapp } from '../services/whatsapp.service.js';
-import { resolveMediaFsPath, safeUnlink } from '../services/cleanup.service.js';
+import { client, getUsersPresence, sendWhatsappSeen, resolveContactPhone, getContactProfileInfo, syncChatUnreadCountFromWhatsapp } from '../services/whatsapp.service.js';
+import { getContactDisplayName } from '../utils/contact-display-name.js';
+import { getAvatarUrl, renderAvatarImg } from '../services/avatar.service.js';
+import { releaseAttachmentFiles } from '../services/cleanup.service.js';
 import {
   DIRECTORY_PAGE_SIZE,
   MESSAGE_PAGE_SIZE,
@@ -181,8 +183,9 @@ export async function showUserMessages(req, res, next) {
     const iconTag = (file, alt) =>
       `<img src="/assets/groups_icons/${file}" alt="${escapeXml(alt)}" height="24" width="24" style="vertical-align:middle;"/>`;
 
+    const avatarHtml = renderAvatarImg(await getAvatarUrl(user.chat_id, 'mini'), 'mini');
     const body =
-      `<h1>${escapeXml(user.username)}${onlineTag}</h1>` +
+      `<h1>${avatarHtml ? `${avatarHtml} ` : ''}${escapeXml(user.username)}${onlineTag}</h1>` +
       phoneHtml +
       '<p><a href="/">Inicio</a> | <a href="/usuario">Usuarios</a></p>' +
       `<p><a href="/mensaje/componer?to=${encodeURIComponent(user.chat_id)}&type=user">${iconTag('Writing_Lightgreen.png', 'Enviar mensaje')}</a> ` +
@@ -207,15 +210,36 @@ export async function showUserDetails(req, res, next) {
       return;
     }
 
-    const user = stmts.getUserByChatId.get(chatId);
-    if (!user) {
-      sendMissingEntity(req, res, 'Usuario');
-      return;
+    // Vista temporal: contacto que aún no está en el Nokia (p. ej. desde el buscador, para
+    // distinguir a dos «Oscar»). Se consulta a WhatsApp y NO se guarda nada en la BD.
+    let user = stmts.getUserByChatId.get(chatId);
+    const isPreview = !user;
+    if (isPreview) {
+      const isUserJid = /^[0-9]{6,20}@(c\.us|lid|s\.whatsapp\.net)$/.test(chatId);
+      let contact = null;
+      if (isUserJid && client) {
+        try {
+          contact = await client.getContactById(chatId);
+        } catch (err) {
+          console.warn(`[detalles] No se pudo consultar ${chatId}:`, err?.message || err);
+        }
+      }
+      if (!contact) {
+        sendMissingEntity(req, res, 'Usuario');
+        return;
+      }
+      user = {
+        chat_id: chatId,
+        username: getContactDisplayName(contact)?.name || `+${chatId.split('@')[0]}`,
+        sms_muted: 0,
+      };
     }
+    const searchQuery = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 50) : '';
 
-    const [profileInfo, presenceMap] = await Promise.all([
+    const [profileInfo, presenceMap, bigAvatarUrl] = await Promise.all([
       getContactProfileInfo(user.chat_id),
       getUsersPresence([user.chat_id]),
+      getAvatarUrl(user.chat_id, 'big'),
     ]);
     const presence = presenceMap.get(user.chat_id);
 
@@ -223,75 +247,81 @@ export async function showUserDetails(req, res, next) {
     if (!phone) {
       phone = formatPhoneNumber(user.chat_id, user.username);
     }
-    const phoneHtml = phone ? `<p>${renderPhoneLink(phone)}</p>` : '';
+    const encodedId = encodeURIComponent(user.chat_id);
 
-    const photoHtml = profileInfo.hasPhoto
-      ? `<p><img src="/usuario/${encodeURIComponent(user.chat_id)}/foto" width="100" alt="Foto de perfil"/></p>`
-      : '<p>Sin foto de perfil.</p>';
-
-    let estadoText;
+    // Estado: «En línea» en verde; si no, la última conexión en corto («hoy 17:45»,
+    // «ayer 09:10», «03/11 21:00») para que quepa en una línea del 6111.
+    let presenceHtml;
     if (presence?.isOnline) {
-      estadoText = 'En línea ahora';
+      presenceHtml = '<font color="#008800">&#9679; En línea</font>';
     } else if (presence?.lastSeen) {
-      const lastSeenDate = new Date(presence.lastSeen * 1000);
-      estadoText = `Última conexión: ${lastSeenDate.toLocaleDateString('es-ES')} ${lastSeenDate.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}`;
+      const seen = new Date(presence.lastSeen * 1000);
+      const fmt = (opts) => new Intl.DateTimeFormat('es-ES', { timeZone: 'Europe/Madrid', ...opts }).format(seen);
+      const dayKey = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid' }).format(d);
+      const today = new Date();
+      const yesterday = new Date(today.getTime() - 86_400_000);
+      const day = dayKey(seen) === dayKey(today) ? 'hoy'
+        : dayKey(seen) === dayKey(yesterday) ? 'ayer'
+          : fmt({ day: '2-digit', month: '2-digit' });
+      presenceHtml = `<font color="#666666">Últ. vez ${day} ${fmt({ hour: '2-digit', minute: '2-digit' })}</font>`;
     } else {
-      estadoText = 'Última conexión desconocida';
+      presenceHtml = '<font color="#666666">Últ. vez desconocida</font>';
     }
 
-    const isMuted = Number(user.sms_muted) === 1;
-    const aboutHtml = profileInfo.about ? `<p>Acerca de: ${escapeXml(profileInfo.about)}</p>` : '';
+    const headerHtml =
+      '<p align="center">' +
+      (bigAvatarUrl
+        ? `${renderAvatarImg(bigAvatarUrl, 'big', 'Foto de perfil')}<br/>`
+        : '<font size="1" color="#888888">(sin foto)</font><br/>') +
+      `<b>${escapeXml(user.username)}</b>` +
+      (phone ? `<br/>${renderPhoneLink(phone)}` : '') +
+      `<br/><font size="1">${presenceHtml}</font>` +
+      '</p>';
 
-    const commonGroupNames = profileInfo.commonGroupIds
+    const aboutHtml = profileInfo.about
+      ? `<p><b>Info:</b><br/><i>${escapeXml(profileInfo.about)}</i></p>`
+      : '';
+
+    const isMuted = Number(user.sms_muted) === 1;
+    const smsHtml = isPreview ? '' :
+      `<p><b>Avisos SMS:</b> ${isMuted ? '<font color="#cc0000">silenciados</font>' : '<font color="#008800">activos</font>'}` +
+      `<br/><a href="/usuario/${encodedId}/silenciar?volver=detalles">[${isMuted ? 'Activar' : 'Silenciar'}]</a></p>`;
+
+    const commonGroups = profileInfo.commonGroupIds
       .map((gid) => {
         const g = stmts.getGroupById.get(gid);
         return g ? `<a href="/grupo/${encodeURIComponent(gid)}">${escapeXml(g.group_name)}</a>` : null;
       })
       .filter(Boolean);
-    const commonGroupsHtml = commonGroupNames.length
-      ? `<ul>${commonGroupNames.map((n) => `<li>${n}</li>`).join('')}</ul>`
-      : '<p>Ninguno en común.</p>';
+    const commonGroupsHtml = commonGroups.length
+      ? `<p><b>Grupos en común (${commonGroups.length}):</b><br/>${commonGroups.map((n) => `- ${n}`).join('<br/>')}</p>`
+      : '<p><b>Grupos en común:</b> ninguno</p>';
+
+    const backToSearch = searchQuery
+      ? `<a href="/mensaje/componer?q=${encodeURIComponent(searchQuery)}">Volver a la búsqueda</a>`
+      : '<a href="/mensaje/componer">Buscar</a>';
+    const navHtml = isPreview
+      ? `<p><font size="1"><a href="/">Inicio</a> | ${backToSearch}</font></p>`
+      : '<p><font size="1"><a href="/">Inicio</a> | <a href="/usuario">Usuarios</a> | ' +
+        `<a href="/usuario/${encodedId}">Chat</a></font></p>`;
+    const previewNoteHtml = isPreview
+      ? '<p align="center"><font size="1" color="#cc6600">Aún no está en tus contactos del Nokia</font></p>'
+      : '';
 
     const body =
-      `<h1>${escapeXml(user.username)} - Detalles</h1>` +
-      '<p><a href="/">Inicio</a> | <a href="/usuario">Usuarios</a> | ' +
-      `<a href="/usuario/${encodeURIComponent(user.chat_id)}">Mensajes</a></p>` +
-      photoHtml +
-      phoneHtml +
-      `<p>${escapeXml(estadoText)}</p>` +
-      `<p>Silenciado: ${isMuted ? 'Sí' : 'No'}</p>` +
+      navHtml +
+      headerHtml +
+      previewNoteHtml +
+      '<hr/>' +
       aboutHtml +
-      '<p>Grupos en común:</p>' +
-      commonGroupsHtml;
+      smsHtml +
+      commonGroupsHtml +
+      '<hr/>' +
+      `<p align="center"><a href="/mensaje/componer?to=${encodedId}&amp;type=user">Escribir mensaje</a></p>`;
 
     sendPage(req, res, 200, `${user.username} - Detalles`, body);
   } catch (error) {
     next(error);
-  }
-}
-
-export async function showUserAvatar(req, res) {
-  try {
-    const chatId = req.params.id;
-    const url = await getProfilePicUrlFresh(chatId);
-    if (!url) {
-      res.status(404).end();
-      return;
-    }
-
-    const response = await fetch(url);
-    if (!response.ok) {
-      res.status(404).end();
-      return;
-    }
-
-    const contentType = response.headers.get('content-type') || 'image/jpeg';
-    const buffer = Buffer.from(await response.arrayBuffer());
-    res.set('Content-Type', contentType);
-    res.set('Cache-Control', 'no-store');
-    res.send(buffer);
-  } catch {
-    res.status(404).end();
   }
 }
 
@@ -307,7 +337,9 @@ export async function toggleUserMute(req, res, next) {
     const newState = Number(user.sms_muted) === 1 ? 0 : 1;
     stmts.setUserSmsMuted.run(newState, chatId);
 
-    const backUrl = `/usuario/${encodeURIComponent(chatId)}`;
+    const backUrl = req.query.volver === 'detalles'
+      ? `/usuario/${encodeURIComponent(chatId)}/detalles`
+      : `/usuario/${encodeURIComponent(chatId)}`;
     const body = `<p><a href="${backUrl}">Volver</a></p>`;
     sendPage(req, res, 200, 'Nokia', body, `<meta http-equiv="refresh" content="0;url=${backUrl}"/>`);
   } catch (error) {
@@ -367,11 +399,7 @@ export async function deleteUser(req, res, next) {
       throw error;
     }
 
-    attachments.forEach((a) => {
-      safeUnlink(resolveMediaFsPath(a.file_path_thumb));
-      safeUnlink(resolveMediaFsPath(a.file_path_full));
-      safeUnlink(resolveMediaFsPath(a.file_path_view));
-    });
+    releaseAttachmentFiles(attachments);
 
     const body =
       '<h1>Nokia</h1>' +

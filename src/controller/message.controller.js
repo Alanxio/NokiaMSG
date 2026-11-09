@@ -349,7 +349,10 @@ export async function renderComposePage(req, res, next) {
         filteredContacts.slice(0, 5).forEach(contact => {
           const iconHtml = contact.isExistingContact ? `${EXISTING_CONTACT_ICON_HTML} ` : '';
           const phoneHtml = contact.phone ? `<br/>${renderPhoneLink(contact.phone)}` : '';
-          body += `<p>${iconHtml}• <a href="/mensaje/componer?to=${encodeURIComponent(contact.chatId)}&type=user"><b>${escapeXml(contact.displayName)}</b></a>${phoneHtml}</p>`;
+          // [Ver]: detalles (foto, info, teléfono) para distinguir contactos con el mismo
+          // nombre; si aún no está en el Nokia se abre en modo temporal sin guardarlo.
+          const detailsHref = `/usuario/${encodeURIComponent(contact.chatId)}/detalles?q=${encodeURIComponent(q.trim())}`;
+          body += `<p>${iconHtml}• <a href="/mensaje/componer?to=${encodeURIComponent(contact.chatId)}&amp;type=user"><b>${escapeXml(contact.displayName)}</b></a> <a href="${escapeXml(detailsHref)}">[Ver]</a>${phoneHtml}</p>`;
         });
       }
 

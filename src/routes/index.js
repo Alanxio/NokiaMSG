@@ -10,6 +10,7 @@ import mobileRoutes from './mobile.routes.js';
 import authRoutes from './auth.routes.js';
 import { requireAuth } from '../middlewares/auth.middleware.js';
 import { showSettings, saveSettings } from '../controller/settings.controller.js';
+import { serveAvatar } from '../services/avatar.service.js';
 
 const router = Router();
 
@@ -26,6 +27,7 @@ router.use('/', requireAuth, pollingRoutes);
 router.use('/usuario', requireAuth, userRoutes);
 router.use('/grupo', requireAuth, groupRoutes);
 router.use('/mensaje', requireAuth, messageRoutes);
+router.get('/avatar/:size/:id', requireAuth, serveAvatar);
 
 router.get('/ajustes', requireAuth, showSettings);
 router.post('/ajustes', requireAuth, saveSettings);

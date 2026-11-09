@@ -3,7 +3,6 @@ import {
   listUsers,
   showUserMessages,
   showUserDetails,
-  showUserAvatar,
   toggleUserMute,
   confirmDeleteUser,
   deleteUser,
@@ -13,7 +12,6 @@ const router = Router();
 
 router.get('/', listUsers);
 router.get('/:id/detalles', showUserDetails);
-router.get('/:id/foto', showUserAvatar);
 router.get('/:id/silenciar', toggleUserMute);
 router.get('/:id/eliminar', confirmDeleteUser);
 router.post('/:id/eliminar', deleteUser);

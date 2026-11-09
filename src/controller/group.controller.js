@@ -1,7 +1,8 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
 import { client, sendWhatsappSeen, resolveContactPhone, syncChatUnreadCountFromWhatsapp } from '../services/whatsapp.service.js';
-import { resolveMediaFsPath, safeUnlink } from '../services/cleanup.service.js';
+import { releaseAttachmentFiles } from '../services/cleanup.service.js';
+import { getAvatarUrl, renderAvatarImg } from '../services/avatar.service.js';
 import {
   CONTACT_NAME_PRIORITY,
   formatWhatsappIdentifier,
@@ -381,8 +382,9 @@ export async function showGroupMessages(req, res, next) {
     const iconTag = (file, alt) =>
       `<img src="/assets/groups_icons/${file}" alt="${escapeXml(alt)}" height="24" width="24" style="vertical-align:middle;"/>`;
 
+    const avatarHtml = renderAvatarImg(await getAvatarUrl(group.group_id, 'mini'), 'mini');
     const body =
-      `<h1>${escapeXml(group.group_name)}</h1>` +
+      `<h1>${avatarHtml ? `${avatarHtml} ` : ''}${escapeXml(group.group_name)}</h1>` +
       '<p><a href="/">Inicio</a> | <a href="/grupo">Grupos</a></p>' +
       `<p><a href="/mensaje/componer?to=${encodeURIComponent(group.group_id)}&type=group">${iconTag('Writing_Lightgreen.png', 'Enviar mensaje al grupo')}</a> ` +
       `<a href="/grupo/${encodeURIComponent(group.group_id)}/silenciar">${iconTag(muteIcon, muteLabel)}</a> ` +
@@ -413,24 +415,48 @@ export async function showGroupDetails(req, res, next) {
     }
     const group = await ensureGroupDisplayName(groupRow);
 
-    const details = await fetchGroupDetailsDirectly(groupId);
+    const [details, bigAvatarUrl] = await Promise.all([
+      fetchGroupDetailsDirectly(groupId),
+      getAvatarUrl(groupId, 'big'),
+    ]);
 
-    let body =
-      `<h1>${escapeXml(group.group_name)}</h1>` +
-      '<p><a href="/">Inicio</a> | <a href="/grupo">Grupos</a> | ' +
-      `<a href="/grupo/${encodeURIComponent(groupId)}">Mensajes</a></p>`;
+    // Misma estética que Detalles de usuario: cabecera centrada, bloques con título en
+    // negrita separados por <hr/> y acción de escribir al final.
+    const encodedGroupId = encodeURIComponent(groupId);
+    const isMuted = Number(groupRow.sms_muted) === 1;
+    const navHtml =
+      '<p><font size="1"><a href="/">Inicio</a> | <a href="/grupo">Grupos</a> | ' +
+      `<a href="/grupo/${encodedGroupId}">Chat</a></font></p>`;
+    const renderHeader = (subtitle) =>
+      '<p align="center">' +
+      (bigAvatarUrl
+        ? `${renderAvatarImg(bigAvatarUrl, 'big', 'Icono del grupo')}<br/>`
+        : '<font size="1" color="#888888">(sin icono)</font><br/>') +
+      `<b>${escapeXml(group.group_name)}</b>` +
+      (subtitle ? `<br/><font size="1" color="#666666">${subtitle}</font>` : '') +
+      '</p>';
+    const smsHtml =
+      `<p><b>Avisos SMS:</b> ${isMuted ? '<font color="#cc0000">silenciados</font>' : '<font color="#008800">activos</font>'}` +
+      `<br/><a href="/grupo/${encodedGroupId}/silenciar?volver=detalles">[${isMuted ? 'Activar' : 'Silenciar'}]</a></p>`;
+    const footerHtml =
+      '<hr/>' +
+      `<p align="center"><a href="/mensaje/componer?to=${encodedGroupId}&amp;type=group">Escribir al grupo</a></p>`;
 
     if (!details) {
       const fallbackParticipants = stmts.getParticipantsByGroupId.all(groupId);
-      body +=
-        '<p>No se han podido obtener los detalles en este momento — puede que WhatsApp ' +
-        'no los tenga cacheados todavía. Prueba a abrir el grupo desde el móvil y vuelve ' +
-        'a intentarlo aquí.</p>' +
-        '<p>Participantes vistos escribiendo en este grupo (lista parcial, sin datos de ' +
-        'quién es admin):</p>';
-      body += fallbackParticipants.length
-        ? '<ul>' + fallbackParticipants.map((p) => `<li>${escapeXml(p.username || p.chat_id)}</li>`).join('') + '</ul>'
-        : '<p>Sin datos.</p>';
+      const body =
+        navHtml +
+        renderHeader('Grupo') +
+        '<hr/>' +
+        '<p><font size="1" color="#cc0000">WhatsApp no ha dado los detalles ahora mismo. ' +
+        'Abre el grupo en el móvil y vuelve a intentarlo.</font></p>' +
+        smsHtml +
+        `<p><b>Vistos escribiendo (${fallbackParticipants.length}):</b><br/>` +
+        (fallbackParticipants.length
+          ? fallbackParticipants.map((p) => `- ${escapeXml(p.username || p.chat_id)}`).join('<br/>')
+          : '<font color="#888888">sin datos</font>') +
+        '</p>' +
+        footerHtml;
 
       sendPage(req, res, 200, `${group.group_name} - Detalles`, body);
       return;
@@ -465,19 +491,30 @@ export async function showGroupDetails(req, res, next) {
       if (ownerPhone) namesByChatId.set(details.owner, ownerPhone);
     }
 
+    const participantCount = details.participants.length;
+    let body =
+      navHtml +
+      renderHeader(`Grupo &#183; ${participantCount} participante${participantCount === 1 ? '' : 's'}`) +
+      '<hr/>';
+
     if (details.desc) {
-      body += `<p>${escapeXml(details.desc)}</p>`;
+      body += `<p><b>Descripción:</b><br/><i>${escapeXml(details.desc)}</i></p>`;
     }
+    const infoLines = [];
     if (details.creation) {
       const createdDate = new Date(details.creation * 1000);
-      body += `<p><font size="1" color="#666666">Creado: ${escapeXml(createdDate.toLocaleDateString('es-ES'))}</font></p>`;
+      infoLines.push(`Creado: ${escapeXml(createdDate.toLocaleDateString('es-ES', { timeZone: 'Europe/Madrid' }))}`);
     }
     if (details.owner) {
-      body += `<p><font size="1" color="#666666">Propietario: ${escapeXml(resolveDisplay(details.owner))}</font></p>`;
+      infoLines.push(`Creador: ${escapeXml(resolveDisplay(details.owner))}`);
     }
     if (details.hasParentCommunity) {
-      body += '<p><font size="1" color="#666666">Vinculado a una Comunidad de WhatsApp.</font></p>';
+      infoLines.push('Parte de una Comunidad');
     }
+    if (infoLines.length) {
+      body += `<p><b>Info:</b><br/><font size="1">${infoLines.join('<br/>')}</font></p>`;
+    }
+    body += smsHtml;
 
     // "Anteriores" = gente vista escribiendo en el grupo (tabla local) que ya no
     // aparece en la lista en vivo de WhatsApp. No hay fecha de salida, solo lo sabemos.
@@ -511,9 +548,14 @@ export async function showGroupDetails(req, res, next) {
     );
     const phoneByChatId = new Map(phoneEntries);
 
-    body += `<p>${sortedParticipants.length} participante${sortedParticipants.length === 1 ? '' : 's'}:</p>`;
+    // Una persona por línea, con su color del chat; rol en pequeño y teléfono debajo.
+    const renderMember = (id, name, roleTag = '') => {
+      const phone = phoneByChatId.get(id);
+      return `- <font color="${getMemberColor(id, memberColorMap)}">${escapeXml(name)}</font>${roleTag}` +
+        (phone ? `<br/>&#160;&#160;${renderPhoneLink(phone)}` : '');
+    };
     body +=
-      '<ul>' +
+      `<p><b>Participantes (${participantCount}):</b><br/>` +
       sortedParticipants
         .map((p) => {
           const roleTag = p.isSuperAdmin
@@ -521,30 +563,20 @@ export async function showGroupDetails(req, res, next) {
             : p.isAdmin
               ? ' <font color="#0000cc">[Admin]</font>'
               : '';
-          const nameHtml = `<font color="${getMemberColor(p.id, memberColorMap)}">${escapeXml(resolveDisplay(p.id))}</font>${roleTag}`;
-          const phone = phoneByChatId.get(p.id);
-          const phoneHtml = phone ? `<br/>${renderPhoneLink(phone)}` : '';
-          return `<li>${nameHtml}${phoneHtml}</li>`;
+          return renderMember(p.id, resolveDisplay(p.id), roleTag);
         })
-        .join('') +
-      '</ul>';
+        .join('<br/>') +
+      '</p>';
 
     if (pastParticipants.length) {
       body +=
-        '<p><font size="1" color="#666666">Participantes anteriores (ya no están en el ' +
-        'grupo, vistos en el historial):</font></p>';
-      body +=
-        '<ul>' +
-        pastParticipants
-          .map((p) => {
-            const nameHtml = `<font color="${getMemberColor(p.chat_id, memberColorMap)}">${escapeXml(p.username || p.chat_id)}</font>`;
-            const phone = phoneByChatId.get(p.chat_id);
-            const phoneHtml = phone ? `<br/>${renderPhoneLink(phone)}` : '';
-            return `<li>${nameHtml}${phoneHtml}</li>`;
-          })
-          .join('') +
-        '</ul>';
+        `<p><b>Ya no están (${pastParticipants.length}):</b><br/>` +
+        `<font size="1" color="#666666">${pastParticipants
+          .map((p) => renderMember(p.chat_id, p.username || p.chat_id))
+          .join('<br/>')}</font></p>`;
     }
+
+    body += footerHtml;
 
     sendPage(req, res, 200, `${group.group_name} - Detalles`, body);
   } catch (error) {
@@ -564,7 +596,9 @@ export async function toggleGroupMute(req, res, next) {
     const newState = Number(group.sms_muted) === 1 ? 0 : 1;
     stmts.setGroupSmsMuted.run(newState, groupId);
 
-    const backUrl = `/grupo/${encodeURIComponent(groupId)}`;
+    const backUrl = req.query.volver === 'detalles'
+      ? `/grupo/${encodeURIComponent(groupId)}/detalles`
+      : `/grupo/${encodeURIComponent(groupId)}`;
     const body = `<p><a href="${backUrl}">Volver</a></p>`;
     sendPage(req, res, 200, 'Nokia', body, `<meta http-equiv="refresh" content="0;url=${backUrl}"/>`);
   } catch (error) {
@@ -621,11 +655,7 @@ export async function deleteGroup(req, res, next) {
       throw error;
     }
 
-    attachments.forEach((a) => {
-      safeUnlink(resolveMediaFsPath(a.file_path_thumb));
-      safeUnlink(resolveMediaFsPath(a.file_path_full));
-      safeUnlink(resolveMediaFsPath(a.file_path_view));
-    });
+    releaseAttachmentFiles(attachments);
 
     const body =
       '<h1>Nokia</h1>' +
