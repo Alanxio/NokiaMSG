@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
+import { spawn } from 'node:child_process';
 import { Jimp, JimpMime } from 'jimp';
 import db, { stmts } from '../../db/db.js';
 
@@ -49,25 +50,22 @@ function fitDimensions(origWidth, origHeight, maxWidth, maxHeight) {
   };
 }
 
-export async function processImageBuffer(buffer) {
+export async function processImageBuffer(buffer, { includeFull = true } = {}) {
   const image = await Jimp.read(buffer);
   const origWidth = image.bitmap.width;
   const origHeight = image.bitmap.height;
 
-  // ---- Full: 320x240 max without upscaling ----
   const fullDim = fitDimensions(origWidth, origHeight, FULL_MAX_WIDTH, FULL_MAX_HEIGHT);
-  const fullImage = image.clone().resize({ w: fullDim.width, h: fullDim.height });
-  const fullBuffer = await fullImage.getBuffer(JimpMime.jpeg, { quality: JPEG_QUALITY });
-
-  // ---- View: 120x140 max without upscaling ----
   const viewDim = fitDimensions(origWidth, origHeight, VIEW_MAX_WIDTH, VIEW_MAX_HEIGHT);
-  const viewImage = image.clone().resize({ w: viewDim.width, h: viewDim.height });
-  const viewBuffer = await viewImage.getBuffer(JimpMime.jpeg, { quality: JPEG_QUALITY });
-
-  // ---- Thumbnail: 40px wide ----
   const thumbHeight = Math.max(1, Math.round(THUMB_WIDTH * origHeight / origWidth));
-  const thumbImage = image.clone().resize({ w: THUMB_WIDTH, h: thumbHeight });
-  const thumbBuffer = await thumbImage.getBuffer(JimpMime.jpeg, { quality: JPEG_QUALITY });
+  const encodeResized = (width, height) => image.clone()
+    .resize({ w: width, h: height })
+    .getBuffer(JimpMime.jpeg, { quality: JPEG_QUALITY });
+  const [fullBuffer, viewBuffer, thumbBuffer] = await Promise.all([
+    includeFull ? encodeResized(fullDim.width, fullDim.height) : null,
+    encodeResized(viewDim.width, viewDim.height),
+    encodeResized(THUMB_WIDTH, thumbHeight),
+  ]);
 
   return {
     fullDim,
@@ -130,20 +128,129 @@ export async function processAndAttachMedia(messageId, buffer, options = {}) {
   const mediaKey = options.mediaKey || `msg_${Date.now()}`;
   const filename = options.filename || `media_${Date.now()}.jpg`;
   const mimeType = options.mimeType || 'image/jpeg';
+  const safeKey = sanitizeMediaKey(mediaKey);
+  const extension = mimeType === 'image/png' ? '.png' : '.jpg';
+  const { viewFile, thumbFile, viewRel, thumbRel } = getMediaPaths(safeKey);
+  const fullFile = `full_${safeKey}${extension}`;
+  const dir = ensureMediaDir();
+  const fullPath = join(dir, fullFile);
+  const viewPath = join(dir, viewFile);
+  const thumbPath = join(dir, thumbFile);
+  const versions = await processImageBuffer(buffer, { includeFull: false });
 
-  const saved = await saveImageVersions(mediaKey, buffer);
+  writeFileSync(fullPath, buffer);
+  writeFileSync(viewPath, versions.viewBuffer);
+  writeFileSync(thumbPath, versions.thumbBuffer);
+  const fullRel = `/media/${fullFile}`;
 
   insertAttachment(messageId, {
-    mediaKey: saved.mediaKey,
+    mediaKey: safeKey,
     mimeType,
     filename,
     bufferLength: buffer.length,
-    filePathFull: saved.fullRel,
-    filePathView: saved.viewRel,
-    filePathThumb: saved.thumbRel,
+    filePathFull: fullRel,
+    filePathView: viewRel,
+    filePathThumb: thumbRel,
   });
 
-  return saved;
+  return {
+    mediaKey: safeKey,
+    fullPath,
+    viewPath,
+    thumbPath,
+    fullRel,
+    viewRel,
+    thumbRel,
+    fullSize: buffer.length,
+    viewSize: versions.viewBuffer.length,
+    thumbSize: versions.thumbBuffer.length,
+  };
+}
+
+function extractVideoFirstFrame(buffer) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-i', 'pipe:0',
+      '-frames:v', '1',
+      '-vf', `scale=${FULL_MAX_WIDTH}:${FULL_MAX_HEIGHT}:force_original_aspect_ratio=decrease`,
+      '-f', 'image2pipe',
+      '-vcodec', 'mjpeg',
+      'pipe:1',
+    ]);
+    const output = [];
+    let errorOutput = '';
+
+    ffmpeg.stdout.on('data', (chunk) => output.push(chunk));
+    ffmpeg.stderr.on('data', (chunk) => {
+      errorOutput += chunk.toString();
+    });
+    ffmpeg.on('error', reject);
+    ffmpeg.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`FFmpeg no pudo extraer el primer fotograma: ${errorOutput.trim() || `código ${code}`}`));
+        return;
+      }
+      if (output.length === 0) {
+        reject(new Error('FFmpeg no generó ningún fotograma para el video.'));
+        return;
+      }
+      resolve(Buffer.concat(output));
+    });
+    ffmpeg.stdin.on('error', (error) => {
+      if (error.code !== 'EPIPE') reject(error);
+    });
+    ffmpeg.stdin.end(buffer);
+  });
+}
+
+export async function processAndAttachVideo(messageId, buffer, options = {}) {
+  const mediaKey = options.mediaKey || `video_${Date.now()}`;
+  const filename = options.filename || `video_${Date.now()}.3gp`;
+  const mimeType = options.mimeType || 'video/3gpp';
+  const safeKey = sanitizeMediaKey(mediaKey);
+  const dir = ensureMediaDir();
+  const fullFile = `full_${safeKey}.3gp`;
+  const fullPath = join(dir, fullFile);
+  const fullRel = `/media/${fullFile}`;
+  let viewRel = null;
+  let thumbRel = null;
+  let previewError = null;
+
+  writeFileSync(fullPath, buffer);
+
+  try {
+    const firstFrame = await extractVideoFirstFrame(buffer);
+    const versions = await processImageBuffer(firstFrame, { includeFull: false });
+    const { viewFile, thumbFile, viewRel: savedViewRel, thumbRel: savedThumbRel } = getMediaPaths(safeKey);
+    writeFileSync(join(dir, viewFile), versions.viewBuffer);
+    writeFileSync(join(dir, thumbFile), versions.thumbBuffer);
+    viewRel = savedViewRel;
+    thumbRel = savedThumbRel;
+  } catch (error) {
+    previewError = error;
+  }
+
+  insertAttachment(messageId, {
+    mediaKey: safeKey,
+    mimeType,
+    filename,
+    bufferLength: buffer.length,
+    filePathFull: fullRel,
+    filePathView: viewRel,
+    filePathThumb: thumbRel,
+  });
+
+  return {
+    mediaKey: safeKey,
+    fullPath,
+    fullRel,
+    viewRel,
+    thumbRel,
+    fullSize: buffer.length,
+    previewError,
+  };
 }
 
 const EXT_BY_MIME = {
@@ -204,6 +311,10 @@ export function cleanupOrphanMediaFiles() {
     const files = readdirSync(dir);
     let removed = 0;
     for (const file of files) {
+      if (file.startsWith('voz_') && file.endsWith('.amr')) {
+        const base = file.slice(4, -4);
+        if ([...referenced].some((ref) => ref.replace(/\.[^.]+$/, '') === base)) continue;
+      }
       if (!referenced.has(file)) {
         const fullPath = join(dir, file);
         try {
@@ -316,7 +427,8 @@ export async function migrateAttachmentsToView() {
     const attachments = db.prepare(`
       SELECT id, message_id, media_key, file_path_full, file_path_view, file_path_thumb
       FROM attachments
-      WHERE file_path_view IS NULL OR file_path_view = ''
+      WHERE (file_path_view IS NULL OR file_path_view = '')
+        AND mime_type LIKE 'image/%'
     `).all();
 
     if (attachments.length === 0) return;
@@ -343,28 +455,26 @@ export async function migrateAttachmentsToView() {
         const viewPath = join(dir, viewFile);
         const thumbPath = join(dir, thumbFile);
 
-        // Rename existing full file to new full path
-        renameSync(oldFullPath, fullPath);
-
-        // Generate view from the full file
-        const buffer = readFileSync(fullPath);
+        const buffer = readFileSync(oldFullPath);
         const image = await Jimp.read(buffer);
         const viewDim = fitDimensions(image.bitmap.width, image.bitmap.height, VIEW_MAX_WIDTH, VIEW_MAX_HEIGHT);
         const viewImage = image.clone().resize({ w: viewDim.width, h: viewDim.height });
         const viewBuffer = await viewImage.getBuffer(JimpMime.jpeg, { quality: JPEG_QUALITY });
-        writeFileSync(viewPath, viewBuffer);
 
-        // Regenerate thumb if missing
-        if (!a.file_path_thumb || !existsSync(join(dir, a.file_path_thumb.split('/').pop()))) {
+        let thumbBuffer;
+        if (!existsSync(thumbPath)) {
           const thumbHeight = Math.max(1, Math.round(THUMB_WIDTH * image.bitmap.height / image.bitmap.width));
           const thumbImage = image.clone().resize({ w: THUMB_WIDTH, h: thumbHeight });
-          const thumbBuffer = await thumbImage.getBuffer(JimpMime.jpeg, { quality: JPEG_QUALITY });
-          writeFileSync(thumbPath, thumbBuffer);
+          thumbBuffer = await thumbImage.getBuffer(JimpMime.jpeg, { quality: JPEG_QUALITY });
         }
 
-        // Update DB
+        if (oldFullPath !== fullPath) writeFileSync(fullPath, buffer);
+        writeFileSync(viewPath, viewBuffer);
+        if (thumbBuffer) writeFileSync(thumbPath, thumbBuffer);
+
         stmts.updateAttachmentPaths.run(fullRel, thumbRel, a.id);
         db.prepare('UPDATE attachments SET file_path_view = ? WHERE id = ?').run(viewRel, a.id);
+        if (oldFullPath !== fullPath) unlinkSync(oldFullPath);
 
         migrated++;
       } catch (migrateErr) {
@@ -378,4 +488,110 @@ export async function migrateAttachmentsToView() {
   } catch (err) {
     console.error('[media] Error en migración de attachments:', err.message);
   }
+}
+
+
+// ─── Audio para Nokia ────────────────────────────────────────────────────────
+// WhatsApp entrega las notas de voz en OGG/Opus, que los Nokia no reproducen.
+// Se convierten bajo demanda a AMR-NB (códec de voz nativo de Nokia: mono, 8 kHz,
+// 12,2 kbps ≈ 1,5 KB/s) y el resultado se guarda junto al original como caché.
+const amrConversions = new Map();
+
+export function getAmrFileName(sourceFileName) {
+  const base = String(sourceFileName).replace(/\.[^.]+$/, '');
+  return `voz_${base}.amr`;
+}
+
+export function convertAudioToAmr(sourceFileName) {
+  const dir = getMediaDir();
+  const sourcePath = join(dir, sourceFileName);
+  const amrName = getAmrFileName(sourceFileName);
+  const amrPath = join(dir, amrName);
+
+  if (existsSync(amrPath)) return Promise.resolve(amrPath);
+  if (!existsSync(sourcePath)) return Promise.reject(new Error(`No existe el audio ${sourceFileName}`));
+  if (amrConversions.has(amrPath)) return amrConversions.get(amrPath);
+
+  const tmpPath = `${amrPath}.tmp`;
+  const job = encodeAmrWithFfmpeg(sourcePath, tmpPath)
+    .catch((ffmpegErr) => {
+      // Debian no compila ffmpeg con libopencore_amrnb: decodificar con ffmpeg
+      // y codificar con sox (que sí usa libopencore-amrnb).
+      console.debug('[audio] ffmpeg sin AMR, se usa sox:', ffmpegErr.message);
+      return encodeAmrWithSox(sourcePath, tmpPath);
+    })
+    .then(() => {
+      renameSync(tmpPath, amrPath);
+      return amrPath;
+    })
+    .catch((err) => {
+      try { unlinkSync(tmpPath); } catch { /* nada que limpiar */ }
+      throw err;
+    })
+    .finally(() => amrConversions.delete(amrPath));
+
+  amrConversions.set(amrPath, job);
+  return job;
+}
+
+function runProcess(command, args, label) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args);
+    let errorOutput = '';
+    proc.stderr.on('data', (chunk) => { errorOutput += chunk.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${label}: ${errorOutput.trim() || `código ${code}`}`));
+    });
+  });
+}
+
+// AMR-NB 12,2 kbps, mono, 8 kHz.
+function encodeAmrWithFfmpeg(sourcePath, outputPath) {
+  return runProcess('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-i', sourcePath,
+    '-vn', '-ac', '1', '-ar', '8000',
+    '-c:a', 'libopencore_amrnb', '-b:a', '12.2k',
+    '-f', 'amr', outputPath,
+  ], 'FFmpeg no pudo convertir a AMR');
+}
+
+function encodeAmrWithSox(sourcePath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const decoder = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error',
+      '-i', sourcePath,
+      '-vn', '-ac', '1', '-ar', '8000',
+      '-f', 's16le', 'pipe:1',
+    ]);
+    const encoder = spawn('sox', [
+      '-t', 'raw', '-r', '8000', '-e', 'signed', '-b', '16', '-c', '1', '-',
+      '-t', 'amr-nb', '-C', '7', outputPath,
+    ]);
+    let errorOutput = '';
+    let pending = 2;
+    let failed = false;
+    const finish = (name) => (code) => {
+      if (failed) return;
+      if (code !== 0) {
+        failed = true;
+        reject(new Error(`${name} no pudo convertir a AMR: ${errorOutput.trim() || `código ${code}`}`));
+        return;
+      }
+      pending -= 1;
+      if (pending === 0) resolve();
+    };
+    const fail = (err) => { if (!failed) { failed = true; reject(err); } };
+
+    decoder.stderr.on('data', (chunk) => { errorOutput += chunk.toString(); });
+    encoder.stderr.on('data', (chunk) => { errorOutput += chunk.toString(); });
+    decoder.on('error', fail);
+    encoder.on('error', fail);
+    encoder.stdin.on('error', (err) => { if (err.code !== 'EPIPE') fail(err); });
+    decoder.stdout.pipe(encoder.stdin);
+    decoder.on('close', finish('ffmpeg'));
+    encoder.on('close', finish('sox'));
+  });
 }

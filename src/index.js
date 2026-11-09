@@ -8,6 +8,7 @@ import { startDailyCleanup, stopDailyCleanup } from './services/cleanup.service.
 import { startWhatsappClient, stopWhatsappClient, getConnectionStatus } from './services/whatsapp.service.js';
 import { saveInteraction } from './controller/notification.controller.js';
 import { requireAuth } from './middlewares/auth.middleware.js';
+import { streamSignedAudio } from './controller/message.controller.js';
 import { cleanupOrphanMediaFiles, migrateAttachmentsToView } from './utils/media.js';
 
 dotenv.config();
@@ -20,6 +21,9 @@ app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use('/assets', requireAuth, express.static('assets'));
 app.use('/media', requireAuth, express.static(join(process.cwd(), 'public/media')));
+
+// Audio de un descriptor OMA (.dd): sin cookie, protegido por URL firmada.
+app.get('/audio/:id/:token/:fileName', streamSignedAudio);
 
 // Descarga de imágenes con Content-Disposition: attachment
 app.get('/descargar/:file', requireAuth, (req, res, next) => {

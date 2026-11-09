@@ -9,24 +9,24 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
+    "test": "node --test test/*.test.js",
     "tunnel": "./scripts/ngrok-http.sh",
-    "expose": "./scripts/expose.sh",
-    "postinstall": "patch-package"
+    "expose": "./scripts/expose.sh"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^11.10.0",
     "dotenv": "^17.4.1",
     "express": "^5.2.1",
+    "groq-sdk": "^1.6.0",
     "jimp": "^1.6.1",
     "multer": "^1.4.5-lts.1",
     "node-cron": "^4.2.1",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "sharp": "0.32.6",
-    "patch-package": "^8.0.1",
     "twilio": "^6.0.2",
-    "whatsapp-web.js": "^1.34.7"
+    "whatsapp-web.js": "https://codeload.github.com/wwebjs/whatsapp-web.js/tar.gz/064a3d5a5a3dce1281a6a12740b5a7051339d154"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

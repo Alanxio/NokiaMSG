@@ -4,6 +4,7 @@ import { join } from 'path';
 import { randomBytes } from 'crypto';
 import {
   getSmsNotificationStatus,
+  sendCallSmsNotification,
   sendSmsNotification,
 } from '../services/sms-notification.service.js';
 import { isNumericOrJid } from './page.controller.js';
@@ -117,6 +118,7 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
     let fromMe = payload.from_me ?? 0;
     let isSticker = payload.is_sticker ?? 0;
     const isSystem = payload.is_system ?? 0;
+    const isCall = payload.is_call === true || payload.is_call === 1 || payload.is_call === 'true';
     const mediaType = (typeof payload.media_type === 'string' && payload.media_type.trim())
       ? payload.media_type.trim().slice(0, 20)
       : null;
@@ -169,6 +171,9 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
     // partir el título por ":" cuando el nombre del grupo o del remitente lo contenga.
     const explicitGroupName = typeof payload.group_name === 'string' ? payload.group_name.trim().slice(0, 100) : '';
     const explicitSenderName = typeof payload.sender_name === 'string' ? payload.sender_name.trim().slice(0, 100) : '';
+    const senderNamePriority = Number.isInteger(Number(payload.sender_name_priority))
+      ? Math.max(0, Math.min(4, Number(payload.sender_name_priority)))
+      : 0;
 
     let nameOrGroupName, username;
     if (isGroup) {
@@ -238,11 +243,13 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
           if (existingUser) {
             finalUserChatId = existingUser.chat_id;
             // Actualizar el nombre si ha cambiado
-            stmts.upsertUser.run(finalUserChatId, username);
+            stmts.upsertUserNameIfPreferred.run(finalUserChatId, username, senderNamePriority);
           } else {
             finalUserChatId = userKey;
-            stmts.upsertUser.run(finalUserChatId, username);
+            stmts.upsertUserNameIfPreferred.run(finalUserChatId, username, senderNamePriority);
           }
+        } else if (isCall) {
+          finalUserChatId = null;
         } else {
           // Fallback: buscar por nombre si no hay sender_chat_id
           const existingUser = stmts.getUserByUsername.get(username);
@@ -250,20 +257,18 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
             finalUserChatId = existingUser.chat_id;
           } else {
             finalUserChatId = makeId('u_');
-            stmts.upsertUser.run(finalUserChatId, username);
+            stmts.upsertUserNameIfPreferred.run(finalUserChatId, username, senderNamePriority);
           }
         }
 
-        stmts.insertParticipant.run(finalUserChatId, finalGroupId);
+        if (finalUserChatId) {
+          stmts.insertParticipant.run(finalUserChatId, finalGroupId);
+        }
       } else {
         // Lógica de usuario individual
         const existingUser = stmts.getUserByChatId.get(chatId || '');
-        if (existingUser) {
-          finalUserChatId = existingUser.chat_id;
-        } else {
-          finalUserChatId = chatId || makeId('u_');
-          stmts.upsertUser.run(finalUserChatId, nameOrGroupName);
-        }
+        finalUserChatId = existingUser?.chat_id || chatId || makeId('u_');
+        stmts.upsertUserNameIfPreferred.run(finalUserChatId, nameOrGroupName, senderNamePriority);
       }
 
       if (whatsappMsgId) {
@@ -349,35 +354,50 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
 
       db.exec('COMMIT');
 
-      // Disparar la notificación SMS solo si: no la hemos mandado ya para esta racha de no
-      // leídos, el chat no está silenciado, y el Nokia no ha cargado ninguna página hace
-      // muy poco (si sigue en la web, ya se enterará por ahí).
-      const msSinceActivity = Date.now() - getLastActivityAt();
-      const isActiveOnWeb = msSinceActivity < SMS_SKIP_IF_ACTIVE_WITHIN_MS;
+      if (isCall) {
+        if (isSmsMuted) {
+          console.log(`[SMS] Aviso de llamada omitido (chat silenciado, ${isGroup ? finalGroupId : finalUserChatId})`);
+        } else {
+          const callName = isGroup
+            ? (stmts.getGroupById.get(finalGroupId)?.group_name || nameOrGroupName)
+            : username;
+          sendCallSmsNotification({
+            type: isGroup ? 'group' : 'user',
+            name: callName,
+            phoneNumber: payload.phone_number,
+            isVideo: payload.is_video === true || payload.is_video === 1 || payload.is_video === 'true',
+          }).catch(err => console.error('[SMS] Fallo al lanzar aviso de llamada:', err));
+        }
+      } else {
+        // Los mensajes normales respetan la racha de no leídos, el silencio del chat y la
+        // actividad reciente en la web. Las llamadas solo omiten esos límites, no el silencio.
+        const msSinceActivity = Date.now() - getLastActivityAt();
+        const isActiveOnWeb = msSinceActivity < SMS_SKIP_IF_ACTIVE_WITHIN_MS;
 
-      if (!fromMe && !alreadyNotified && !isSmsMuted && !isActiveOnWeb) {
-        console.log(`[SMS] Disparando notificación (previousUnseen=${previousUnseen}, muted=${isSmsMuted})`);
-        // Marcar ANTES de lanzar el envío (que es async) para no dejar ventana en la que
-        // dos mensajes casi simultáneos disparen dos SMS para la misma racha.
-        if (isGroup) stmts.setGroupSmsNotified.run(finalGroupId);
-        else stmts.setUserSmsNotified.run(finalUserChatId);
+        if (!fromMe && !alreadyNotified && !isSmsMuted && !isActiveOnWeb) {
+          console.log(`[SMS] Disparando notificación (previousUnseen=${previousUnseen}, muted=${isSmsMuted})`);
+          // Marcar ANTES de lanzar el envío (que es async) para no dejar ventana en la que
+          // dos mensajes casi simultáneos disparen dos SMS para la misma racha.
+          if (isGroup) stmts.setGroupSmsNotified.run(finalGroupId);
+          else stmts.setUserSmsNotified.run(finalUserChatId);
 
-        // Para el nombre de grupo del SMS, usar el que ya está guardado en wgroups (el
-        // dato fiable, protegido por la lógica de "shouldUpdate" de más arriba) en vez
-        // de nameOrGroupName, que viene directo de la ingesta y puede ser un ID en
-        // crudo si la resolución en vivo falló para este mensaje en concreto.
-        const smsGroupName = isGroup
-          ? (stmts.getGroupById.get(finalGroupId)?.group_name || nameOrGroupName)
-          : nameOrGroupName;
-        sendSmsNotification({
-          type: isGroup ? 'group' : 'user',
-          groupName: smsGroupName,
-          username: username,
-          chatId: isGroup ? finalGroupId : finalUserChatId
-        }).catch(err => console.error('[SMS] Fallo al lanzar notificación:', err));
-      } else if (!fromMe) {
-        const motivo = alreadyNotified ? 'ya notificado' : isSmsMuted ? 'silenciado' : isActiveOnWeb ? 'activo en la web' : 'desconocido';
-        console.log(`[SMS] Omitido (motivo=${motivo}, previousUnseen=${previousUnseen})`);
+          // Para el nombre de grupo del SMS, usar el que ya está guardado en wgroups (el
+          // dato fiable, protegido por la lógica de "shouldUpdate" de más arriba) en vez
+          // de nameOrGroupName, que viene directo de la ingesta y puede ser un ID en
+          // crudo si la resolución en vivo falló para este mensaje en concreto.
+          const smsGroupName = isGroup
+            ? (stmts.getGroupById.get(finalGroupId)?.group_name || nameOrGroupName)
+            : nameOrGroupName;
+          sendSmsNotification({
+            type: isGroup ? 'group' : 'user',
+            groupName: smsGroupName,
+            username: username,
+            chatId: isGroup ? finalGroupId : finalUserChatId
+          }).catch(err => console.error('[SMS] Fallo al lanzar notificación:', err));
+        } else if (!fromMe) {
+          const motivo = alreadyNotified ? 'ya notificado' : isSmsMuted ? 'silenciado' : isActiveOnWeb ? 'activo en la web' : 'desconocido';
+          console.log(`[SMS] Omitido (motivo=${motivo}, previousUnseen=${previousUnseen})`);
+        }
       }
 
       res.status(201).json({ success: true, messageId });

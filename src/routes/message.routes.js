@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { renderComposePage, showMessageDetail, validateAndCreateChat, voteOnPoll } from '../controller/message.controller.js';
+import { renderComposePage, serveAudioDescriptor, showMessageDetail, showMessageReadReceipts, validateAndCreateChat, voteOnPoll } from '../controller/message.controller.js';
 
 const router = Router();
 
@@ -8,6 +8,12 @@ router.get('/componer', renderComposePage);
 
 // Votar/cambiar voto en una encuesta (GET, reversible — antes del catch-all de abajo)
 router.get('/:id/votar/:optionId', voteOnPoll);
+
+// Ver quién leyó un mensaje saliente (antes del catch-all de abajo)
+router.get('/:id/leidos', showMessageReadReceipts);
+
+// Nota de voz / audio convertido a AMR para el Nokia (antes del catch-all de abajo)
+router.get('/:id/escuchar.dd', serveAudioDescriptor);
 
 // Detalle de un mensaje (GET)
 router.get('/:id', showMessageDetail);

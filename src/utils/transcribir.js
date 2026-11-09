@@ -1,21 +1,28 @@
-// Transcripción de notas de voz de WhatsApp (castellano + valenciano + xurro)
-// npm i express multer groq-sdk   ·   necesita ffmpeg y ffprobe instalados
-// GROQ_API_KEY=... node transcribir.js
-
-import express from "express";
-import multer from "multer";
+// Transcripción de audios de WhatsApp (castellano + valenciano + xurro)
 import Groq from "groq-sdk";
+import { File } from "node:buffer";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
-import crypto from "node:crypto";
 import os from "node:os";
+import { join } from "node:path";
+
+// groq-sdk requiere File global, que Node 18 solo expone desde node:buffer.
+if (typeof globalThis.File === "undefined") globalThis.File = File;
 
 const run = promisify(execFile);
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 25 * 1024 * 1024 } });
-const app = express();
+let clienteGroq;
+
+function getGroq() {
+  if (clienteGroq) return clienteGroq;
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    throw new Error("Falta configurar GROQ_API_KEY para transcribir audios.");
+  }
+  clienteGroq = new Groq({ apiKey });
+  return clienteGroq;
+}
 
 // ===== INICIO FUNCIONES =====
 
@@ -23,35 +30,34 @@ const app = express();
 // Modelo completo (no turbo): algo más robusto con ruido y con valenciano/catalán
 const MODELO = "whisper-large-v3";
 
-// Prompt en xurro y con formas valencianas: le dice a Whisper que aquí se mezcla
-// castellano y valenciano y que escriba "eixir", "este", "hui"... tal cual los oye.
-// Lleva una frase en castellano para no sesgar la detección solo hacia valenciano.
+// Whisper trata el prompt como «el texto anterior» al audio: frases de ejemplo largas
+// acaban colándose en la transcripción (palabras que no se han dicho). Se deja una
+// pista corta de contexto y estilo, con un par de formas valencianas (hui, este, vore)
+// y una parte en castellano para no sesgar la detección de idioma.
 const PROMPT_BASE =
-  "Oye, que luego te llamo, ¿vale? Bueno, pues hui isc prompte de la faena. " +
-  "Este xiquet és molt xicotet, es que no me'n recordava de la palabra. " +
-  "Anem a vore, vine ací, que tinc huit coses. " +
-  "Yeee bro, entra al Discord i fem unes partides, ok? Que tinc lag.";
-// Nombres propios y palabras en inglés que salgan a menudo (juegos, apps, gente, sitios):
-// "Alan, Benimaclet, UPV, Vicent, Deadlock, Steam, Twitch"
+  "Nota de voz de WhatsApp entre amigos de València, en castellano y valenciano mezclados. " +
+  "Bueno, pues hui anem a vore això, ¿vale?";
+// Solo nombres propios que salgan a menudo (gente, sitios). Cuantas menos palabras,
+// menos riesgo de que Whisper las meta donde no se han dicho.
 const VOCAB = process.env.VOCAB || "";
-const PROMPT = VOCAB ? `${PROMPT_BASE} ${VOCAB}.` : PROMPT_BASE;
+const PROMPT = VOCAB ? `${PROMPT_BASE} Nombres: ${VOCAB}.` : PROMPT_BASE;
 
 // Pasar formas del catalán central a valenciano en los trozos detectados como catalán
 const VALENCIANIZAR = process.env.VALENCIANIZAR !== "0";
 
-// Troceado por pausas
+// Troceado por pausas: solo para notas largas. Whisper trabaja en ventanas de 30 s
+// y acierta más (idioma y palabras) con el contexto completo que con trozos de 4 s.
 const SILENCIO_DB = Number(process.env.SILENCIO_DB || -35); // más alto (-30) si hay mucho ruido de fondo
 const SILENCIO_MIN = 0.5;          // segundos de pausa para considerar un posible corte
-const TROZO_MIN = 4;               // trozos más cortos detectan mal el idioma
-const NO_TROCEAR_SI_MENOS_DE = 10; // notas cortas: una sola petición
+const TROZO_MIN = 12;              // trozos cortos pierden contexto y detectan mal el idioma
+const NO_TROCEAR_SI_MENOS_DE = 30; // notas de hasta 30 s: una sola petición con el audio entero
 const TROZOS_MAX = 12;             // free tier de Groq: 20 peticiones/minuto
 const CONCURRENCIA = 3;
 
 // --- Audio -----------------------------------------------------------------
 // Limpieza suave: quita el retumbe del viento (graves) y normaliza volumen.
 // Nada agresivo: un denoise fuerte empeora a Whisper en vez de ayudarle.
-async function limpiar(entrada) {
-  const salida = entrada + ".flac";
+async function limpiar(entrada, salida) {
   await run("ffmpeg", [
     "-y", "-i", entrada,
     "-af", "highpass=f=120,afftdn=nf=-25,dynaudnorm=f=150",
@@ -100,8 +106,8 @@ function planificarTrozos(dur, sil, min = TROZO_MIN) {
   return trozos.length > TROZOS_MAX ? planificarTrozos(dur, sil, min * 1.5) : trozos;
 }
 
-async function cortar(ruta, { desde, hasta }, i) {
-  const salida = `${ruta}.${i}.flac`;
+async function cortar(ruta, { desde, hasta }, i, tempDir) {
+  const salida = join(tempDir, `trozo-${i}.flac`);
   await run("ffmpeg", [
     "-y", "-ss", desde.toFixed(3), "-t", (hasta - desde).toFixed(3), "-i", ruta, salida,
   ]);
@@ -124,6 +130,7 @@ async function enParalelo(items, n, fn) {
 
 // --- Whisper ---------------------------------------------------------------
 async function transcribir(ruta, language) {
+  const groq = getGroq();
   return groq.audio.transcriptions.create({
     file: createReadStream(ruta),
     model: MODELO,
@@ -235,25 +242,18 @@ function limpiarTexto(t) {
 
 // ===== FIN FUNCIONES =====
 
-const cache = new Map(); // hash del audio -> resultado (cámbialo por Redis/SQLite si quieres persistir)
-
-app.post("/transcribir", upload.single("audio"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "Falta el campo 'audio'" });
-  const temporales = [req.file.path];
+export async function transcribirAudio(rutaOriginal) {
+  getGroq();
+  const tempDir = await fs.mkdtemp(join(os.tmpdir(), "nokia-transcribir-"));
   try {
-    const buf = await fs.readFile(req.file.path);
-    const hash = crypto.createHash("sha1").update(buf).digest("hex");
-    if (cache.has(hash)) return res.json(cache.get(hash));
-
-    const limpio = await limpiar(req.file.path);
-    temporales.push(limpio);
+    const limpio = join(tempDir, "audio.flac");
+    await limpiar(rutaOriginal, limpio);
 
     const dur = await duracion(limpio);
-    const trozos = planificarTrozos(dur, await silencios(req.file.path));
+    const trozos = planificarTrozos(dur, await silencios(rutaOriginal));
 
     const resultados = await enParalelo(trozos, CONCURRENCIA, async (t, i) => {
-      const ruta = trozos.length === 1 ? limpio : await cortar(limpio, t, i);
-      if (ruta !== limpio) temporales.push(ruta);
+      const ruta = trozos.length === 1 ? limpio : await cortar(limpio, t, i, tempDir);
       return { ...t, ...(await transcribirTrozo(ruta)) };
     });
 
@@ -275,14 +275,12 @@ app.post("/transcribir", upload.single("audio"), async (req, res) => {
       // Lo que devolvió Whisper sin tocar (sin limpiar ni valencianizar)
       bruto: resultados.map((r) => r.whisper).filter(Boolean).join(" "),
     };
-    cache.set(hash, resultado);
-    res.json(resultado);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "No se pudo transcribir" });
+    return resultado;
   } finally {
-    for (const f of temporales) fs.unlink(f).catch(() => {});
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch (error) {
+      console.error("[transcripcion] No se pudieron limpiar los archivos temporales:", error);
+    }
   }
-});
-
-app.listen(3000, () => console.log("Transcriptor en :3000  →  POST /transcribir (campo 'audio')"));
+}

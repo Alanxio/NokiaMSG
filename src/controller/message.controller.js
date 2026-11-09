@@ -1,10 +1,15 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { escapeXml, formatPhoneNumber, isNumericOrJid, renderMediaLine, renderMentions, renderPhoneLink, sendInvalidEntity, sendMissingEntity, sendPage } from './page.controller.js';
-import { processAndAttachMedia } from '../utils/media.js';
+import { buildAudioFileName, escapeXml, formatPhoneNumber, isNumericOrJid, renderMediaLine, renderMentions, renderPhoneLink, sendInvalidEntity, sendMissingEntity, sendPage } from './page.controller.js';
+import { convertAudioToAmr, getAmrFileName, getMediaDir, processAndAttachMedia, processAndAttachVideo } from '../utils/media.js';
+import { queueAudioTranscription } from '../services/audio-transcription.service.js';
 import { getMessageQuotePreview } from '../utils/message-preview.js';
+import { CONTACT_NAME_PRIORITY } from '../utils/contact-display-name.js';
 import multer from 'multer';
 import pkg from 'whatsapp-web.js';
+import { basename, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import crypto from 'node:crypto';
 
 const { MessageMedia } = pkg;
 
@@ -20,9 +25,9 @@ function normalizeGroupName(rawName) {
 }
 
 // Asegúrate de que esta ruta apunte correctamente a donde exportas el cliente
-import { castPollVote, client, refreshPollVotesFromWhatsapp, resolveContactPhone, resolveMyVoterIds } from '../services/whatsapp.service.js';
+import { castPollVote, client, refreshPollVotesFromWhatsapp, resolveContactPhone, resolveMyVoterIds, syncOutgoingMessageAck } from '../services/whatsapp.service.js';
 import { ensureGroupDisplayName } from './group.controller.js';
-import { registerPendingOutgoing } from '../services/pending-outgoing.service.js';
+import { registerPendingOutgoing, removeObservedOutgoing, takeObservedOutgoing } from '../services/pending-outgoing.service.js';
 
 const EXISTING_CONTACT_ICON_HTML = '<img src="/assets/user.jpeg" alt="Contacto" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
 
@@ -44,15 +49,23 @@ function getReplyMessageForTarget(messageId, targetJid) {
   return message;
 }
 
+function isVideoUpload(file) {
+  const extension = String(file?.originalname || '').toLowerCase().split('.').pop();
+  return extension === '3gp'
+    && ['video/3gpp', 'video/3gp', 'application/x-3gp', 'application/octet-stream'].includes(file.mimetype);
+}
+
 export const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png'];
-    if (allowed.includes(file.mimetype)) {
+    const allowedImage = ['image/jpeg', 'image/png'].includes(file.mimetype);
+    // El campo «Multimedia» (image) acepta tanto fotos como videos 3GP.
+    const allowedVideo = file.fieldname === 'image' && isVideoUpload(file);
+    if ((['image', 'image2'].includes(file.fieldname) && allowedImage) || allowedVideo) {
       cb(null, true);
     } else {
-      cb(new Error('Solo se permiten imagenes JPG o PNG'), false);
+      cb(new Error('Solo se permiten imagenes JPG/PNG y videos 3GP'), false);
     }
   },
 });
@@ -109,6 +122,7 @@ export async function renderComposePage(req, res, next) {
         body += `<p><font size="1" color="#555555">Respondiendo a ${escapeXml(quotedSender)}:</font><br/><i>${escapeXml(quotedText)}</i></p>`;
       }
 
+      let mentionPickerHtml = '';
       if (type === 'group') {
         try {
           const participants = db.prepare(`
@@ -120,13 +134,15 @@ export async function renderComposePage(req, res, next) {
           `).all(to);
 
           if (participants && participants.length > 0) {
-            body += `<p><font size="1" color="#555555">Mencionar en grupo:</font><br/>`;
-            body += participants.map(p => {
-              const textWithMention = (textoPrevio ? textoPrevio + ' ' : '') + '@' + p.username + ' ';
-              const replyParam = replyMessage ? `&replyTo=${replyMessage.id}` : '';
-              return `<a href="/mensaje/componer?to=${encodeURIComponent(to)}&type=group&text=${encodeURIComponent(textWithMention)}${replyParam}">@${escapeXml(p.username)}</a>`;
-            }).join(' | ');
-            body += `</p>`;
+            mentionPickerHtml =
+              `<p><font size="1" color="#555555">Mencionar en grupo:</font><br/>` +
+              `<select name="mention">` +
+              `<option value="">Elegir participante</option>` +
+              participants.map((p) =>
+                `<option value="${escapeXml(p.chat_id)}">@${escapeXml(p.username)}</option>`
+              ).join('') +
+              `</select> ` +
+              `<button type="submit" name="compose_action" value="add_mention">Añadir mención</button></p>`;
           }
         } catch (e) {}
       }
@@ -139,9 +155,10 @@ export async function renderComposePage(req, res, next) {
           <p>
             <textarea name="text" rows="5" cols="22">${escapeXml(textoPrevio)}</textarea>
           </p>
+          ${mentionPickerHtml}
           <p>
-            Foto 1:<br/>
-            <input type="file" name="image" accept="image/jpeg,image/png"/>
+            Multimedia:<br/>
+            <input type="file" name="image" accept="image/jpeg,image/png,.3gp,video/3gpp"/>
             Foto 2:<br/>
             <input type="file" name="image2" accept="image/jpeg,image/png"/>
           </p>
@@ -287,9 +304,8 @@ export async function renderComposePage(req, res, next) {
       // group.controller.js: para @lid (id interno, no son dígitos de un número real) hace
       // falta resolverlo en vivo; para @c.us los dígitos ya están en el propio chat_id.
       await Promise.all(filteredContacts.map(async (contact) => {
-        contact.phone = contact.chatId.endsWith('@lid')
-          ? await resolveContactPhone(contact.chatId)
-          : formatPhoneNumber(contact.chatId);
+        contact.phone = (await resolveContactPhone(contact.chatId))
+          || formatPhoneNumber(contact.chatId);
       }));
 
       // El icono de "contacto existente" indica que ya está en los Contactos del Nokia (la
@@ -373,7 +389,7 @@ export async function renderComposePage(req, res, next) {
 
 export async function validateAndCreateChat(req, res, next) {
   // ===========================================================================
-  // 1. Procesar hasta dos imágenes adjuntas con multer
+  // 1. Procesar el campo Multimedia (foto o video 3GP) y una segunda foto con multer
   // ===========================================================================
   try {
     await new Promise((resolve, reject) => {
@@ -386,10 +402,10 @@ export async function validateAndCreateChat(req, res, next) {
       });
     });
   } catch (err) {
-    let message = 'Error al procesar la imagen.';
+    let message = 'Error al procesar el archivo multimedia.';
     if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
-      message = 'Cada imagen puede ocupar como máximo 5 MB.';
-    } else if (err.message === 'Solo se permiten imagenes JPG o PNG') {
+      message = 'Cada archivo puede ocupar como máximo 5 MB.';
+    } else if (err.message === 'Solo se permiten imagenes JPG/PNG y videos 3GP') {
       message = err.message;
     }
     return sendPage(
@@ -402,20 +418,57 @@ export async function validateAndCreateChat(req, res, next) {
   }
 
   try {
-    const { phone, text, type, replyTo } = req.body;
-    const imageFiles = ['image', 'image2'].flatMap((field) => req.files?.[field] || []);
+    const { phone, text, type, replyTo, mention, compose_action: composeAction } = req.body;
+    const mediaFiles = ['image', 'image2'].flatMap((field) => req.files?.[field] || []);
+
+    // En navegadores clásicos no hay forma de que un enlace lea el contenido
+    // todavía no enviado de un textarea. Este submit vuelve al editor con la
+    // mención añadida, conservando todo lo que el usuario ya había escrito.
+    if (composeAction === 'add_mention') {
+      const groupId = typeof phone === 'string' ? phone.trim() : '';
+      const mentionId = typeof mention === 'string' ? mention.trim() : '';
+      const participant = groupId && mentionId
+        ? db.prepare(`
+            SELECT u.username
+            FROM group_participants gp
+            JOIN users u ON u.chat_id = gp.user_chat_id
+            WHERE gp.group_id = ? AND gp.user_chat_id = ?
+            LIMIT 1
+          `).get(groupId, mentionId)
+        : null;
+
+      if (type === 'group' && participant?.username) {
+        let currentText = typeof text === 'string' ? text : '';
+        // Permite escribir «Hola @» antes de elegir: el @ pendiente se sustituye
+        // por la mención completa, sin dejar un segundo arroba.
+        currentText = currentText.replace(/@\s*$/, '');
+        const separator = currentText && !/\s$/.test(currentText) ? ' ' : '';
+        const textWithMention = `${currentText}${separator}@${participant.username} `;
+        const params = new URLSearchParams({
+          to: groupId,
+          type: 'group',
+          text: textWithMention,
+        });
+        if (typeof replyTo === 'string' && replyTo) params.set('replyTo', replyTo);
+        return res.redirect(`/mensaje/componer?${params.toString()}`);
+      }
+    }
 
     const trimmedText = typeof text === 'string' ? text.trim() : '';
     const hasText = trimmedText !== '';
-    const hasImages = imageFiles.length > 0;
+    const outgoingMediaFiles = mediaFiles.map((file) => ({
+      file,
+      mediaType: isVideoUpload(file) ? 'video' : 'image',
+    }));
+    const hasMedia = outgoingMediaFiles.length > 0;
 
-    if (!phone || (!hasText && !hasImages)) {
+    if (!phone || (!hasText && !hasMedia)) {
       return sendPage(
         req,
         res,
         400,
         'Error',
-        '<p>Debes escribir un mensaje o adjuntar una imagen.</p><p><a href="/mensaje/componer">Volver</a></p>'
+        '<p>Debes escribir un mensaje o adjuntar una imagen o un video.</p><p><a href="/mensaje/componer">Volver</a></p>'
       );
     }
 
@@ -451,7 +504,7 @@ export async function validateAndCreateChat(req, res, next) {
     }
 
     // =========================================================================
-    // 2. Enviar mensaje de texto, imagen o imagen con caption
+    // 2. Enviar mensaje de texto, imagen o video con caption
     // =========================================================================
     const options = {};
     if (type === 'group' || targetJid.endsWith('@g.us')) {
@@ -520,21 +573,23 @@ export async function validateAndCreateChat(req, res, next) {
     const urlDestino = type === 'group' || targetJid.endsWith('@g.us')
       ? `/grupo/${encodeURIComponent(targetJid)}`
       : `/usuario/${encodeURIComponent(targetJid)}`;
-    const outgoingMessages = hasImages
-      ? imageFiles.map((imageFile, index) => ({
-        imageFile,
+    const outgoingMessages = hasMedia
+      ? outgoingMediaFiles.map(({ file, mediaType }, index) => ({
+        mediaFile: file,
+        mediaType,
         text: index === 0 ? processedText : '',
       }))
-      : [{ imageFile: null, text: processedText }];
+      : [{ mediaFile: null, mediaType: null, text: processedText }];
+    const sentMedia = [];
 
-    for (const { imageFile, text: messageText } of outgoingMessages) {
-      const hasImage = !!imageFile;
+    for (const { mediaFile, mediaType, text: messageText } of outgoingMessages) {
+      const hasAttachment = !!mediaFile;
       let sentMessage;
-      if (imageFile) {
+      if (mediaFile) {
         const media = new MessageMedia(
-          imageFile.mimetype,
-          imageFile.buffer.toString('base64'),
-          imageFile.originalname
+          mediaType === 'video' ? 'video/3gpp' : mediaFile.mimetype,
+          mediaFile.buffer.toString('base64'),
+          mediaFile.originalname
         );
         const mediaOptions = {
           ...options,
@@ -576,12 +631,12 @@ export async function validateAndCreateChat(req, res, next) {
 
       // whatsapp-web.js puede no devolver el id, así que se enlaza después del evento
       // message_create cuando WhatsApp confirme el envío.
-      const whatsappMsgId = sentMessage?.id?._serialized || null;
+      let whatsappMsgId = sentMessage?.id?._serialized || sentMessage?.id?.$1 || null;
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
       const pad = (n) => String(n).padStart(2, '0');
       const daySend = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
       const hourSend = `${daySend} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-      const finalText = messageText || '[Imagen]';
+      const finalText = messageText || (mediaType === 'video' ? '[Video]' : '[Imagen]');
       let insertedMessageId;
 
       if (type === 'group' || targetJid.endsWith('@g.us')) {
@@ -594,7 +649,7 @@ export async function validateAndCreateChat(req, res, next) {
           } catch (e) {}
           stmts.upsertGroup.run(targetJid, groupName);
         }
-        const result = hasImage
+        const result = hasAttachment
           ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null, whatsappMsgId)
           : stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid, whatsappMsgId);
         insertedMessageId = result.lastInsertRowid;
@@ -610,7 +665,7 @@ export async function validateAndCreateChat(req, res, next) {
           } catch (e) {}
           stmts.upsertUser.run(targetJid, finalName);
         }
-        const result = hasImage
+        const result = hasAttachment
           ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null, whatsappMsgId)
           : stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null, whatsappMsgId);
         insertedMessageId = result.lastInsertRowid;
@@ -624,20 +679,45 @@ export async function validateAndCreateChat(req, res, next) {
         );
       }
 
-      if (!whatsappMsgId && insertedMessageId) {
-        registerPendingOutgoing(targetJid, insertedMessageId);
+      if (insertedMessageId) {
+        if (whatsappMsgId) {
+          removeObservedOutgoing(targetJid, whatsappMsgId);
+          syncOutgoingMessageAck(whatsappMsgId, sentMessage?.ack);
+        } else {
+          whatsappMsgId = takeObservedOutgoing(targetJid);
+          if (whatsappMsgId) {
+            stmts.setMessageWhatsappId.run(whatsappMsgId, insertedMessageId);
+            syncOutgoingMessageAck(whatsappMsgId, sentMessage?.ack);
+          } else {
+            registerPendingOutgoing(targetJid, insertedMessageId);
+          }
+        }
       }
 
-      if (imageFile && insertedMessageId) {
-        try {
-          await processAndAttachMedia(insertedMessageId, imageFile.buffer, {
-            mediaKey: `out_${insertedMessageId}_${Date.now()}`,
-            filename: imageFile.originalname || `out_${insertedMessageId}.jpg`,
-            mimeType: imageFile.mimetype || 'image/jpeg',
-          });
-        } catch (mediaErr) {
-          console.error('[mensaje] Error guardando attachment saliente:', mediaErr.message);
+      if (mediaType === 'video' && insertedMessageId) {
+        db.prepare('UPDATE messages SET media_type = ? WHERE id = ?').run('video', insertedMessageId);
+      }
+
+      if (mediaFile && insertedMessageId) {
+        sentMedia.push({ messageId: insertedMessageId, mediaFile, mediaType });
+      }
+    }
+
+    for (const { messageId, mediaFile, mediaType } of sentMedia) {
+      try {
+        const options = {
+          mediaKey: `out_${messageId}_${Date.now()}`,
+          filename: mediaFile.originalname || (mediaType === 'video' ? `out_${messageId}.3gp` : `out_${messageId}.jpg`),
+          mimeType: mediaType === 'video' ? 'video/3gpp' : mediaFile.mimetype || 'image/jpeg',
+        };
+        const saved = mediaType === 'video'
+          ? await processAndAttachVideo(messageId, mediaFile.buffer, options)
+          : await processAndAttachMedia(messageId, mediaFile.buffer, options);
+        if (saved.previewError) {
+          console.error('[mensaje] Video guardado sin fotograma de vista previa:', saved.previewError.message);
         }
+      } catch (mediaErr) {
+        console.error(`[mensaje] Error guardando attachment saliente (${mediaType}):`, mediaErr.message);
       }
     }
 
@@ -691,7 +771,8 @@ export async function showMessageDetail(req, res, next) {
     } else if (message.user_chat_id) {
       const isOutgoing = Number(message.from_me) === 1;
       const name = escapeXml(message.username || message.user_chat_id.replace(/@.*$/, ''));
-      const phone = formatPhoneNumber(message.user_chat_id, message.username);
+      const phone = (await resolveContactPhone(message.user_chat_id))
+        || formatPhoneNumber(message.user_chat_id, message.username);
       const phoneLink = phone ? ` ${renderPhoneLink(phone)}` : '';
       fromToLabel = isOutgoing ? `Para: ${name}` : `De: ${name}${phoneLink}`;
       backUrl = `/usuario/${encodeURIComponent(message.user_chat_id)}`;
@@ -727,14 +808,21 @@ export async function showMessageDetail(req, res, next) {
 
       contentHtml += `<p><b>${escapeXml(pollQuestion)}</b></p>`;
 
-      pollOptions.forEach((option, index) => {
+      for (const [index, option] of pollOptions.entries()) {
         const voters = stmts.getVotersForOption.all(option.option_id);
         const isMine = myIds ? voters.some((v) => myIds.has(v.voter_chat_id)) : false;
-        const voterNames = voters.map((v) => {
+        const voterNames = await Promise.all(voters.map(async (v) => {
           const user = stmts.getUserByChatId.get(v.voter_chat_id);
-          const display = user?.username || formatPhoneNumber(v.voter_chat_id) || v.voter_chat_id.replace(/@.*$/, '');
+          // Un nombre real (agenda o perfil) se respeta; si solo tenemos un número,
+          // se sustituye por el personal en lugar del de empresa.
+          const hasRealName = user?.username && Number(user.name_priority) >= CONTACT_NAME_PRIORITY.PROFILE_NAME;
+          const display = (hasRealName ? user.username : null)
+            || (await resolveContactPhone(v.voter_chat_id))
+            || user?.username
+            || formatPhoneNumber(v.voter_chat_id)
+            || v.voter_chat_id.replace(/@.*$/, '');
           return escapeXml(display);
-        });
+        }));
 
         const accesskeyAttr = index < 9 ? ` accesskey="${index + 1}"` : '';
         const actionHtml = isMine
@@ -745,7 +833,7 @@ export async function showMessageDetail(req, res, next) {
           : '<br/><font size="1" color="#888888">Sin votos aún</font>';
 
         contentHtml += `<p>${escapeXml(option.option_name)} — ${option.vote_count} voto(s) ${actionHtml}${votersLine}</p>`;
-      });
+      }
 
       contentHtml += `<p><font size="1" color="#888888">Total: ${totalVotes} voto(s)</font></p>`;
     } else if (
@@ -755,16 +843,41 @@ export async function showMessageDetail(req, res, next) {
       const stickerPath = attachment.file_path_view || attachment.file_path_full || attachment.file_path_thumb;
       const stickerWidth = attachment.file_path_view || attachment.file_path_full ? 120 : 40;
       contentHtml += `<p><img src="${escapeXml(stickerPath)}" alt="Sticker" width="${stickerWidth}"/></p>`;
+    } else if (mediaType === 'video' && attachment?.file_path_view) {
+      contentHtml += `<p><img src="${escapeXml(attachment.file_path_view)}" alt="Primer fotograma del video" width="120"/></p>`;
+      contentHtml += `<p>${renderMediaLine(message, { showPreview: false })}</p>`;
     } else if (attachment?.file_path_view) {
       contentHtml += `<p><img src="${escapeXml(attachment.file_path_view)}" alt="Imagen" width="${attachment.view_width || 120}" height="${attachment.view_height || 90}"/></p>`;
     } else if (mediaType) {
       contentHtml += `<p>${renderMediaLine(message, {})}</p>`;
     }
 
-    if (message.text && message.text !== '[Imagen]' && !isPoll) {
+    if (
+      message.text
+      && message.text !== '[Imagen]'
+      && !(mediaType === 'video' && message.text === '[Video]')
+      && !isPoll
+    ) {
       contentHtml += `<p>${renderMentions(message.text)}</p>`;
     } else if (!attachment?.file_path_view && !isSticker && !mediaType) {
       contentHtml += `<p>${renderMentions(message.text || '')}</p>`;
+    }
+
+    if (mediaType === 'ptt' || mediaType === 'audio') {
+      contentHtml += '<h2>Transcripción</h2>';
+      if (message.transcription) {
+        contentHtml += `<p>${escapeXml(message.transcription)}</p>`;
+      } else if (message.file_path_full) {
+        const audioPath = join(getMediaDir(), basename(message.file_path_full));
+        if (existsSync(audioPath)) {
+          queueAudioTranscription(message.id, audioPath);
+          contentHtml += '<p>La transcripción se está preparando automáticamente. Vuelve a abrir este detalle en unos instantes.</p>';
+        } else {
+          contentHtml += '<p>El archivo de audio no está disponible para transcribir.</p>';
+        }
+      } else {
+        contentHtml += '<p>El archivo de audio no está disponible para transcribir.</p>';
+      }
     }
 
     if (!isSticker && !mediaType && attachment?.file_path_full) {
@@ -774,11 +887,249 @@ export async function showMessageDetail(req, res, next) {
 
     const body =
       '<h1>Mensaje</h1>' +
-      `<p><b>${fromToLabel}</b><br/>${escapeXml(dateTimeLabel)}</p>` +
+      `<p><b>${fromToLabel}</b><br/>${escapeXml(dateTimeLabel)}${Number(message.is_deleted) === 1 ? ' <font size="1" color="#cc0000">(borrado)</font>' : ''}</p>` +
       contentHtml +
       `<p><a href="${backUrl}">Volver a la conversacion</a></p>`;
 
     sendPage(req, res, 200, 'Mensaje', body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function loadAudioMessage(req, res) {
+  const messageId = Number.parseInt(req.params.id, 10);
+  if (Number.isNaN(messageId)) {
+    sendInvalidEntity(req, res, 'Mensaje');
+    return null;
+  }
+  const message = stmts.getMessageByIdWithMedia.get(messageId);
+  if (!message) {
+    sendMissingEntity(req, res, 'Mensaje');
+    return null;
+  }
+  if (!['ptt', 'audio'].includes(message.media_type) || !message.file_path_full) {
+    sendPage(req, res, 404, 'Audio', '<p>Este mensaje no tiene audio.</p>' +
+      `<p><a href="/mensaje/${messageId}">Volver</a></p>`);
+    return null;
+  }
+  try {
+    await convertAudioToAmr(basename(message.file_path_full));
+  } catch (convertErr) {
+    console.error(`[audio] No se pudo convertir el audio del mensaje ${messageId}:`, convertErr.message);
+    sendPage(req, res, 500, 'Audio', '<p>No se pudo preparar el audio.</p>' +
+      `<p><a href="/mensaje/${messageId}">Volver</a></p>`);
+    return null;
+  }
+  return message;
+}
+
+// El gestor de descargas del Nokia pide el objeto del descriptor por su cuenta y puede
+// no enviar la cookie de sesión, así que esa URL va firmada (HMAC del id del mensaje).
+// La clave es aleatoria por arranque: el descriptor se pide siempre justo antes.
+const AUDIO_LINK_SECRET = crypto.randomBytes(32);
+
+function signAudioLink(messageId) {
+  return crypto.createHmac('sha256', AUDIO_LINK_SECRET).update(String(messageId)).digest('hex').slice(0, 32);
+}
+
+// El Nokia 6111 no soporta HTTPS, así que el objectURI del descriptor va siempre por
+// http://. No se usa X-Forwarded-Proto: el Gateway lo fija a «https» en todas las
+// peticiones aunque el teléfono haya entrado por HTTP.
+function getPublicBaseUrl(req) {
+  const first = (value) => String(value || '').split(',')[0].trim();
+  const proto = 'http';
+  const host = first(req.headers['x-forwarded-host']) || req.headers.host;
+  return `${proto}://${host}`;
+}
+
+// PRUEBA — OMA DRM 1.0 «combined delivery»: el .amr viaja dentro de un mensaje DRM con
+// un derecho de reproducción limitado a N escuchas (AUDIO_PLAY_COUNT, por defecto 1).
+// Con AUDIO_PLAY_COUNT=0 se envía el .amr normal, sin DRM.
+const AUDIO_PLAY_COUNT = Number.parseInt(process.env.AUDIO_PLAY_COUNT ?? '1', 10) || 0;
+const DRM_BOUNDARY = 'nokiamsn-drm-boundary';
+
+function buildAudioPayload(message, amrPath) {
+  const amr = readFileSync(amrPath);
+  if (AUDIO_PLAY_COUNT <= 0) return { contentType: 'audio/amr', body: amr };
+
+  const cid = `audio${message.id}@nokiamsn`;
+  const rights =
+    '<o-ex:rights xmlns:o-ex="http://odrl.net/1.1/ODRL-EX" xmlns:o-dd="http://odrl.net/1.1/ODRL-DD" ' +
+    'xmlns:ds="http://www.w3.org/2000/09/xmldsig#/">' +
+    '<o-ex:context><o-dd:version>1.0</o-dd:version></o-ex:context>' +
+    '<o-ex:agreement>' +
+    `<o-ex:asset><o-ex:context><o-dd:uid>cid:${cid}</o-dd:uid></o-ex:context></o-ex:asset>` +
+    '<o-ex:permission><o-dd:play><o-ex:constraint>' +
+    `<o-dd:count>${AUDIO_PLAY_COUNT}</o-dd:count>` +
+    '</o-ex:constraint></o-dd:play></o-ex:permission>' +
+    '</o-ex:agreement>' +
+    '</o-ex:rights>';
+  const head =
+    `--${DRM_BOUNDARY}\r\n` +
+    'Content-Type: application/vnd.oma.drm.rights+xml\r\n' +
+    'Content-Transfer-Encoding: binary\r\n' +
+    '\r\n' +
+    `${rights}\r\n` +
+    `--${DRM_BOUNDARY}\r\n` +
+    'Content-Type: audio/amr\r\n' +
+    `Content-ID: <${cid}>\r\n` +
+    'Content-Transfer-Encoding: binary\r\n' +
+    '\r\n';
+  const tail = `\r\n--${DRM_BOUNDARY}--\r\n`;
+  return {
+    contentType: `application/vnd.oma.drm.message; boundary=${DRM_BOUNDARY}`,
+    body: Buffer.concat([Buffer.from(head, 'utf8'), amr, Buffer.from(tail, 'utf8')]),
+  };
+}
+
+// GET /mensaje/:id/escuchar.dd — descriptor OMA Download con el nombre del archivo.
+export async function serveAudioDescriptor(req, res, next) {
+  try {
+    const message = await loadAudioMessage(req, res);
+    if (!message) return;
+    const amrPath = join(getMediaDir(), getAmrFileName(basename(message.file_path_full)));
+    const fileName = buildAudioFileName(message);
+    const payload = buildAudioPayload(message, amrPath);
+    const objectUri = `${getPublicBaseUrl(req)}/audio/${message.id}/${signAudioLink(message.id)}/${encodeURIComponent(fileName)}`;
+    const descriptor =
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<media xmlns="http://www.openmobilealliance.org/xmlns/dd">\n' +
+      (AUDIO_PLAY_COUNT > 0 ? '<type>application/vnd.oma.drm.message</type>\n' : '') +
+      '<type>audio/amr</type>\n' +
+      `<size>${payload.body.length}</size>\n` +
+      `<objectURI>${escapeXml(objectUri)}</objectURI>\n` +
+      `<name>${escapeXml(fileName.replace(/\.amr$/, ''))}</name>\n` +
+      '<DDVersion>1.0</DDVersion>\n' +
+      '</media>\n';
+    res.set({
+      'Content-Type': 'application/vnd.oma.dd+xml',
+      'Cache-Control': 'no-store',
+    });
+    res.send(descriptor);
+  } catch (error) {
+    next(error);
+  }
+}
+
+// GET /audio/:id/:token/:fileName — sin cookie, validado por la firma.
+export async function streamSignedAudio(req, res, next) {
+  try {
+    const expected = Buffer.from(signAudioLink(req.params.id));
+    const given = Buffer.from(String(req.params.token || ''));
+    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
+      return res.status(403).send('Enlace no válido');
+    }
+    const message = await loadAudioMessage(req, res);
+    if (!message) return;
+    const amrPath = join(getMediaDir(), getAmrFileName(basename(message.file_path_full)));
+    const payload = buildAudioPayload(message, amrPath);
+    const fileName = buildAudioFileName(message).replace(/\.amr$/, AUDIO_PLAY_COUNT > 0 ? '.dm' : '.amr');
+    res.set({
+      'Content-Type': payload.contentType,
+      'Content-Disposition': `attachment; filename="${fileName}"`,
+      'Cache-Control': 'no-store',
+    });
+    res.send(payload.body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function showMessageReadReceipts(req, res, next) {
+  try {
+    const messageId = Number.parseInt(req.params.id, 10);
+    if (Number.isNaN(messageId)) {
+      return sendPage(req, res, 404, 'No encontrado', '<p>Mensaje no encontrado.</p><p><a href="/">Inicio</a></p>');
+    }
+
+    const message = stmts.getMessageByIdWithMedia.get(messageId);
+    if (
+      !message ||
+      Number(message.from_me) !== 1 ||
+      !message.whatsapp_msg_id ||
+      Number(message.is_deleted) === 1 ||
+      Number(message.is_system) === 1
+    ) {
+      return sendPage(req, res, 404, 'No encontrado', '<p>No hay recibos de lectura para este mensaje.</p><p><a href="/">Inicio</a></p>');
+    }
+
+    let backUrl = '/';
+    if (message.group_id) {
+      backUrl = `/grupo/${encodeURIComponent(message.group_id)}`;
+    } else if (message.user_chat_id) {
+      backUrl = `/usuario/${encodeURIComponent(message.user_chat_id)}`;
+    }
+
+    if (!client?.info) {
+      return sendPage(req, res, 503, 'Leídos', '<h1>Leídos</h1><p>WhatsApp no está conectado; no se pueden consultar los recibos.</p>' +
+        `<p><a href="/mensaje/${message.id}">Volver al mensaje</a></p>`);
+    }
+
+    const whatsappMessage = await client.getMessageById(message.whatsapp_msg_id);
+    const info = whatsappMessage ? await whatsappMessage.getInfo() : null;
+    if (!info) {
+      return sendPage(req, res, 200, 'Leídos', '<h1>Leídos</h1><p>WhatsApp no ha devuelto información de lectura para este mensaje.</p>' +
+        `<p><a href="/mensaje/${message.id}">Volver al mensaje</a> | <a href="${backUrl}">Volver a la conversación</a></p>`);
+    }
+
+    const readReceipts = Array.isArray(info.read) ? info.read : [];
+    const readers = await Promise.all(readReceipts.map(async (receipt) => {
+      const chatId = typeof receipt?.id === 'string'
+        ? receipt.id
+        : receipt?.id?._serialized || null;
+      if (!chatId) {
+        return { label: 'Contacto desconocido', timestamp: receipt?.t };
+      }
+
+      const storedUser = stmts.getUserByChatId.get(chatId);
+      // Un username que solo es un número (posiblemente el de empresa) no cuenta como nombre.
+      const localUser = storedUser?.username && Number(storedUser.name_priority) >= CONTACT_NAME_PRIORITY.PROFILE_NAME
+        ? storedUser
+        : null;
+      let contact = null;
+      if (!localUser?.username && typeof client.getContactById === 'function') {
+        try {
+          contact = await client.getContactById(chatId);
+        } catch (error) {
+          console.warn(`[mensaje] No se pudo resolver el lector ${chatId}:`, error.message);
+        }
+      }
+
+      const displayName = localUser?.username || contact?.pushname || contact?.name || contact?.shortName;
+      return {
+        label: displayName
+          || (await resolveContactPhone(chatId))
+          || storedUser?.username
+          || formatPhoneNumber(chatId)
+          || chatId.replace(/@.*$/, ''),
+        timestamp: receipt?.t,
+      };
+    }));
+
+    const readersHtml = readers.length
+      ? `<ul>${readers.map(({ label, timestamp }) => {
+        const readAt = Number(timestamp) > 0
+          ? ` <font size="1" color="#666666">${escapeXml(new Date(Number(timestamp) * 1000).toLocaleString('es-ES'))}</font>`
+          : '';
+        return `<li>${escapeXml(label)}${readAt}</li>`;
+      }).join('')}</ul>`
+      : '<p>Nadie ha leído este mensaje todavía.</p>';
+    const readRemaining = Number(info.readRemaining);
+    const remainingHtml = Number.isFinite(readRemaining) && readRemaining > 0
+      ? `<p>${readRemaining} pendiente(s) de leer.</p>`
+      : '';
+    const sentAt = message.hour_send || message.day_send || '';
+
+    const body =
+      '<h1>Leídos</h1>' +
+      `<p>Mensaje del ${escapeXml(sentAt)}</p>` +
+      `<p>${renderMentions(message.text || '')}</p>` +
+      `<p>Leído por ${readers.length} contacto(s):</p>` +
+      readersHtml +
+      remainingHtml +
+      `<p><a href="/mensaje/${message.id}">Volver al mensaje</a> | <a href="${backUrl}">Volver a la conversación</a></p>`;
+    sendPage(req, res, 200, 'Leídos', body);
   } catch (error) {
     next(error);
   }

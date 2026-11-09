@@ -1,6 +1,6 @@
 import db, { stmts } from '../../db/db.js';
 import { sendPage, escapeXml } from './page.controller.js';
-import { getConnectionStatus, getUsersPresence, sendWhatsappSeen } from '../services/whatsapp.service.js';
+import { getConnectionStatus, getUsersPresence, sendWhatsappSeen, syncUnreadCountsFromWhatsapp } from '../services/whatsapp.service.js';
 import { ensureGroupDisplayName } from './group.controller.js';
 
 const USER_ICON_HTML = '<img src="/assets/user.jpeg" alt="U" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
@@ -8,6 +8,7 @@ const GROUP_ICON_HTML = '<img src="/assets/group.jpeg" alt="G" height="14" width
 
 export async function showHome(req, res, next) {
   try {
+    await syncUnreadCountsFromWhatsapp();
     const recentUsers = stmts.getRecentUsersWithUnseen.all(10);
     const recentGroups = stmts.getRecentGroupsWithUnseen.all(10);
 

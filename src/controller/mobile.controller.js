@@ -12,7 +12,7 @@ import { client, getConnectionStatus, sendWhatsappSeen } from '../services/whats
 import { getPollingState, limpiarNovedad } from '../services/polling.service.js';
 import { registerPendingOutgoing } from '../services/pending-outgoing.service.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { ensureGroupDisplayName } from './group.controller.js';
+import { ensureGroupDisplayName, ensureGroupDisplayNames } from './group.controller.js';
 import { DIRECTORY_PAGE_SIZE, MESSAGE_PAGE_SIZE, getTotal, toPositiveInt } from './page.controller.js';
 
 function jsonError(res, status, code, message) {
@@ -106,19 +106,21 @@ export async function mobileInbox(req, res, next) {
 
 export async function mobileDirectoryUsers(req, res, next) {
   try {
-    const allUsers = stmts.getAllUsers.all();
-    allUsers.sort((a, b) => (a.username || '').localeCompare(b.username || '', 'es', { sensitivity: 'base' }));
-
     const requestedPage = toPositiveInt(req.query.p, 1);
-    const totalPages = Math.max(1, Math.ceil(allUsers.length / DIRECTORY_PAGE_SIZE));
+    const total = stmts.countDirectoryUsers.get().total;
+    const totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
     const page = Math.min(requestedPage, totalPages);
     const offset = (page - 1) * DIRECTORY_PAGE_SIZE;
-    const users = allUsers.slice(offset, offset + DIRECTORY_PAGE_SIZE);
+    const users = stmts.getDirectoryUsersPage.all(DIRECTORY_PAGE_SIZE, offset);
+    users.sort((a, b) =>
+      (a.username || '').localeCompare(b.username || '', 'es', { sensitivity: 'base' })
+      || a.chat_id.localeCompare(b.chat_id)
+    );
 
     res.json({
       page,
       totalPages,
-      total: allUsers.length,
+      total,
       pageSize: DIRECTORY_PAGE_SIZE,
       users: users.map((u) => ({ id: u.chat_id, name: u.username, unseenCount: u.unseen_count })),
     });
@@ -129,19 +131,23 @@ export async function mobileDirectoryUsers(req, res, next) {
 
 export async function mobileDirectoryGroups(req, res, next) {
   try {
-    const allGroups = await Promise.all(stmts.getAllGroups.all().map(ensureGroupDisplayName));
-    allGroups.sort((a, b) => (a.group_name || '').localeCompare(b.group_name || '', 'es', { sensitivity: 'base' }));
-
     const requestedPage = toPositiveInt(req.query.p, 1);
-    const totalPages = Math.max(1, Math.ceil(allGroups.length / DIRECTORY_PAGE_SIZE));
+    const total = stmts.countDirectoryGroups.get().total;
+    const totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
     const page = Math.min(requestedPage, totalPages);
     const offset = (page - 1) * DIRECTORY_PAGE_SIZE;
-    const groups = allGroups.slice(offset, offset + DIRECTORY_PAGE_SIZE);
+    const groups = await ensureGroupDisplayNames(
+      stmts.getDirectoryGroupsPage.all(DIRECTORY_PAGE_SIZE, offset)
+    );
+    const nameCollator = new Intl.Collator('es', { sensitivity: 'base' });
+    groups.sort((a, b) =>
+      nameCollator.compare(a.group_name || '', b.group_name || '') || a.group_id.localeCompare(b.group_id)
+    );
 
     res.json({
       page,
       totalPages,
-      total: allGroups.length,
+      total,
       pageSize: DIRECTORY_PAGE_SIZE,
       groups: groups.map((g) => ({ id: g.group_id, name: g.group_name, unseenCount: g.unseen_count })),
     });
@@ -166,7 +172,13 @@ function buildAttachmentInfo(message) {
       case 'ptt':
       case 'audio':
       case 'video':
-        return { kind: type, fileName: message.file_name || null, durationSec: message.duration_sec || null, downloadUrl };
+        return {
+          kind: type,
+          fileName: message.file_name || null,
+          durationSec: message.duration_sec || null,
+          downloadUrl,
+          ...(type === 'video' && message.file_path_thumb ? { thumbUrl: message.file_path_thumb } : {}),
+        };
       case 'document':
         return { kind: 'document', fileName: message.file_name || null, durationSec: null, downloadUrl };
       case 'location':

@@ -1,12 +1,18 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { client, sendWhatsappSeen, resolveContactPhone } from '../services/whatsapp.service.js';
+import { client, sendWhatsappSeen, resolveContactPhone, syncChatUnreadCountFromWhatsapp } from '../services/whatsapp.service.js';
 import { resolveMediaFsPath, safeUnlink } from '../services/cleanup.service.js';
+import {
+  CONTACT_NAME_PRIORITY,
+  formatWhatsappIdentifier,
+  getContactDisplayName,
+} from '../utils/contact-display-name.js';
 import {
   DIRECTORY_PAGE_SIZE,
   MESSAGE_PAGE_SIZE,
   escapeXml,
   formatPhoneNumber,
+  getMessageDateInfo,
   buildMemberColorMap,
   getLetterBucket,
   getMemberColor,
@@ -15,12 +21,13 @@ import {
   renderAckLabel,
   renderList,
   renderMediaLine,
+  renderMessageDateSeparator,
   renderMentions,
   renderPollLine,
   renderNumberedPager,
   renderPager,
   renderPhoneLink,
-  renderReplyLink,
+  renderMessageActions,
   sendInvalidEntity,
   sendMissingEntity,
   sendPage,
@@ -165,21 +172,63 @@ export async function ensureGroupDisplayName(group) {
   return group;
 }
 
+export async function ensureGroupDisplayNames(groups) {
+  const resolved = [];
+  for (let offset = 0; offset < groups.length; offset += 6) {
+    const batch = groups.slice(offset, offset + 6);
+    resolved.push(...await Promise.all(batch.map(ensureGroupDisplayName)));
+  }
+  return resolved;
+}
+
+// La lista de participantes no debe depender de que alguien haya escrito antes
+// en el grupo. Se actualiza al abrirla para que un contacto recién guardado
+// reemplace enseguida su perfil o teléfono en la base local.
+async function resolveParticipantDisplayName(chatId, storedUser) {
+  if (!chatId) return 'Desconocido';
+
+  try {
+    const contact = client ? await client.getContactById(chatId) : null;
+    const contactName = getContactDisplayName(contact);
+    if (contactName) {
+      stmts.upsertUserNameIfPreferred.run(chatId, contactName.name, contactName.priority);
+      return contactName.name;
+    }
+  } catch (err) {
+    console.debug(`[grupo] No se pudo resolver el contacto ${chatId}:`, err?.message || err);
+  }
+
+  // Un nombre de agenda o perfil ya conocido sigue siendo preferible al teléfono
+  // si WhatsApp no puede responder temporalmente.
+  if (storedUser?.username && storedUser.name_priority >= CONTACT_NAME_PRIORITY.PROFILE_NAME) {
+    return storedUser.username;
+  }
+
+  const personalPhone = await resolveContactPhone(chatId);
+  if (personalPhone) {
+    stmts.upsertUserNameIfPreferred.run(chatId, personalPhone, CONTACT_NAME_PRIORITY.PERSONAL_PHONE);
+    return personalPhone;
+  }
+
+  if (storedUser?.username) return storedUser.username;
+  return formatWhatsappIdentifier(chatId);
+}
+
 export async function listGroups(req, res, next) {
   try {
-    // Resolvemos los nombres pendientes ANTES de ordenar, para que el orden alfabético
-    // y las cabeceras de letra reflejen el nombre real y no el ID/JID en crudo.
-    const allGroups = await Promise.all(stmts.getAllGroups.all().map(ensureGroupDisplayName));
-    allGroups.sort((a, b) =>
-      (a.group_name || '').localeCompare(b.group_name || '', 'es', { sensitivity: 'base' })
-    );
-
     const requestedPage = toPositiveInt(req.query.p, 1);
-    const totalPages = Math.max(1, Math.ceil(allGroups.length / DIRECTORY_PAGE_SIZE));
+    const total = stmts.countDirectoryGroups.get().total;
+    const totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
     const page = Math.min(requestedPage, totalPages);
     const offset = (page - 1) * DIRECTORY_PAGE_SIZE;
 
-    const resolvedGroups = allGroups.slice(offset, offset + DIRECTORY_PAGE_SIZE);
+    const resolvedGroups = await ensureGroupDisplayNames(
+      stmts.getDirectoryGroupsPage.all(DIRECTORY_PAGE_SIZE, offset)
+    );
+    const nameCollator = new Intl.Collator('es', { sensitivity: 'base' });
+    resolvedGroups.sort((a, b) =>
+      nameCollator.compare(a.group_name || '', b.group_name || '') || a.group_id.localeCompare(b.group_id)
+    );
 
     const body =
       '<h1>Grupos</h1>' +
@@ -226,7 +275,8 @@ export async function showGroupMessages(req, res, next) {
       return;
     }
 
-    const group = await ensureGroupDisplayName(groupRows);
+    await syncChatUnreadCountFromWhatsapp(groupId);
+    const group = await ensureGroupDisplayName(stmts.getGroupById.get(groupId) || groupRows);
     const unseenCount = group.unseen_count;
 
     stmts.resetGroupUnseen.run(groupId);
@@ -255,14 +305,20 @@ export async function showGroupMessages(req, res, next) {
     if (messages.length === 0) {
       messagesHtml = '<p>Sin mensajes.</p>';
     } else {
+      let previousDate = null;
       for (let index = 0; index < messages.length; index += 1) {
         const message = messages[index];
         const isNew = index < newMessageCount;
         const unseenMarker = isNew ? '<font color="#cc0000">[!]</font> ' : '';
         const sentAt = formatHourSend(message.hour_send);
+        const dateInfo = getMessageDateInfo(message);
+        const dateSeparator = dateInfo?.label && dateInfo.key !== previousDate
+          ? renderMessageDateSeparator(dateInfo.label)
+          : '';
+        if (dateInfo) previousDate = dateInfo.key;
 
         if (Number(message.is_system) === 1) {
-          messagesHtml += `<p align="center">${unseenMarker}<i><font size="1" color="#888888">${escapeXml(sentAt)} — ${renderMentions(message.text)}</font></i></p>`;
+          messagesHtml += `${dateSeparator}<p align="center">${unseenMarker}<i><font size="1" color="#888888">${escapeXml(sentAt)} — ${renderMentions(message.text)}</font></i></p>`;
           continue;
         }
 
@@ -271,9 +327,7 @@ export async function showGroupMessages(req, res, next) {
           ? renderPollLine(message, stmts.getPollOptionCountsByMessageId.all(message.id), { linkToDetail: `/mensaje/${message.id}` })
           : null;
         let contentPart;
-        if (Number(message.is_deleted) === 1) {
-          contentPart = `<i><font color="#888888">${escapeXml(message.text)}</font></i>`;
-        } else if (mediaLine) {
+        if (mediaLine) {
           contentPart = mediaLine;
         } else if (pollLine) {
           contentPart = pollLine;
@@ -284,14 +338,18 @@ export async function showGroupMessages(req, res, next) {
         } else {
           contentPart = renderMentions(message.text);
         }
-        const editedTag = (Number(message.is_deleted) !== 1 && Number(message.is_edited) === 1)
-          ? ' <font size="1" color="#888888">(editado)</font>'
-          : '';
+        // Un mensaje borrado se sigue mostrando, marcado en rojo como «(borrado)».
+        const editedTag = Number(message.is_deleted) === 1
+          ? ' <font size="1" color="#cc0000">(borrado)</font>'
+          : Number(message.is_edited) === 1
+            ? ' <font size="1" color="#888888">(editado)</font>'
+            : '';
 
         const isSaliente = Number(message.from_me) === 1;
         const fromMeMarker = isSaliente
           ? `<font color="#006600">[Yo]</font> ${renderAckLabel(message.ack_status)}`
           : '';
+        const messageActions = renderMessageActions(message, group.group_id, 'group');
 
         const senderColor = getMemberColor(message.user_chat_id, memberColorMap);
         const usernameLine = isSaliente
@@ -308,7 +366,7 @@ export async function showGroupMessages(req, res, next) {
         }
 
         messagesHtml +=
-          `<p>${unseenMarker}${fromMeMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font>${editedTag}${renderReplyLink(message, group.group_id, 'group')}<br/>` +
+          `${dateSeparator}<p>${unseenMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font>${editedTag}${messageActions}${messageActions && fromMeMarker ? '<br/>' : ''}${fromMeMarker}<br/>` +
           usernameLine +
           quotedBlock +
           `<font size="1" color="#000000">${contentPart}</font><br/>` +
@@ -378,19 +436,34 @@ export async function showGroupDetails(req, res, next) {
       return;
     }
 
-    // Resolver nombres locales de todos los participantes en una sola consulta,
-    // en vez de una llamada async por persona (un grupo puede tener decenas de gente).
+    // Partimos de la caché local, pero refrescamos los contactos en WhatsApp para
+    // que una persona desconocida muestre su perfil y un contacto recién añadido
+    // muestre el nombre de agenda sin esperar a que mande un mensaje.
     const ids = details.participants.map((p) => p.id).filter(Boolean);
     const namesByChatId = new Map();
     if (ids.length) {
       const placeholders = ids.map(() => '?').join(',');
       const rows = db
-        .prepare(`SELECT chat_id, username FROM users WHERE chat_id IN (${placeholders})`)
+        .prepare(`SELECT chat_id, username, name_priority FROM users WHERE chat_id IN (${placeholders})`)
         .all(...ids);
-      rows.forEach((r) => namesByChatId.set(r.chat_id, r.username));
+      const storedUsersByChatId = new Map(rows.map((r) => [r.chat_id, r]));
+
+      // Limitar la concurrencia evita saturar WhatsApp Web en grupos grandes.
+      for (let offset = 0; offset < ids.length; offset += 6) {
+        const batch = ids.slice(offset, offset + 6);
+        const refreshed = await Promise.all(batch.map(async (id) => [
+          id,
+          await resolveParticipantDisplayName(id, storedUsersByChatId.get(id)),
+        ]));
+        refreshed.forEach(([id, name]) => namesByChatId.set(id, name));
+      }
     }
 
     const resolveDisplay = (id) => namesByChatId.get(id) || formatPhoneNumber(id) || id;
+    if (details.owner && !namesByChatId.get(details.owner)) {
+      const ownerPhone = await resolveContactPhone(details.owner);
+      if (ownerPhone) namesByChatId.set(details.owner, ownerPhone);
+    }
 
     if (details.desc) {
       body += `<p>${escapeXml(details.desc)}</p>`;
@@ -432,7 +505,7 @@ export async function showGroupDetails(req, res, next) {
     const allPhoneIds = [...currentIds, ...pastParticipants.map((p) => p.chat_id)];
     const phoneEntries = await Promise.all(
       allPhoneIds.map(async (id) => {
-        const phone = id?.endsWith('@lid') ? await resolveContactPhone(id) : null;
+        const phone = id ? await resolveContactPhone(id) : null;
         return [id, phone || formatPhoneNumber(id)];
       })
     );

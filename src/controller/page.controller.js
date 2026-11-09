@@ -23,7 +23,9 @@ export function nl2br(value = '') {
 
 export function formatPhoneNumber(chatId = '', username = '') {
   if (!chatId && !username) return null;
-  const digitsFromChatId = chatId ? String(chatId).split('@')[0].replace(/[^0-9]/g, '') : '';
+  // Un @lid es un identificador interno de WhatsApp, no un teléfono: sus dígitos no se muestran.
+  const isLid = String(chatId || '').endsWith('@lid');
+  const digitsFromChatId = chatId && !isLid ? String(chatId).split('@')[0].replace(/[^0-9]/g, '') : '';
   const digitsFromUsername = username ? String(username).replace(/[^0-9]/g, '') : '';
 
   const digits = digitsFromChatId.length >= 8 ? digitsFromChatId : digitsFromUsername;
@@ -61,15 +63,75 @@ export function renderReplyLink(message, chatId, type) {
     return '';
   }
 
-  return `<a href="/mensaje/componer?to=${encodeURIComponent(chatId)}&amp;type=${type}&amp;replyTo=${message.id}" title="Responder a este mensaje" style="display:inline-block; padding:5px; vertical-align:middle;"><span style="display:block; width:10px; height:10px; overflow:hidden;"><img src="/assets/Chat.png" alt="Responder" width="12" height="12" style="position:relative; left:-28px; top:-67px;"/></span></a>`;
+  return `<a href="/mensaje/componer?to=${encodeURIComponent(chatId)}&amp;type=${type}&amp;replyTo=${message.id}" title="Responder a este mensaje" style="display:inline-block; padding:0; vertical-align:middle;"><span style="display:block; width:10px; height:10px; overflow:hidden;"><img src="/assets/Chat.png" alt="Responder" width="12" height="12" style="position:relative; left:-28px; top:-67px;"/></span></a>`;
+}
+
+export function renderReadLink(message) {
+  if (
+    Number(message.from_me) !== 1 ||
+    !message.whatsapp_msg_id ||
+    Number(message.is_deleted) === 1 ||
+    Number(message.is_system) === 1
+  ) {
+    return '';
+  }
+
+  return `<a href="/mensaje/${message.id}/leidos" title="Ver quién ha leído este mensaje" style="display:inline-block; padding:0; vertical-align:middle;"><img src="/assets/Eye.png" alt="Leídos" width="12" height="12" style="vertical-align:middle;"/></a>`;
+}
+
+export function renderMessageActions(message, chatId, type) {
+  const readLink = renderReadLink(message);
+  const replyLink = renderReplyLink(message, chatId, type);
+  const actions = readLink + replyLink;
+  return actions
+    ? `<nobr style="vertical-align:middle;"> ${actions}</nobr>`
+    : '';
+}
+
+export function getMessageDateInfo(message) {
+  const dateMatch = String(message?.day_send || message?.hour_send || '')
+    .match(/(\d{4}-\d{2}-\d{2})/);
+  if (!dateMatch) return null;
+
+  const dateKey = dateMatch[1];
+  const [year, month, day] = dateKey.split('-').map(Number);
+  const todayParts = new Intl.DateTimeFormat('en', {
+    timeZone: 'Europe/Madrid',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const today = Object.fromEntries(todayParts.map(({ type, value }) => [type, value]));
+  const todayKey = `${today.year}-${today.month}-${today.day}`;
+  const dayDifference = (Date.parse(`${todayKey}T00:00:00Z`) - Date.parse(`${dateKey}T00:00:00Z`)) / 86400000;
+
+  let label;
+  if (dayDifference === 0) {
+    label = null; // Hoy: sin separador
+  } else if (dayDifference === 1) {
+    label = 'Ayer';
+  } else {
+    label = new Intl.DateTimeFormat('es-ES', {
+      day: 'numeric',
+      month: 'long',
+      ...(String(year) !== today.year ? { year: 'numeric' } : {}),
+      timeZone: 'UTC',
+    }).format(new Date(Date.UTC(year, month - 1, day, 12)));
+  }
+
+  return { key: dateKey, label };
+}
+
+export function renderMessageDateSeparator(label) {
+  return `<p align="center"><b><font size="1" color="#666666">${escapeXml(label)}</font></b></p>`;
 }
 
 export function renderAckLabel(ackStatus) {
   const ack = Number(ackStatus ?? 0);
-  if (ack === -1) return '<font color="#cc0000">[Error]</font> ';
-  if (ack >= 3) return '<font color="#0000cc">[Visto]</font> ';
-  if (ack === 2) return '<font color="#888888">[Entregado]</font> ';
-  return '<font color="#888888">[Enviado]</font> ';
+  if (ack === -1) return '<font color="#cc0000">[Error]:</font> ';
+  if (ack >= 3) return '<font color="#0000cc">[Visto]:</font> ';
+  if (ack === 2) return '<font color="#888888">[Entregado]:</font> ';
+  return '<font color="#888888">[Enviado]:</font> ';
 }
 
 function formatDurationLabel(seconds) {
@@ -80,7 +142,37 @@ function formatDurationLabel(seconds) {
 // message: fila con media_type, file_path_full, file_name, duration_sec (getUserMessagesPaginated /
 // getGroupMessagesPaginated / getMessageByIdWithMedia). Devuelve null si no es un tipo de media nuevo
 // (imagen/sticker siguen su propio camino de render, sin pasar por aquí).
-export function renderMediaLine(message, { linkToDetail = null } = {}) {
+function toFileNamePart(value, maxLength = 18) {
+  return String(value || '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^A-Za-z0-9 ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength)
+    .trim();
+}
+
+// «Usuario (Grupo) Grabacion de voz 09-11 17h45.amr» — el usuario va delante para
+// reconocerlo de un vistazo en Tonos. La fecha corta al final evita que dos audios
+// de la misma persona tengan el mismo nombre (el Nokia pediría sustituir el anterior).
+export function buildAudioFileName(message) {
+  const kind = message.media_type === 'ptt' ? 'Grabacion de voz' : 'Audio';
+  const sender = Number(message.from_me) === 1 ? 'Yo' : (toFileNamePart(message.username) || 'Desconocido');
+  const group = message.group_id ? toFileNamePart(message.group_name) : '';
+  const who = group ? `${sender} (${group})` : sender;
+  const stamp = String(message.hour_send || message.day_send || '').match(/\d{4}-(\d{2})-(\d{2})(?:\s+(\d{2}):(\d{2}))?/);
+  const when = stamp ? `${stamp[2]}-${stamp[1]}${stamp[3] ? ` ${stamp[3]}h${stamp[4]}` : ''}` : '';
+  return [who, kind, when].filter(Boolean).join(' ') + '.amr';
+}
+
+// [Escuchar] apunta a un descriptor OMA Download (.dd). El Nokia 6111 (S40 3ª ed.)
+// ignora Content-Disposition y la URL al nombrar descargas («File.amr»), pero sí usa
+// el <name> del descriptor. Probado: no reproduce audio incrustado con <object>.
+function renderAudioActions(message) {
+  return `<a href="/mensaje/${message.id}/escuchar.dd">[Escuchar]</a>`;
+}
+
+export function renderMediaLine(message, { linkToDetail = null, showPreview = true } = {}) {
   const type = message?.media_type;
   if (!type) return null;
 
@@ -91,11 +183,11 @@ export function renderMediaLine(message, { linkToDetail = null } = {}) {
   switch (type) {
     case 'ptt':
       label = `Nota de voz${dur}`;
-      actionHtml = fileName ? `<a href="/descargar/${escapeXml(fileName)}">[Escuchar]</a>` : '';
+      actionHtml = fileName && message.id ? renderAudioActions(message) : '';
       break;
     case 'audio':
       label = `Audio${dur}`;
-      actionHtml = fileName ? `<a href="/descargar/${escapeXml(fileName)}">[Escuchar]</a>` : '';
+      actionHtml = fileName && message.id ? renderAudioActions(message) : '';
       break;
     case 'video':
       label = `Video${dur}`;
@@ -118,7 +210,10 @@ export function renderMediaLine(message, { linkToDetail = null } = {}) {
   }
 
   const verLink = linkToDetail ? ` <a href="${escapeXml(linkToDetail)}">[Ver]</a>` : '';
-  return `<i>[${label}]</i> ${actionHtml}${verLink}`;
+  const preview = type === 'video' && showPreview && message.file_path_thumb
+    ? `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="Video"/> `
+    : '';
+  return `${preview}<i>[${label}]</i> ${actionHtml}${verLink}`;
 }
 
 // message: fila con media_type === 'poll' y text = "[Encuesta] <pregunta>" (puesto por

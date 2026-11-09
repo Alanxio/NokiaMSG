@@ -100,6 +100,36 @@ export async function sendSmsNotification(payload) {
   return sendRawSms(config, smsText);
 }
 
+export async function sendCallSmsNotification(payload) {
+  const config = getSmsConfig();
+  const status = getSmsNotificationStatus();
+
+  if (!status.enabled) {
+    return { status: status.status, missing: status.missing };
+  }
+
+  const name = normalizeAsciiText(
+    payload.name,
+    payload.type === 'group' ? 'Grupo de WhatsApp' : 'Desconocido'
+  );
+  const phoneDigits = typeof payload.phoneNumber === 'string'
+    ? payload.phoneNumber.replace(/\D/g, '')
+    : '';
+  const phoneNumber = phoneDigits.length >= 8 && phoneDigits.length <= 15
+    ? `+${phoneDigits}`
+    : '';
+  const phoneSuffix = phoneNumber && name.replace(/\D/g, '') !== phoneDigits
+    ? ` (${phoneNumber})`
+    : '';
+  const videoText = payload.isVideo ? ' por videollamada' : '';
+
+  const smsText = payload.type === 'group'
+    ? `Este grupo ha hecho una llamada grupal${payload.isVideo ? ' de video' : ''}: ${name}`
+    : `Este usuario te ha llamado${videoText}: ${name}${phoneSuffix}`;
+
+  return sendRawSms(config, smsText);
+}
+
 // Alerta genérica de infraestructura (p.ej. WhatsApp lleva mucho desconectado) — mismo canal
 // Twilio ya configurado, sin el enlace al chat que sí lleva sendSmsNotification.
 export async function sendInfraAlertSms(text) {

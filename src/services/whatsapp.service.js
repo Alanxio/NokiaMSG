@@ -9,11 +9,23 @@ import { marcarNovedad } from './polling.service.js';
 import { resolveMentions } from '../utils/mentions.js';
 import { saveImageVersions, processSticker, saveRawMediaFile } from '../utils/media.js';
 import { resolvePendingGroupNames, resolveGroupNameFromWhatsapp } from '../controller/group.controller.js';
-import { takePendingOutgoing } from './pending-outgoing.service.js';
-import { sendInfraAlertSms } from './sms-notification.service.js';
+import {
+  rememberPendingOutgoingAck,
+  registerObservedOutgoing,
+  takePendingOutgoing,
+  takePendingOutgoingAck,
+} from './pending-outgoing.service.js';
+import { sendCallSmsNotification, sendInfraAlertSms } from './sms-notification.service.js';
+import { queueAudioTranscription } from './audio-transcription.service.js';
+import { isViewOnceMessage } from '../utils/view-once.js';
+import {
+  CONTACT_NAME_PRIORITY,
+  formatWhatsappIdentifier,
+  getContactDisplayName,
+} from '../utils/contact-display-name.js';
 import { getMessageQuotePreview } from '../utils/message-preview.js';
 
-const { Client, LocalAuth } = pkg;
+const { Client, LocalAuth, Message } = pkg;
 
 const AUTH_DATA_PATH = '.wwebjs_auth';
 const RECONNECT_BASE_DELAY = 5000;
@@ -39,6 +51,8 @@ let disconnectAlertTimer = null;
 let disconnectAlertSent = false;
 
 const activeChatsSinceStart = new Set();
+const directMessageListenerPages = new WeakMap();
+const directMessageListenerRetries = new WeakMap();
 
 function getSerializedId(value) {
   if (typeof value === 'string') return value;
@@ -72,21 +86,25 @@ export async function resolveContactPhone(chatId) {
   if (!client || !chatId || typeof chatId !== 'string') return null;
   const cleanChatId = chatId.trim();
 
-  try {
-    if (cleanChatId.endsWith('@lid') && typeof client.getContactLidAndPhone === 'function') {
-      const [result] = await client.getContactLidAndPhone([cleanChatId]);
-      const rawPhone = result?.pn && typeof result.pn === 'string'
-        ? result.pn
-        : result?.pn?._serialized;
-      if (rawPhone) {
-        const digits = String(rawPhone).replace(/[^0-9]/g, '');
-        if (digits.length >= 8) {
-          return `+${digits}`;
-        }
-      }
-    }
+  const toPhoneNumber = (value) => {
+    const digits = String(value || '').replace(/[^0-9]/g, '');
+    return digits.length >= 8 && digits.length <= 15 ? `+${digits}` : null;
+  };
 
-    if (typeof client.getContactById === 'function') {
+  // Resolver primero el PN personal de WhatsApp, también cuando el chat ya viene
+  // identificado por número: el número del JID/contacto puede ser empresarial.
+  if (typeof client.getContactLidAndPhone === 'function') {
+    try {
+      const [result] = await client.getContactLidAndPhone([cleanChatId]);
+      const personalPhone = toPhoneNumber(result?.pn?._serialized || result?.pn);
+      if (personalPhone) return personalPhone;
+    } catch (err) {
+      console.debug(`[whatsapp] No se pudo resolver el teléfono personal de ${cleanChatId}:`, err?.message || err);
+    }
+  }
+
+  if (typeof client.getContactById === 'function') {
+    try {
       const contact = await client.getContactById(cleanChatId);
       if (contact) {
         const candidateNumbers = [];
@@ -98,7 +116,7 @@ export async function resolveContactPhone(chatId) {
             const formatted = await contact.getFormattedNumber();
             if (formatted) candidateNumbers.push(formatted);
           } catch {
-            // Ignorar error de formato
+            // Ignorar error de formato y probar los siguientes datos de contacto.
           }
         }
         if (typeof contact.id === 'object' && contact.id?._serialized) {
@@ -106,16 +124,13 @@ export async function resolveContactPhone(chatId) {
         }
 
         for (const candidate of candidateNumbers) {
-          if (!candidate) continue;
-          const digits = String(candidate).replace(/[^0-9]/g, '');
-          if (digits.length >= 8) {
-            return `+${digits}`;
-          }
+          const phoneNumber = toPhoneNumber(candidate);
+          if (phoneNumber) return phoneNumber;
         }
       }
+    } catch (err) {
+      console.debug(`[whatsapp] No se pudo consultar el número de ${cleanChatId}:`, err?.message || err);
     }
-  } catch {
-    // Ignorar cualquier error de resolución del contacto.
   }
 
   return null;
@@ -244,6 +259,102 @@ async function attachDirectUnreadCountListener() {
   }
 }
 
+async function attachDirectMessageListener() {
+  if (!client?.pupPage) return;
+  const page = client.pupPage;
+  const existingSetup = directMessageListenerPages.get(page);
+  if (existingSetup) return existingSetup;
+
+  const setup = (async () => {
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      if (client?.pupPage !== page || page.isClosed()) return false;
+
+      const bindingExists = await page.evaluate(
+        () => typeof window.onNokiaDirectMessageAdded === 'function'
+      );
+      if (!bindingExists) {
+        await page.exposeFunction('onNokiaDirectMessageAdded', async (data) => {
+          try {
+            const messageId = getWhatsappMessageId(data);
+            if (!messageId || data?.id?.fromMe || stmts.findMessageByWhatsappId.get(messageId)) return;
+
+            await new Promise((resolve) => setTimeout(resolve, 5000));
+            if (stmts.findMessageByWhatsappId.get(messageId) || !client) return;
+
+            const message = new Message(client, data);
+            client.emit('message_create', message);
+          } catch (err) {
+            console.error('[whatsapp] Error reenviando mensaje desde listener directo:', err?.stack || err?.message || err);
+          }
+        });
+      }
+
+      const recoveredMessages = await page.evaluate((cutoff) => {
+        const { Msg } = window.require('WAWebCollections');
+        if (!window.__nokiaDirectMessageListener) {
+          Msg.on('add', (msg) => {
+            if (!msg.isNewMsg || msg.id?.fromMe) return;
+            window.onNokiaDirectMessageAdded(window.WWebJS.getMessageModel(msg));
+          });
+          window.__nokiaDirectMessageListener = true;
+        }
+
+        if (window.__nokiaRecentMessagesRecovered) return [];
+        window.__nokiaRecentMessagesRecovered = true;
+        return Msg.getModelsArray()
+          .filter((msg) => msg.isNewMsg && !msg.id?.fromMe && Number(msg.t) >= cutoff)
+          .sort((a, b) => Number(a.t) - Number(b.t))
+          .slice(-500)
+          .map((msg) => window.WWebJS.getMessageModel(msg));
+      }, Math.floor(Date.now() / 1000) - 24 * 60 * 60);
+
+      if (recoveredMessages.length > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        let recoveredCount = 0;
+        for (const data of recoveredMessages) {
+          const messageId = getWhatsappMessageId(data);
+          if (!messageId || data?.id?.fromMe || stmts.findMessageByWhatsappId.get(messageId)) continue;
+
+          const message = new Message(client, data);
+          message.isNokiaBackfill = true;
+          client.emit('message_create', message);
+          recoveredCount += 1;
+        }
+        if (recoveredCount > 0) {
+          console.log(`[whatsapp] Recuperando ${recoveredCount} mensajes recientes no guardados.`);
+        }
+      }
+      console.log('[whatsapp] Listener directo de mensajes adjuntado.');
+      return true;
+    } catch (err) {
+      console.error('[whatsapp] No se pudo adjuntar el listener directo de mensajes:', err?.stack || err?.message || err);
+      return false;
+    }
+  })();
+
+  directMessageListenerPages.set(page, setup);
+  const attached = await setup;
+  if (attached) {
+    directMessageListenerRetries.delete(page);
+    return;
+  }
+
+  directMessageListenerPages.delete(page);
+  const retries = directMessageListenerRetries.get(page) || 0;
+  if (retries < 2 && connectionStatus === 'connected') {
+    directMessageListenerRetries.set(page, retries + 1);
+    const retryTimer = setTimeout(() => {
+      if (client?.pupPage) {
+        attachDirectMessageListener().catch((err) => {
+          console.error('[whatsapp] Error reintentando listener directo de mensajes:', err?.message || err);
+        });
+      }
+    }, 3000);
+    retryTimer.unref?.();
+  }
+}
+
 export async function syncUnreadCountsFromWhatsapp() {
   if (!client || connectionStatus !== 'connected') return;
   try {
@@ -255,6 +366,25 @@ export async function syncUnreadCountsFromWhatsapp() {
   } catch (err) {
     console.warn('[whatsapp] Error sincronizando unread counts:', err.message);
   }
+}
+
+export async function syncChatUnreadCountFromWhatsapp(chatId) {
+  if (!chatId || !client || connectionStatus !== 'connected') return false;
+
+  const chats = await getChatUnreadSummariesDirectly();
+  const chat = chats.find((entry) => entry.id === chatId);
+  if (!chat) return false;
+
+  await applyChatUnreadCount(chat);
+  return true;
+}
+
+export function syncOutgoingMessageAck(whatsappMsgId, initialAck = 0) {
+  if (!whatsappMsgId) return;
+  const pendingAck = takePendingOutgoingAck(whatsappMsgId);
+  const ack = Math.max(Number(initialAck) || 0, Number(pendingAck) || 0);
+  if (ack <= 0) return;
+  stmts.updateMessageAckByWhatsappId.run(ack, whatsappMsgId, ack);
 }
 
 function delay(ms) {
@@ -354,6 +484,7 @@ export async function startWhatsappClient(processMessageFn) {
 
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: AUTH_DATA_PATH }),
+    webVersionCache: { type: 'none' },
     puppeteer: {
       headless: 'shell',
       args: [
@@ -459,6 +590,7 @@ export async function startWhatsappClient(processMessageFn) {
           currentQr = null;
           reconnectAttempts = 0;
           try { writeFileSync('assets/qr.png', ''); } catch { }
+          await attachDirectMessageListener();
         }
         if (pollCount >= MAX_POLLS) {
           clearInterval(readyPollInterval);
@@ -504,6 +636,11 @@ export async function startWhatsappClient(processMessageFn) {
     if (authReadyTimer) { clearTimeout(authReadyTimer); authReadyTimer = null; }
     if (readyPollInterval) { clearInterval(readyPollInterval); readyPollInterval = null; }
     console.log('[whatsapp] Cliente conectado y listo.');
+    try {
+      console.log(`[whatsapp] Versión de WhatsApp Web: ${await client.getWWebVersion()}`);
+    } catch (error) {
+      console.warn('[whatsapp] No se pudo consultar la versión de WhatsApp Web:', error?.message || error);
+    }
     connectionStatus = 'connected';
     lastStatusChange = new Date().toISOString();
     currentQr = null;
@@ -553,6 +690,7 @@ export async function startWhatsappClient(processMessageFn) {
     // (marcar como leído en el móvil) llegue también a los chats afectados por el bug
     // de getChatById, sin esperar a la próxima reconexión.
     await attachDirectUnreadCountListener();
+    await attachDirectMessageListener();
     // Reintentar la resolución de nombres de grupo que quedaron como ID/placeholder
     // (p. ej. porque fallaron en su momento al no estar el chat aún cacheado).
     try {
@@ -604,7 +742,12 @@ export async function startWhatsappClient(processMessageFn) {
     try {
       const whatsappMsgId = getWhatsappMessageId(message);
       if (!whatsappMsgId) return;
-      stmts.updateMessageAckByWhatsappId.run(ack, whatsappMsgId, ack);
+      const localMessage = stmts.findMessageByWhatsappId.get(whatsappMsgId);
+      if (localMessage) {
+        stmts.updateMessageAckByWhatsappId.run(ack, whatsappMsgId, ack);
+      } else {
+        rememberPendingOutgoingAck(whatsappMsgId, ack);
+      }
     } catch (e) {
       console.error('[whatsapp] Error actualizando estado de mensaje (ack):', e.message);
     }
@@ -618,7 +761,7 @@ export async function startWhatsappClient(processMessageFn) {
     try {
       const whatsappMsgId = message?.id?._serialized || null;
       if (!whatsappMsgId) return;
-      stmts.markMessageDeleted.run('[Mensaje eliminado]', whatsappMsgId);
+      stmts.markMessageDeleted.run(whatsappMsgId); // conserva el texto original
     } catch (e) {
       console.error('[whatsapp] Error marcando mensaje eliminado (everyone):', e.message);
     }
@@ -628,7 +771,7 @@ export async function startWhatsappClient(processMessageFn) {
     try {
       const whatsappMsgId = message?.id?._serialized || null;
       if (!whatsappMsgId) return;
-      stmts.markMessageDeleted.run('[Mensaje eliminado]', whatsappMsgId);
+      stmts.markMessageDeleted.run(whatsappMsgId); // conserva el texto original
     } catch (e) {
       console.error('[whatsapp] Error marcando mensaje eliminado (me):', e.message);
     }
@@ -676,32 +819,60 @@ export async function startWhatsappClient(processMessageFn) {
   // llamado, igual que ya se hace con los stickers.
   client.on('call', async (call) => {
     try {
-      // Solo llamadas entrantes 1:1 — las salientes no necesitan aviso, y las de grupo se
-      // dejan fuera porque no está claro si call.from es el JID del grupo o del que llama.
-      if (call.fromMe || call.isGroup || !call.from) return;
+      if (call.fromMe || !call.from) return;
 
-      const callerChatId = call.from;
+      const isGroup = Boolean(call.isGroup);
+      const chatId = call.from;
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
       const pad = (n) => String(n).padStart(2, '0');
       const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
       const timeStr = `${dateStr} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 
-      const existingUser = stmts.getUserByChatId.get(callerChatId);
-      const callerName = existingUser?.username || callerChatId;
+      let chatName;
+      let phoneNumber = null;
+      if (isGroup) {
+        const existingGroup = stmts.getGroupById.get(chatId);
+        chatName = existingGroup?.group_name || null;
+        if (!chatName) {
+          try {
+            chatName = await resolveGroupNameFromWhatsapp(chatId);
+          } catch (err) {
+            console.warn(`[whatsapp] No se pudo resolver el nombre del grupo de llamada ${chatId}:`, err?.message || err);
+          }
+        }
+        chatName ||= 'Grupo de WhatsApp';
+      } else {
+        phoneNumber = await resolveContactPhone(chatId);
+        const caller = await resolveDisplayNameForChatId(chatId);
+        chatName = caller.name;
+        if (!phoneNumber && /@(c\.us|s\.whatsapp\.net)$/.test(chatId)) {
+          const digits = chatId.split('@')[0].replace(/\D/g, '');
+          if (digits.length >= 8 && digits.length <= 15) phoneNumber = `+${digits}`;
+        }
+      }
+
+      const message = isGroup
+        ? `Este grupo ha hecho una llamada grupal${call.isVideo ? ' de video' : ''}: ${chatName}`
+        : `Este usuario te ha llamado${call.isVideo ? ' por videollamada' : ''}: ${chatName}${phoneNumber ? ` (${phoneNumber})` : ''}`;
 
       const fakeReq = {
         body: {
-          title: callerName,
-          message: call.isVideo ? '[Videollamada]' : '[Llamada]',
+          title: chatName,
+          message,
           date: dateStr,
           time: timeStr,
-          chat_id: callerChatId,
-          sender_chat_id: callerChatId,
-          whatsapp_msg_id: `call_${call.id}`,
+          chat_id: chatId,
+          sender_chat_id: isGroup ? null : chatId,
+          whatsapp_msg_id: `call_${isGroup ? 'group' : 'user'}_${call.id}`,
           from_me: 0,
-          chat_type: 'user',
-          is_group: 0,
-          sender_name: callerName,
+          chat_type: isGroup ? 'group' : 'user',
+          is_group: isGroup ? 1 : 0,
+          sender_name: isGroup ? null : chatName,
+          group_name: isGroup ? chatName : null,
+          is_system: 1,
+          is_call: true,
+          is_video: Boolean(call.isVideo),
+          phone_number: phoneNumber,
         },
       };
       const mockRes = {
@@ -711,8 +882,17 @@ export async function startWhatsappClient(processMessageFn) {
         json(data) { this._json = data; },
       };
 
-      await saveInteraction(fakeReq, mockRes, () => {}, null);
-      console.log(`[whatsapp] 📞 Llamada${call.isVideo ? ' de video' : ''} registrada de ${callerChatId}`);
+      const messageId = await saveInteraction(
+        fakeReq,
+        mockRes,
+        (err) => {
+          if (err) console.error('[whatsapp] Error guardando notificación de llamada:', err.message || err);
+        },
+        null
+      );
+      if (messageId) {
+        console.log(`[whatsapp] 📞 Llamada${isGroup ? ' grupal' : ''}${call.isVideo ? ' de video' : ''} registrada en ${chatId}`);
+      }
     } catch (err) {
       console.error('[whatsapp] Error registrando llamada:', err.message);
     }
@@ -723,16 +903,45 @@ export async function startWhatsappClient(processMessageFn) {
   // is_system para que se renderice como notificación y no como si lo hubiera "dicho"
   // alguien. Un whatsapp_msg_id propio (no viene de WhatsApp para estos eventos) permite que
   // el UNIQUE + INSERT OR IGNORE ya existente descarte duplicados si el evento se repite.
-  function resolveDisplayNameForChatId(chatId) {
-    if (!chatId) return null;
+  async function resolveDisplayNameForChatId(chatId) {
+    if (!chatId) return { name: 'Desconocido', priority: 0 };
     const existing = stmts.getUserByChatId.get(chatId);
-    if (existing?.username) return existing.username;
+
+    // group_join suele traer un @lid. La tabla local todavía no conoce a esa
+    // persona, por lo que hay que consultar WhatsApp antes de mostrar el LID.
+    try {
+      const contact = await client.getContactById(chatId);
+      const contactName = getContactDisplayName(contact);
+      if (contactName) return contactName;
+    } catch (err) {
+      console.debug(`[whatsapp] No se pudo consultar el contacto ${chatId}:`, err?.message || err);
+    }
+
+    // Si WhatsApp no puede devolver el contacto en este instante, conservar el
+    // nombre de agenda/perfil que ya conocemos antes de caer a un teléfono.
+    if (existing?.username && existing.name_priority >= CONTACT_NAME_PRIORITY.PROFILE_NAME) {
+      return { name: existing.username, priority: existing.name_priority };
+    }
+
+    // Para los LID, getContactLidAndPhone devuelve el teléfono personal (pn)
+    // asociado. Es preferible a enseñar el identificador/número empresarial.
+    const personalPhone = await resolveContactPhone(chatId);
+    if (personalPhone) {
+      return { name: personalPhone, priority: CONTACT_NAME_PRIORITY.PERSONAL_PHONE };
+    }
+
+    if (existing?.username) {
+      return { name: existing.username, priority: existing.name_priority || 0 };
+    }
     const baseDigits = String(chatId).split('@')[0];
     if (baseDigits) {
       const byDigits = stmts.getUserByPhonePattern.get(`${baseDigits}@%`);
-      if (byDigits?.username) return byDigits.username;
+      if (byDigits?.username) return { name: byDigits.username, priority: 0 };
     }
-    return `+${baseDigits}`;
+    return {
+      name: formatWhatsappIdentifier(chatId),
+      priority: CONTACT_NAME_PRIORITY.BUSINESS_NUMBER,
+    };
   }
 
   // senderChatId/senderName: a quién se le atribuye la fila para la FK de
@@ -740,7 +949,7 @@ export async function startWhatsappClient(processMessageFn) {
   // persona real relacionada con el evento (quien entra/sale/asciende, o quien hizo el
   // cambio) para no crear usuarios fantasma; solo cae al placeholder "Sistema" si de verdad
   // no hay ningún JID real disponible para ese evento.
-  async function logGroupSystemMessage(groupId, text, dedupKey, senderChatId, senderName) {
+  async function logGroupSystemMessage(groupId, text, dedupKey, senderChatId, sender) {
     try {
       const groupName = (await resolveGroupNameFromWhatsapp(groupId))
         || stmts.getGroupById.get(groupId)?.group_name
@@ -763,7 +972,8 @@ export async function startWhatsappClient(processMessageFn) {
           chat_type: 'group',
           is_group: 1,
           group_name: groupName,
-          sender_name: senderName || 'Sistema',
+          sender_name: sender?.name || 'Sistema',
+          sender_name_priority: sender?.priority || 0,
           is_system: 1,
         },
       };
@@ -784,13 +994,13 @@ export async function startWhatsappClient(processMessageFn) {
       const groupId = notification.chatId;
       if (!groupId) return;
       for (const participantId of notification.recipientIds || []) {
-        const name = resolveDisplayNameForChatId(participantId);
+        const participant = await resolveDisplayNameForChatId(participantId);
         await logGroupSystemMessage(
           groupId,
-          `${name} ha entrado al grupo`,
+          `${participant.name} ha entrado al grupo`,
           `groupevent_join_${groupId}_${notification.timestamp}_${participantId}`,
           participantId,
-          name
+          participant
         );
       }
     } catch (err) {
@@ -804,14 +1014,14 @@ export async function startWhatsappClient(processMessageFn) {
       if (!groupId) return;
       const wasRemoved = notification.type === 'remove';
       for (const participantId of notification.recipientIds || []) {
-        const name = resolveDisplayNameForChatId(participantId);
-        const text = wasRemoved ? `${name} ha sido eliminado del grupo` : `${name} ha salido del grupo`;
+        const participant = await resolveDisplayNameForChatId(participantId);
+        const text = wasRemoved ? `${participant.name} ha sido eliminado del grupo` : `${participant.name} ha salido del grupo`;
         await logGroupSystemMessage(
           groupId,
           text,
           `groupevent_leave_${groupId}_${notification.timestamp}_${participantId}`,
           participantId,
-          name
+          participant
         );
       }
     } catch (err) {
@@ -825,14 +1035,14 @@ export async function startWhatsappClient(processMessageFn) {
       if (!groupId) return;
       const promoted = notification.type === 'promote';
       for (const participantId of notification.recipientIds || []) {
-        const name = resolveDisplayNameForChatId(participantId);
-        const text = promoted ? `${name} ahora es admin` : `${name} ya no es admin`;
+        const participant = await resolveDisplayNameForChatId(participantId);
+        const text = promoted ? `${participant.name} ahora es admin` : `${participant.name} ya no es admin`;
         await logGroupSystemMessage(
           groupId,
           text,
           `groupevent_admin_${groupId}_${notification.timestamp}_${participantId}`,
           participantId,
-          name
+          participant
         );
       }
     } catch (err) {
@@ -846,13 +1056,13 @@ export async function startWhatsappClient(processMessageFn) {
       if (!groupId) return;
       const dedupKey = `groupevent_update_${groupId}_${notification.type}_${notification.timestamp}`;
       const authorId = notification.author || null;
-      const authorName = authorId ? resolveDisplayNameForChatId(authorId) : null;
+      const author = authorId ? await resolveDisplayNameForChatId(authorId) : null;
       if (notification.type === 'subject') {
         const newName = (await resolveGroupNameFromWhatsapp(groupId)) || null;
         if (newName) stmts.upsertGroup.run(groupId, newName);
-        await logGroupSystemMessage(groupId, `El grupo ahora se llama "${newName || '?'}"`, dedupKey, authorId, authorName);
+        await logGroupSystemMessage(groupId, `El grupo ahora se llama "${newName || '?'}"`, dedupKey, authorId, author);
       } else if (notification.type === 'picture') {
-        await logGroupSystemMessage(groupId, 'El grupo ha cambiado la foto', dedupKey, authorId, authorName);
+        await logGroupSystemMessage(groupId, 'El grupo ha cambiado la foto', dedupKey, authorId, author);
       }
       // description/announce/restrict: se dejan fuera por ahora, poco relevantes para avisar.
     } catch (err) {
@@ -887,11 +1097,13 @@ export async function startWhatsappClient(processMessageFn) {
         || getSerializedId(msg.to)
         || getSerializedId(msg._data?.to);
       if (whatsappMsgId) {
+        let linkedRow = false;
         if (chatId) {
           const rowId = takePendingOutgoing(chatId);
           if (rowId) {
             try {
               stmts.setMessageWhatsappId.run(whatsappMsgId, rowId);
+              linkedRow = true;
               console.log(`[whatsapp] whatsapp_msg_id asignado a posteriori: fila local #${rowId} -> ${whatsappMsgId}`);
             } catch (err) {
               console.warn('[whatsapp] No se pudo enlazar whatsapp_msg_id:', err?.message);
@@ -899,8 +1111,11 @@ export async function startWhatsappClient(processMessageFn) {
           }
         }
         const currentAck = Number(msg.ack ?? msg._data?.ack);
-        if (Number.isFinite(currentAck) && currentAck > 0) {
-          stmts.updateMessageAckByWhatsappId.run(currentAck, whatsappMsgId, currentAck);
+        if (linkedRow || stmts.findMessageByWhatsappId.get(whatsappMsgId)) {
+          syncOutgoingMessageAck(whatsappMsgId, currentAck);
+        } else if (chatId) {
+          registerObservedOutgoing(chatId, whatsappMsgId);
+          rememberPendingOutgoingAck(whatsappMsgId, currentAck);
         }
       }
       console.log(`[whatsapp] Mensaje saliente omitido (ya guardado por validateAndCreateChat): ${whatsappMsgId}`);
@@ -910,13 +1125,18 @@ export async function startWhatsappClient(processMessageFn) {
     // IGNORAR BACKLOG: Omitimos mensajes con más de 5 minutos (300s) de antigüedad
     const nowInSeconds = Math.floor(Date.now() / 1000);
     const messageAge = nowInSeconds - msg.timestamp;
-    if (messageAge > 300) {
+    if (!msg.isNokiaBackfill && messageAge > 300) {
       console.log(`[whatsapp] ⏳ Mensaje omitido por antigüedad (backlog tras reconexión). Edad: ${messageAge}s, De: ${msg.from}`);
+      return;
+    }
+    if (msg.isNokiaBackfill && messageAge > 24 * 60 * 60) {
+      console.log(`[whatsapp] ⏳ Mensaje de recuperación omitido por antigüedad. Edad: ${messageAge}s, De: ${msg.from}`);
       return;
     }
 
     const esSticker = msg.hasMedia && msg.type === 'sticker';
     const esImagenReal = msg.hasMedia && msg.type === 'image';
+    const esFotoUnaVista = esImagenReal && isViewOnceMessage(msg);
     const esPtt = msg.hasMedia && msg.type === 'ptt';
     const esAudio = msg.hasMedia && msg.type === 'audio';
     const esVideo = msg.hasMedia && msg.type === 'video';
@@ -946,7 +1166,13 @@ export async function startWhatsappClient(processMessageFn) {
 
     let mediaInfo = null;
 
-    if (msg.hasMedia && esImagenReal) {
+    if (esFotoUnaVista) {
+      const caption = typeof msg.body === 'string' ? msg.body.trim() : '';
+      msg.body = caption
+        ? `[Foto de visualización única] ${caption}`
+        : '[Foto de visualización única]';
+      console.log(`[whatsapp] Foto de visualización única recibida de ${msg.from}; no se descargará.`);
+    } else if (msg.hasMedia && esImagenReal) {
       console.log(`[whatsapp] 📸 Detectado mensaje multimedia de ${msg.from}. Descargando...`);
       mediaInfo = await downloadAndProcessMedia(msg);
       if (!msg.body) {
@@ -1011,6 +1237,7 @@ export async function startWhatsappClient(processMessageFn) {
       const timeStr = `${dateStr} ${pad(localDate.getHours())}:${pad(localDate.getMinutes())}:${pad(localDate.getSeconds())}`;
 
       let title, senderName, groupName;
+      let senderNamePriority = 0;
 
       if (isGroup) {
         // chat?.name viene de msg.getChat(), que puede toparse con el mismo bug de
@@ -1019,18 +1246,32 @@ export async function startWhatsappClient(processMessageFn) {
         groupName = (await resolveGroupNameFromWhatsapp(chatId)) || chat?.name || chatId?.replace(/@.*$/, '') || 'Grupo sin nombre';
         try {
           const contact = await msg.getContact();
-          senderName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || msg.author?.replace(/@.*$/, '') || 'Desconocido';
+          const resolvedName = getContactDisplayName(contact);
+          const personalPhone = resolvedName ? null : await resolveContactPhone(msg.author);
+          senderName = resolvedName?.name || personalPhone || formatWhatsappIdentifier(msg.author);
+          senderNamePriority = resolvedName?.priority || (personalPhone
+            ? CONTACT_NAME_PRIORITY.PERSONAL_PHONE
+            : CONTACT_NAME_PRIORITY.BUSINESS_NUMBER);
         } catch {
-          senderName = msg.author?.replace(/@.*$/, '') || 'Desconocido';
+          const fallback = await resolveDisplayNameForChatId(msg.author);
+          senderName = fallback.name;
+          senderNamePriority = fallback.priority;
         }
         title = `${groupName}:${senderName}`;
       } else {
         groupName = null;
         try {
           const contact = await msg.getContact();
-          senderName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || msg.from.replace(/@.*$/, '') || 'Desconocido';
+          const resolvedName = getContactDisplayName(contact);
+          const personalPhone = resolvedName ? null : await resolveContactPhone(msg.from);
+          senderName = resolvedName?.name || personalPhone || formatWhatsappIdentifier(msg.from);
+          senderNamePriority = resolvedName?.priority || (personalPhone
+            ? CONTACT_NAME_PRIORITY.PERSONAL_PHONE
+            : CONTACT_NAME_PRIORITY.BUSINESS_NUMBER);
         } catch {
-          senderName = msg.from.replace(/@.*$/, '') || 'Desconocido';
+          const fallback = await resolveDisplayNameForChatId(msg.from);
+          senderName = fallback.name;
+          senderNamePriority = fallback.priority;
         }
         title = senderName;
       }
@@ -1101,6 +1342,7 @@ export async function startWhatsappClient(processMessageFn) {
           // grupo o del remitente contiene ese carácter).
           group_name: isGroup ? groupName : undefined,
           sender_name: senderName,
+          sender_name_priority: senderNamePriority,
           quoted_text: quotedText,
           quoted_sender: quotedSender,
           media_type: mediaType,
@@ -1158,7 +1400,14 @@ export async function startWhatsappClient(processMessageFn) {
           }
         }
       } else {
-        await saveInteraction(fakeReq, mockRes, logSaveInteractionError, mediaInfo);
+        const messageId = await saveInteraction(fakeReq, mockRes, logSaveInteractionError, mediaInfo);
+        if (
+          messageId &&
+          (mediaType === 'ptt' || mediaType === 'audio') &&
+          mediaInfo?.originalPath
+        ) {
+          queueAudioTranscription(messageId, mediaInfo.originalPath);
+        }
       }
 
       marcarNovedad(resolvedBody);
@@ -1304,86 +1553,114 @@ async function downloadAndProcessMedia(msg) {
 }
 
 async function downloadMediaWithFallback(msg) {
-  let primaryError = null;
-  const raw = msg.rawData || msg._data || {};
-  const expectedSize = Number(raw.size || msg.size);
-  const isCompleteMedia = (media) => {
-    if (!media?.data) return false;
-    return !Number.isFinite(expectedSize)
-      || expectedSize <= 0
-      || Buffer.byteLength(media.data, 'base64') >= expectedSize * 0.9;
-  };
+  const maxAttempts = 3;
+  let lastError = null;
 
-  try {
-    const media = await msg.downloadMedia();
-    if (isCompleteMedia(media)) return media;
-    if (media?.data && expectedSize > 0) {
-      primaryError = new Error(`descarga incompleta (${Buffer.byteLength(media.data, 'base64')}/${expectedSize} bytes)`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+      try {
+        await msg.reload();
+      } catch (reloadError) {
+        console.warn(`[whatsapp] No se pudieron refrescar los datos del media (intento ${attempt}):`, reloadError?.stack || reloadError);
+      }
     }
-  } catch (err) {
-    primaryError = err;
-  }
 
-  const descriptor = {
-    directPath: raw.directPath,
-    encFilehash: raw.encFilehash,
-    filehash: raw.filehash,
-    mediaKey: raw.mediaKey || msg.mediaKey,
-    mediaKeyTimestamp: raw.mediaKeyTimestamp,
-    type: raw.type || msg.type,
-    mimetype: raw.mimetype || msg.mimetype,
-    filename: raw.filename || msg.filename,
-    filesize: expectedSize || undefined,
-  };
+    const raw = msg.rawData || msg._data || {};
+    const expectedSize = Number(raw.size || msg.size);
+    const isCompleteMedia = (media) => {
+      if (!media?.data) return false;
+      return !Number.isFinite(expectedSize)
+        || expectedSize <= 0
+        || Buffer.byteLength(media.data, 'base64') >= expectedSize * 0.9;
+    };
 
-  if (!descriptor.directPath || !descriptor.mediaKey) {
-    if (primaryError) throw primaryError;
-    console.warn(`[whatsapp] Descarga de media vacía y faltan datos para el respaldo directo (tipo ${msg.type}).`);
-    return null;
-  }
-  if (!client?.pupPage) {
-    throw new Error('No hay una página de WhatsApp activa para la descarga directa.');
-  }
-
-  try {
-    const media = await client.pupPage.evaluate(async (details) => {
-      const downloadQpl = {
-        addAnnotations() { return this; },
-        addPoint() { return this; },
-      };
-      const data = await window
-        .require('WAWebDownloadManager')
-        .downloadManager.downloadAndMaybeDecrypt({
-          directPath: details.directPath,
-          encFilehash: details.encFilehash,
-          filehash: details.filehash,
-          mediaKey: details.mediaKey,
-          mediaKeyTimestamp: details.mediaKeyTimestamp,
-          type: details.type,
-          signal: new AbortController().signal,
-          downloadQpl,
-        });
-      return {
-        data: await window.WWebJS.arrayBufferToBase64Async(data),
-        mimetype: details.mimetype,
-        filename: details.filename,
-        filesize: details.filesize,
-      };
-    }, descriptor);
-    if (!isCompleteMedia(media)) {
-      const actualSize = media?.data ? Buffer.byteLength(media.data, 'base64') : 0;
-      throw new Error(`La descarga directa devolvió un archivo incompleto (${actualSize}/${expectedSize || '?'} bytes).`);
+    let primaryError = null;
+    try {
+      const media = await msg.downloadMedia();
+      if (isCompleteMedia(media)) return media;
+      if (media?.data && expectedSize > 0) {
+        primaryError = new Error(`descarga incompleta (${Buffer.byteLength(media.data, 'base64')}/${expectedSize} bytes)`);
+      }
+    } catch (error) {
+      primaryError = error;
     }
-    if (primaryError) {
-      console.warn(`[whatsapp] msg.downloadMedia falló (${primaryError.message}); se recuperó con descarga directa.`);
+
+    const descriptor = {
+      directPath: raw.directPath,
+      encFilehash: raw.encFilehash,
+      filehash: raw.filehash,
+      mediaKey: raw.mediaKey || msg.mediaKey,
+      mediaKeyTimestamp: raw.mediaKeyTimestamp,
+      type: raw.type || msg.type,
+      mimetype: raw.mimetype || msg.mimetype,
+      filename: raw.filename || msg.filename,
+      filesize: expectedSize || undefined,
+    };
+
+    if (!descriptor.directPath || !descriptor.mediaKey) {
+      if (primaryError) lastError = primaryError;
+      else {
+        console.warn(`[whatsapp] Descarga de media vacía y faltan datos para el respaldo directo (tipo ${msg.type}).`);
+        return null;
+      }
+    } else if (!client?.pupPage) {
+      lastError = new Error('No hay una página de WhatsApp activa para la descarga directa.');
+    } else {
+      try {
+        const media = await client.pupPage.evaluate(async (details) => {
+          const downloadQpl = {
+            addAnnotations() { return this; },
+            addPoint() { return this; },
+          };
+          const data = await window
+            .require('WAWebDownloadManager')
+            .downloadManager.downloadAndMaybeDecrypt({
+              directPath: details.directPath,
+              encFilehash: details.encFilehash,
+              filehash: details.filehash,
+              mediaKey: details.mediaKey,
+              mediaKeyTimestamp: details.mediaKeyTimestamp,
+              type: details.type,
+              signal: new AbortController().signal,
+              downloadQpl,
+            });
+          return {
+            data: await window.WWebJS.arrayBufferToBase64Async(data),
+            mimetype: details.mimetype,
+            filename: details.filename,
+            filesize: details.filesize,
+          };
+        }, descriptor);
+        if (!isCompleteMedia(media)) {
+          const actualSize = media?.data ? Buffer.byteLength(media.data, 'base64') : 0;
+          throw new Error(`La descarga directa devolvió un archivo incompleto (${actualSize}/${expectedSize || '?'} bytes).`);
+        }
+        if (primaryError) {
+          console.warn(`[whatsapp] msg.downloadMedia falló (${primaryError.message}); se recuperó con descarga directa.`);
+        }
+        return media;
+      } catch (fallbackError) {
+        lastError = new Error(
+          primaryError
+            ? `msg.downloadMedia: ${primaryError.message}; descarga directa: ${fallbackError.message}`
+            : fallbackError.message,
+          { cause: fallbackError }
+        );
+        lastError.primaryError = primaryError;
+      }
     }
-    return media;
-  } catch (fallbackError) {
-    const reason = primaryError
-      ? `msg.downloadMedia: ${primaryError.message}; descarga directa: ${fallbackError.message}`
-      : fallbackError.message;
-    throw new Error(`No se pudo descargar media (${msg.type}): ${reason}`, { cause: fallbackError });
+
+    if (attempt < maxAttempts) {
+      console.warn(`[whatsapp] Falló la descarga de media (${msg.type}, intento ${attempt}/${maxAttempts}); se reintentará:`, {
+        message: lastError?.message,
+        primaryError: lastError?.primaryError?.stack || lastError?.primaryError?.message,
+        cause: lastError?.cause?.stack || lastError?.cause?.message,
+      });
+    }
   }
+
+  throw new Error(`No se pudo descargar media (${msg.type}) tras ${maxAttempts} intentos: ${lastError?.message || 'error desconocido'}`, { cause: lastError });
 }
 
 const MEDIA_TYPE_LABELS = { ptt: 'Nota de voz', audio: 'Audio', video: 'Video' };
@@ -1422,7 +1699,12 @@ async function downloadAndProcessOtherMedia(msg, mediaType) {
       durationSec: msg.duration ? Math.round(Number(msg.duration)) : null,
     };
   } catch (err) {
-    console.error(`[whatsapp] Error downloadAndProcessOtherMedia (${mediaType}):`, err?.stack || err?.message || err);
+    console.error(`[whatsapp] Error downloadAndProcessOtherMedia (${mediaType}):`, {
+      message: err?.message,
+      stack: err?.stack,
+      primaryError: err?.primaryError?.stack || err?.primaryError?.message,
+      cause: err?.cause?.stack || err?.cause?.message,
+    });
     return null;
   }
 }

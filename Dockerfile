@@ -16,6 +16,12 @@ RUN apt-get update && apt-get install -y \
     libnspr4 \
     libnss3 \
     sqlite3 \
+    ffmpeg \
+    # El ffmpeg de Debian no trae codificador AMR: sox + opencore lo codifica
+    # para que las notas de voz se puedan reproducir en el Nokia.
+    sox \
+    libsox-fmt-all \
+    libopencore-amrnb0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Variables críticas de ejecución limpia para saltar compilaciones lentas de sharp

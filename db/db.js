@@ -10,10 +10,27 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 db.pragma('busy_timeout = 5000');
 
+const directoryNameReplacements = [
+  ['Á', 'a'], ['á', 'a'], ['É', 'e'], ['é', 'e'],
+  ['Í', 'i'], ['í', 'i'], ['Ó', 'o'], ['ó', 'o'],
+  ['Ú', 'u'], ['ú', 'u'], ['Ü', 'u'], ['ü', 'u'],
+  ['Ñ', 'n{'], ['ñ', 'n{'], ['Ç', 'c'], ['ç', 'c'],
+];
+function directoryNameSortKey(column) {
+  const translated = directoryNameReplacements.reduce(
+    (expression, [from, to]) => `replace(${expression}, '${from}', '${to}')`,
+    column
+  );
+  return `lower(${translated})`;
+}
+const userDirectorySortKey = directoryNameSortKey('username');
+const groupDirectorySortKey = directoryNameSortKey('group_name');
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     chat_id TEXT PRIMARY KEY,
     username TEXT,
+    name_priority INTEGER DEFAULT 0,
     unseen_count INTEGER DEFAULT 0
   );
 
@@ -82,6 +99,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_user_chat_id ON messages(user_chat_id);
   CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id);
   CREATE INDEX IF NOT EXISTS idx_messages_media_key ON messages(media_key);
+  DROP INDEX IF EXISTS idx_users_directory_order;
+  DROP INDEX IF EXISTS idx_groups_directory_order;
+  CREATE INDEX IF NOT EXISTS idx_users_directory_es_order
+    ON users(${userDirectorySortKey} COLLATE NOCASE, chat_id);
+  CREATE INDEX IF NOT EXISTS idx_groups_directory_es_order
+    ON wgroups(${groupDirectorySortKey} COLLATE NOCASE, group_id);
   CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments(message_id);
   CREATE INDEX IF NOT EXISTS idx_attachments_media_key ON attachments(media_key);
   CREATE INDEX IF NOT EXISTS idx_poll_options_message_id ON poll_options(message_id);
@@ -108,6 +131,11 @@ try {
 }
 try {
   db.exec(`ALTER TABLE users ADD COLUMN sms_muted INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN name_priority INTEGER DEFAULT 0`);
 } catch {
   // Columna ya existe, ignorar
 }
@@ -157,6 +185,11 @@ try {
   // Columna ya existe, ignorar
 }
 try {
+  db.exec(`ALTER TABLE messages ADD COLUMN transcription TEXT`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
   db.exec(`ALTER TABLE attachments ADD COLUMN duration_sec INTEGER`);
 } catch {
   // Columna ya existe, ignorar
@@ -169,8 +202,17 @@ export const stmts = {
     ON CONFLICT(chat_id) DO UPDATE SET username = excluded.username
   `),
 
+  // Un dato de menor calidad no debe reemplazar un contacto guardado previamente.
+  upsertUserNameIfPreferred: db.prepare(`
+    INSERT INTO users (chat_id, username, name_priority, unseen_count)
+    VALUES (?, ?, ?, 0)
+    ON CONFLICT(chat_id) DO UPDATE SET
+      username = CASE WHEN excluded.name_priority >= users.name_priority THEN excluded.username ELSE users.username END,
+      name_priority = MAX(users.name_priority, excluded.name_priority)
+  `),
+
   getUserByChatId: db.prepare(`
-    SELECT chat_id, username, unseen_count, sms_muted, sms_notified FROM users WHERE chat_id = ? LIMIT 1
+    SELECT chat_id, username, name_priority, unseen_count, sms_muted, sms_notified FROM users WHERE chat_id = ? LIMIT 1
   `),
 
   getUserByUsername: db.prepare(`
@@ -314,7 +356,7 @@ export const stmts = {
   `),
 
   markMessageDeleted: db.prepare(`
-    UPDATE messages SET text = ?, is_deleted = 1 WHERE whatsapp_msg_id = ?
+    UPDATE messages SET is_deleted = 1 WHERE whatsapp_msg_id = ?
   `),
 
   markMessageEdited: db.prepare(`
@@ -360,11 +402,12 @@ export const stmts = {
   getUserMessagesPaginated: db.prepare(`
     SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.ack_status,
            m.quoted_text, m.quoted_sender, m.whatsapp_msg_id, m.is_deleted, m.is_edited, m.is_system,
-           m.media_type,
-           g.group_name,
+           m.media_type, m.group_id, m.day_send,
+           g.group_name, u.username,
            a.file_path_thumb, a.file_path_full, a.file_name, a.duration_sec
     FROM messages m
     LEFT JOIN wgroups g ON g.group_id = m.group_id
+    LEFT JOIN users u ON u.chat_id = m.user_chat_id
     LEFT JOIN attachments a ON a.message_id = m.id
     WHERE m.user_chat_id = ? AND m.group_id IS NULL
     ORDER BY m.hour_send DESC, m.id DESC
@@ -374,11 +417,12 @@ export const stmts = {
   getGroupMessagesPaginated: db.prepare(`
     SELECT m.id, m.text, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.ack_status,
            m.quoted_text, m.quoted_sender, m.whatsapp_msg_id, m.is_deleted, m.is_edited, m.is_system,
-           m.media_type,
-           u.username, u.chat_id AS user_chat_id,
+           m.media_type, m.group_id, m.day_send,
+           u.username, u.chat_id AS user_chat_id, g.group_name,
            a.file_path_thumb, a.file_path_full, a.file_name, a.duration_sec
     FROM messages m
     LEFT JOIN users u ON u.chat_id = m.user_chat_id
+    LEFT JOIN wgroups g ON g.group_id = m.group_id
     LEFT JOIN attachments a ON a.message_id = m.id
     WHERE m.group_id = ?
     ORDER BY m.hour_send DESC, m.id DESC
@@ -431,6 +475,32 @@ export const stmts = {
     SELECT group_id, group_name, unseen_count FROM wgroups
   `),
 
+  countDirectoryUsers: db.prepare(`
+    SELECT COUNT(*) AS total FROM users u
+    WHERE EXISTS (
+      SELECT 1 FROM messages m WHERE m.user_chat_id = u.chat_id AND m.group_id IS NULL
+    )
+  `),
+
+  getDirectoryUsersPage: db.prepare(`
+    SELECT u.chat_id, u.username, u.unseen_count FROM users u
+    WHERE EXISTS (
+      SELECT 1 FROM messages m WHERE m.user_chat_id = u.chat_id AND m.group_id IS NULL
+    )
+    ORDER BY ${userDirectorySortKey} COLLATE NOCASE, u.chat_id
+    LIMIT ? OFFSET ?
+  `),
+
+  countDirectoryGroups: db.prepare(`
+    SELECT COUNT(*) AS total FROM wgroups
+  `),
+
+  getDirectoryGroupsPage: db.prepare(`
+    SELECT group_id, group_name, unseen_count FROM wgroups
+    ORDER BY ${groupDirectorySortKey} COLLATE NOCASE, group_id
+    LIMIT ? OFFSET ?
+  `),
+
   deleteMessagesOlderThan: db.prepare(`
     DELETE FROM messages WHERE hour_send IS NOT NULL AND hour_send <= ?
   `),
@@ -473,6 +543,10 @@ export const stmts = {
   insertAttachment: db.prepare(`
     INSERT INTO attachments (message_id, media_key, mime_type, file_name, file_size, file_path_full, file_path_view, file_path_thumb, duration_sec, album_order, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `),
+
+  saveMessageTranscription: db.prepare(`
+    UPDATE messages SET transcription = ? WHERE id = ?
   `),
 
   getLastMessageWithMedia: db.prepare(`
@@ -544,7 +618,7 @@ export const stmts = {
 
   getMessageByIdWithMedia: db.prepare(`
     SELECT m.id, m.text, m.day_send, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.media_key,
-           m.media_type, m.whatsapp_msg_id,
+           m.media_type, m.whatsapp_msg_id, m.transcription, m.is_deleted, m.is_system,
            u.username, u.chat_id AS user_chat_id,
            g.group_name, m.group_id,
            a.file_path_full, a.file_path_view, a.file_path_thumb, a.mime_type, a.file_name, a.duration_sec

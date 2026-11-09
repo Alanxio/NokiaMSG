@@ -209,6 +209,10 @@ http://localhost:8080/grupo/1
 http://localhost:8080/grupo/1?p=2
 ```
 
+### `GET /mensaje/:id/leidos`
+
+Consulta en WhatsApp quién ha leído un mensaje saliente y la hora de lectura disponible. Se accede desde el icono `Eye.png` que aparece junto a los mensajes salientes enviados. Requiere que WhatsApp esté conectado y que el mensaje siga disponible para consultar sus recibos.
+
 ### `POST /grupo/:id/mensaje`
 
 El bot envía un mensaje a un grupo específico e incrementa el contador de mensajes no vistos.

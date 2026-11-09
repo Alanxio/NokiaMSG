@@ -1,23 +1,25 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { getUsersPresence, sendWhatsappSeen, resolveContactPhone, getContactProfileInfo, getProfilePicUrlFresh } from '../services/whatsapp.service.js';
+import { getUsersPresence, sendWhatsappSeen, resolveContactPhone, getContactProfileInfo, getProfilePicUrlFresh, syncChatUnreadCountFromWhatsapp } from '../services/whatsapp.service.js';
 import { resolveMediaFsPath, safeUnlink } from '../services/cleanup.service.js';
 import {
   DIRECTORY_PAGE_SIZE,
   MESSAGE_PAGE_SIZE,
   escapeXml,
   formatPhoneNumber,
+  getMessageDateInfo,
   getLetterBucket,
   getTotal,
   renderAckLabel,
   renderList,
   renderMediaLine,
+  renderMessageDateSeparator,
   renderMentions,
   renderPollLine,
   renderNumberedPager,
   renderPager,
   renderPhoneLink,
-  renderReplyLink,
+  renderMessageActions,
   sendInvalidEntity,
   sendMissingEntity,
   sendPage,
@@ -27,17 +29,17 @@ import {
 
 export async function listUsers(req, res, next) {
   try {
-    const allUsers = stmts.getAllUsers.all();
-    allUsers.sort((a, b) =>
-      (a.username || '').localeCompare(b.username || '', 'es', { sensitivity: 'base' })
-    );
-
     const requestedPage = toPositiveInt(req.query.p, 1);
-    const totalPages = Math.max(1, Math.ceil(allUsers.length / DIRECTORY_PAGE_SIZE));
+    const total = stmts.countDirectoryUsers.get().total;
+    const totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
     const page = Math.min(requestedPage, totalPages);
     const offset = (page - 1) * DIRECTORY_PAGE_SIZE;
 
-    const users = allUsers.slice(offset, offset + DIRECTORY_PAGE_SIZE);
+    const users = stmts.getDirectoryUsersPage.all(DIRECTORY_PAGE_SIZE, offset);
+    users.sort((a, b) =>
+      (a.username || '').localeCompare(b.username || '', 'es', { sensitivity: 'base' })
+      || a.chat_id.localeCompare(b.chat_id)
+    );
 
     const chatIds = users.map((u) => u.chat_id).filter(Boolean);
     const presenceMap = await getUsersPresence(chatIds);
@@ -74,7 +76,8 @@ export async function showUserMessages(req, res, next) {
       return;
     }
 
-    const user = userRows;
+    await syncChatUnreadCountFromWhatsapp(chatId);
+    const user = stmts.getUserByChatId.get(chatId) || userRows;
     const presence = user.chat_id ? await getUsersPresence([user.chat_id]) : new Map();
     const userPresence = user.chat_id ? presence.get(user.chat_id) : null;
     const onlineTag = userPresence && userPresence.isOnline ? ' *' : '';
@@ -101,13 +104,19 @@ export async function showUserMessages(req, res, next) {
     if (messages.length === 0) {
       messagesHtml = '<p>Sin mensajes.</p>';
     } else {
+      let previousDate = null;
       messages.forEach((message, index) => {
         const isNew = index < newMessageCount;
         const unseenMarker = isNew ? '<font color="#cc0000">[!]</font> ' : '';
         const sentAt = formatHourSend(message.hour_send);
+        const dateInfo = getMessageDateInfo(message);
+        const dateSeparator = dateInfo?.label && dateInfo.key !== previousDate
+          ? renderMessageDateSeparator(dateInfo.label)
+          : '';
+        if (dateInfo) previousDate = dateInfo.key;
 
         if (Number(message.is_system) === 1) {
-          messagesHtml += `<p align="center">${unseenMarker}<i><font size="1" color="#888888">${escapeXml(sentAt)} — ${renderMentions(message.text)}</font></i></p>`;
+          messagesHtml += `${dateSeparator}<p align="center">${unseenMarker}<i><font size="1" color="#888888">${escapeXml(sentAt)} — ${renderMentions(message.text)}</font></i></p>`;
           return;
         }
 
@@ -118,9 +127,7 @@ export async function showUserMessages(req, res, next) {
           ? renderPollLine(message, stmts.getPollOptionCountsByMessageId.all(message.id), { linkToDetail: `/mensaje/${message.id}` })
           : null;
         let contentPart;
-        if (Number(message.is_deleted) === 1) {
-          contentPart = `<i><font color="#888888">${escapeXml(message.text)}</font></i>`;
-        } else if (mediaLine) {
+        if (mediaLine) {
           contentPart = mediaLine;
         } else if (pollLine) {
           contentPart = pollLine;
@@ -131,9 +138,12 @@ export async function showUserMessages(req, res, next) {
         } else {
           contentPart = renderMentions(message.text);
         }
-        const editedTag = (Number(message.is_deleted) !== 1 && Number(message.is_edited) === 1)
-          ? ' <font size="1" color="#888888">(editado)</font>'
-          : '';
+        // Un mensaje borrado se sigue mostrando, marcado en rojo como «(borrado)».
+        const editedTag = Number(message.is_deleted) === 1
+          ? ' <font size="1" color="#cc0000">(borrado)</font>'
+          : Number(message.is_edited) === 1
+            ? ' <font size="1" color="#888888">(editado)</font>'
+            : '';
 
         let quotedBlock = '';
         if (message.quoted_text || message.quoted_sender) {
@@ -149,17 +159,16 @@ export async function showUserMessages(req, res, next) {
         const fromMeMarker = isSaliente
           ? `<font color="#006600">[Yo]</font> ${renderAckLabel(message.ack_status)}`
           : '';
+        const messageActions = renderMessageActions(message, user.chat_id, 'user');
 
         messagesHtml +=
-          `<p>${unseenMarker}${fromMeMarker}${escapeXml(sentAt)}${groupPart}${editedTag}${renderReplyLink(message, user.chat_id, 'user')}<br/>` +
+          `${dateSeparator}<p>${unseenMarker}${escapeXml(sentAt)}${groupPart}${editedTag}${messageActions}${messageActions && fromMeMarker ? '<br/>' : ''}${fromMeMarker}<br/>` +
           `${quotedBlock}${contentPart}<br/>----------</p>`;
       });
     }
 
-    let phone = null;
-    if (user.chat_id && user.chat_id.endsWith('@lid')) {
-      phone = await resolveContactPhone(user.chat_id);
-    }
+    // Siempre se pide el número personal: el del JID puede ser el de empresa.
+    let phone = user.chat_id ? await resolveContactPhone(user.chat_id) : null;
     if (!phone) {
       phone = formatPhoneNumber(user.chat_id, user.username);
     }
@@ -210,10 +219,7 @@ export async function showUserDetails(req, res, next) {
     ]);
     const presence = presenceMap.get(user.chat_id);
 
-    let phone = null;
-    if (user.chat_id.endsWith('@lid')) {
-      phone = await resolveContactPhone(user.chat_id);
-    }
+    let phone = await resolveContactPhone(user.chat_id);
     if (!phone) {
       phone = formatPhoneNumber(user.chat_id, user.username);
     }
