@@ -34,6 +34,9 @@ import {
   sendPage,
   toPositiveInt,
   truncateName,
+  getSearchQuery,
+  normalizeSearchText,
+  renderDirectorySearch,
 } from './page.controller.js';
 
 // Un nombre de grupo "necesita resolución" cuando aún no tenemos el nombre real:
@@ -218,25 +221,44 @@ async function resolveParticipantDisplayName(chatId, storedUser) {
 export async function listGroups(req, res, next) {
   try {
     const requestedPage = toPositiveInt(req.query.p, 1);
-    const total = stmts.countDirectoryGroups.get().total;
-    const totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
-    const page = Math.min(requestedPage, totalPages);
-    const offset = (page - 1) * DIRECTORY_PAGE_SIZE;
-
-    const resolvedGroups = await ensureGroupDisplayNames(
-      stmts.getDirectoryGroupsPage.all(DIRECTORY_PAGE_SIZE, offset)
-    );
+    const query = getSearchQuery(req);
     const nameCollator = new Intl.Collator('es', { sensitivity: 'base' });
-    resolvedGroups.sort((a, b) =>
-      nameCollator.compare(a.group_name || '', b.group_name || '') || a.group_id.localeCompare(b.group_id)
-    );
+    const byName = (a, b) =>
+      nameCollator.compare(a.group_name || '', b.group_name || '') || a.group_id.localeCompare(b.group_id);
+
+    let resolvedGroups;
+    let total;
+    let page;
+    let totalPages;
+    if (query) {
+      const needle = normalizeSearchText(query);
+      const matches = stmts.getAllDirectoryGroups.all()
+        .filter((g) => normalizeSearchText(g.group_name).includes(needle))
+        .sort(byName);
+      total = matches.length;
+      totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
+      page = Math.min(requestedPage, totalPages);
+      resolvedGroups = await ensureGroupDisplayNames(
+        matches.slice((page - 1) * DIRECTORY_PAGE_SIZE, page * DIRECTORY_PAGE_SIZE)
+      );
+    } else {
+      total = stmts.countDirectoryGroups.get().total;
+      totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
+      page = Math.min(requestedPage, totalPages);
+      resolvedGroups = await ensureGroupDisplayNames(
+        stmts.getDirectoryGroupsPage.all(DIRECTORY_PAGE_SIZE, (page - 1) * DIRECTORY_PAGE_SIZE)
+      );
+    }
+    resolvedGroups.sort(byName);
+    const pagerParams = query ? { q: query } : {};
 
     const body =
       '<h1>Grupos</h1>' +
+      renderDirectorySearch('/grupo', query, query ? total : null) +
       '<p><a href="/">Inicio</a></p>' +
-      renderNumberedPager('/grupo', page, totalPages) +
-      renderList(resolvedGroups, (group) => `/grupo/${group.group_id}`, (group) => `${truncateName(group.group_name)}[${group.unseen_count}]`, 'Sin grupos.', (group) => getLetterBucket(group.group_name)) +
-      renderNumberedPager('/grupo', page, totalPages);
+      renderNumberedPager('/grupo', page, totalPages, pagerParams) +
+      renderList(resolvedGroups, (group) => `/grupo/${group.group_id}`, (group) => `${truncateName(group.group_name)}[${group.unseen_count}]`, query ? 'Ningún grupo coincide.' : 'Sin grupos.', (group) => getLetterBucket(group.group_name)) +
+      renderNumberedPager('/grupo', page, totalPages, pagerParams);
 
     sendPage(req, res, 200, 'Grupos', body);
   } catch (error) {
@@ -382,7 +404,7 @@ export async function showGroupMessages(req, res, next) {
     const iconTag = (file, alt) =>
       `<img src="/assets/groups_icons/${file}" alt="${escapeXml(alt)}" height="24" width="24" style="vertical-align:middle;"/>`;
 
-    const avatarHtml = renderAvatarImg(await getAvatarUrl(group.group_id, 'mini'), 'mini');
+    const avatarHtml = renderAvatarImg(await getAvatarUrl(group.group_id, 'mini', { fallback: 'group' }), 'mini');
     const body =
       `<h1>${avatarHtml ? `${avatarHtml} ` : ''}${escapeXml(group.group_name)}</h1>` +
       '<p><a href="/">Inicio</a> | <a href="/grupo">Grupos</a></p>' +
@@ -417,7 +439,7 @@ export async function showGroupDetails(req, res, next) {
 
     const [details, bigAvatarUrl] = await Promise.all([
       fetchGroupDetailsDirectly(groupId),
-      getAvatarUrl(groupId, 'big'),
+      getAvatarUrl(groupId, 'big', { fallback: 'group' }),
     ]);
 
     // Misma estética que Detalles de usuario: cabecera centrada, bloques con título en

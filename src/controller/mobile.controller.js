@@ -14,6 +14,8 @@ import { registerPendingOutgoing } from '../services/pending-outgoing.service.js
 import { convertEmojisToAscii } from '../utils/emoji.js';
 import { ensureGroupDisplayName, ensureGroupDisplayNames } from './group.controller.js';
 import { DIRECTORY_PAGE_SIZE, MESSAGE_PAGE_SIZE, getTotal, toPositiveInt } from './page.controller.js';
+import { alertNewLogin } from '../services/security-alert.service.js';
+import { isTlsRequest } from '../utils/public-url.js';
 
 function jsonError(res, status, code, message) {
   return res.status(status).json({ error: { code, message } });
@@ -50,8 +52,9 @@ export async function mobileLogin(req, res) {
     }
 
     resetAttempts(ip);
-    const { token, days } = createTrustToken();
+    const { token, days } = createTrustToken('mobile');
     console.log(`[Mobile] Login exitoso desde ${ip}`);
+    alertNewLogin({ ip, via: 'J2ME', remember: true, tls: isTlsRequest(req) });
     return res.status(200).json({ token, expiresInDays: days });
   } catch (error) {
     console.error('[Mobile] Error en mobileLogin:', error.message);

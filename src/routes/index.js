@@ -9,7 +9,7 @@ import mobileRoutes from './mobile.routes.js';
 
 import authRoutes from './auth.routes.js';
 import { requireAuth } from '../middlewares/auth.middleware.js';
-import { showSettings, saveSettings } from '../controller/settings.controller.js';
+import { showSettings, saveSettings, confirmCloseSessions, closeOtherSessions } from '../controller/settings.controller.js';
 import { serveAvatar } from '../services/avatar.service.js';
 
 const router = Router();
@@ -31,5 +31,7 @@ router.get('/avatar/:size/:id', requireAuth, serveAvatar);
 
 router.get('/ajustes', requireAuth, showSettings);
 router.post('/ajustes', requireAuth, saveSettings);
+router.get('/ajustes/cerrar-sesiones', requireAuth, confirmCloseSessions);
+router.post('/ajustes/cerrar-sesiones', requireAuth, closeOtherSessions);
 
 export default router;

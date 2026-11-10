@@ -374,6 +374,36 @@ export function renderPager(path, page, totalPages, params = {}) {
   return `<p>${page}/${totalPages} ${links.join(' | ')}</p>`;
 }
 
+// Texto comparable sin mayúsculas ni acentos: «Óscar» y «oscar» coinciden.
+export function normalizeSearchText(value) {
+  return String(value || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+}
+
+export function getSearchQuery(req) {
+  return typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 40) : '';
+}
+
+// Buscador de las listas de Usuarios y Grupos: campo de texto + lupa para enviar.
+// Es GET, así que pulsar «Enter»/OK en el campo también busca.
+export function renderDirectorySearch(path, query, resultCount = null) {
+  const form =
+    // Tabla de dos columnas: el navegador del 6111 pone cada campo de texto en su propia
+    // línea, y la tabla obliga a que la lupa quede al lado.
+    // <input type="image"> y no <button>: el 6111 pinta <button> como una imagen suelta
+    // en otra línea y no deja seleccionarla.
+    `<form action="${escapeXml(path)}" method="get">` +
+    '<table cellpadding="0" cellspacing="0"><tr>' +
+    // size="7" + lupa de 12 px: lo justo para los 128 px del 6111 (ignora el ancho por
+    // CSS y size va de carácter en carácter: 6 queda corto y 7 con lupa de 16 se corta).
+    `<td><input type="text" name="q" value="${escapeXml(query)}" size="7" maxlength="40"/></td>` +
+    '<td><input type="image" src="/assets/Search.png" width="16" height="16" alt="Buscar"/></td>' +
+    '</tr></table></form>';
+  if (!query) return form;
+  return form +
+    `<p><font size="1">${resultCount ?? 0} resultado${resultCount === 1 ? '' : 's'} para «${escapeXml(query)}» ` +
+    `<a href="${escapeXml(path)}">[Quitar]</a></font></p>`;
+}
+
 export function renderNumberedPager(path, page, totalPages, params = {}) {
   const maxKeypadPage = Math.min(totalPages, 9);
   const numberLinks = [];

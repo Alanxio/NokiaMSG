@@ -1,4 +1,6 @@
-import { getClientIp, isValidSession, isValidTrustToken } from '../services/auth.service.js';
+import { getClientIp, hashToken, isValidSession, isValidTrustToken, useWebTrustToken } from '../services/auth.service.js';
+import { alertTokenTheft } from '../services/security-alert.service.js';
+import { isTlsRequest, secureCookieSuffix } from '../utils/public-url.js';
 
 function parseCookies(cookieHeader) {
   const list = {};
@@ -35,6 +37,15 @@ export function getLastActivityAt() {
   return lastActivityAt;
 }
 
+// Rutas de imágenes/archivos: el token web no se renueva aquí (el Nokia procesa la
+// cookie nueva en las páginas; las imágenes salen en paralelo con la cookie anterior).
+const NO_ROTATE_PREFIXES = ['/assets/', '/media/', '/avatar/', '/descargar/', '/sounds/', '/audio/'];
+
+function trustCookieHeader(token, expiresAt, req) {
+  const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+  return `trust_token=${token}; HttpOnly; Max-Age=${maxAge}; Path=/${secureCookieSuffix(req)}`;
+}
+
 export function requireAuth(req, res, next) {
   const cookies = parseCookies(req.headers.cookie);
   const sessionId  = cookies['session_id'];
@@ -44,13 +55,23 @@ export function requireAuth(req, res, next) {
   // 1. Sesión activa válida
   if (sessionId && isValidSession(sessionId, ip)) {
     lastActivityAt = Date.now();
+    req.auth = { sessionId, trustHash: trustToken ? hashToken(trustToken) : null };
     return next();
   }
 
-  // 2. Token de "Recordarme" de larga duración (no depende de la IP)
-  if (isValidTrustToken(trustToken)) {
-    lastActivityAt = Date.now();
-    return next();
+  // 2. Token de "Recordarme" de larga duración (no depende de la IP), con renovación
+  // periódica y detección de tokens copiados (ver useWebTrustToken).
+  if (trustToken) {
+    const path = req.originalUrl || req.url || '';
+    const allowRotate = !NO_ROTATE_PREFIXES.some((prefix) => path.startsWith(prefix));
+    const result = useWebTrustToken(trustToken, { allowRotate });
+    if (result.ok) {
+      if (result.newToken) res.append('Set-Cookie', trustCookieHeader(result.newToken, result.expiresAt, req));
+      lastActivityAt = Date.now();
+      req.auth = { sessionId: null, trustHash: result.hash };
+      return next();
+    }
+    if (result.theft) alertTokenTheft({ ip, tls: isTlsRequest(req) });
   }
 
   // 3. Mismo token de "Recordarme", enviado como header en vez de cookie — así el
@@ -58,6 +79,7 @@ export function requireAuth(req, res, next) {
   // el token que ya recibió de POST /mobile/login.
   if (isValidTrustToken(req.headers['x-nokia-token'])) {
     lastActivityAt = Date.now();
+    req.auth = { sessionId: null, trustHash: hashToken(req.headers['x-nokia-token']) };
     return next();
   }
 

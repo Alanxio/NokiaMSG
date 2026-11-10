@@ -2,6 +2,7 @@ import fs from 'fs';
 import { sendPage } from './page.controller.js';
 import { startDailyCleanup, stopDailyCleanup } from '../services/cleanup.service.js';
 import { SETTINGS_ENV_PATH } from '../utils/settings-env.js';
+import { revokeAllSessions } from '../services/auth.service.js';
 
 const envPath = SETTINGS_ENV_PATH;
 const CLEANUP_RETENTION_OPTIONS = [
@@ -61,6 +62,8 @@ export function showSettings(req, res, next) {
       <br/><br/>
       <p>Sesion:</p>
       <a href="/logout">Cerrar sesion</a>
+      <br/>
+      <a href="/ajustes/cerrar-sesiones">Cerrar las demas sesiones</a>
       <br/><br/>
       <p>WhatsApp:</p>
       <a href="/whatsapp/logout">Cerrar sesion de WhatsApp</a>
@@ -105,4 +108,31 @@ export function saveSettings(req, res, next) {
     `<p>Ticks azules: ${newReadReceiptsEnabled === 'true' ? 'Activado' : 'Desactivado'}</p>` +
     `<p>Borrado: ${cleanupLabel}</p>` +
     '<p>Volviendo...</p>');
+}
+
+// «Cerrar las demás sesiones»: anula todos los «Recordarme» y sesiones salvo la actual.
+// Confirmación con formulario POST (no un enlace GET, para que no se pueda disparar
+// desde otra página o al precargar enlaces).
+export function confirmCloseSessions(req, res) {
+  const body =
+    '<h1>Sesiones</h1>' +
+    '<p>Se cerrarán todas las sesiones abiertas (otros móviles, navegadores o un token ' +
+    'copiado), menos esta.</p>' +
+    '<form action="/ajustes/cerrar-sesiones" method="post">' +
+    '<p><input type="submit" value="Cerrar las demás"/></p>' +
+    '</form>' +
+    '<p><a href="/ajustes">Cancelar</a></p>';
+  sendPage(req, res, 200, 'Sesiones', body);
+}
+
+export function closeOtherSessions(req, res) {
+  const closed = revokeAllSessions({
+    keepSessionId: req.auth?.sessionId || null,
+    keepTrustHash: req.auth?.trustHash || null,
+  });
+  console.log(`[Auth] Cerradas las demás sesiones: ${closed.tokens} recordada(s), ${closed.sessions} sesión(es).`);
+  sendPage(req, res, 200, 'Sesiones',
+    '<meta http-equiv="refresh" content="3; url=/ajustes"/>' +
+    `<p>Cerradas ${closed.tokens + closed.sessions} sesión(es). Esta sigue abierta.</p>` +
+    '<p><a href="/ajustes">Volver</a></p>');
 }

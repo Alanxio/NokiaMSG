@@ -499,6 +499,19 @@ export const stmts = {
     LIMIT ? OFFSET ?
   `),
 
+  // Buscador de las listas: se filtra en JS (sin acentos ni mayúsculas), así que se
+  // piden todas las filas del directorio sin paginar.
+  getAllDirectoryUsers: db.prepare(`
+    SELECT u.chat_id, u.username, u.unseen_count FROM users u
+    WHERE EXISTS (
+      SELECT 1 FROM messages m WHERE m.user_chat_id = u.chat_id AND m.group_id IS NULL
+    )
+  `),
+
+  getAllDirectoryGroups: db.prepare(`
+    SELECT group_id, group_name, unseen_count FROM wgroups
+  `),
+
   countDirectoryGroups: db.prepare(`
     SELECT COUNT(*) AS total FROM wgroups
   `),

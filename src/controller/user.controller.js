@@ -27,35 +27,54 @@ import {
   sendPage,
   toPositiveInt,
   truncateName,
+  getSearchQuery,
+  normalizeSearchText,
+  renderDirectorySearch,
 } from './page.controller.js';
 
 export async function listUsers(req, res, next) {
   try {
     const requestedPage = toPositiveInt(req.query.p, 1);
-    const total = stmts.countDirectoryUsers.get().total;
-    const totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
-    const page = Math.min(requestedPage, totalPages);
-    const offset = (page - 1) * DIRECTORY_PAGE_SIZE;
-
-    const users = stmts.getDirectoryUsersPage.all(DIRECTORY_PAGE_SIZE, offset);
-    users.sort((a, b) =>
+    const query = getSearchQuery(req);
+    const byName = (a, b) =>
       (a.username || '').localeCompare(b.username || '', 'es', { sensitivity: 'base' })
-      || a.chat_id.localeCompare(b.chat_id)
-    );
+      || a.chat_id.localeCompare(b.chat_id);
+
+    let users;
+    let total;
+    let page;
+    let totalPages;
+    if (query) {
+      const needle = normalizeSearchText(query);
+      const matches = stmts.getAllDirectoryUsers.all()
+        .filter((u) => normalizeSearchText(u.username).includes(needle) || u.chat_id.includes(needle))
+        .sort(byName);
+      total = matches.length;
+      totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
+      page = Math.min(requestedPage, totalPages);
+      users = matches.slice((page - 1) * DIRECTORY_PAGE_SIZE, page * DIRECTORY_PAGE_SIZE);
+    } else {
+      total = stmts.countDirectoryUsers.get().total;
+      totalPages = Math.max(1, Math.ceil(total / DIRECTORY_PAGE_SIZE));
+      page = Math.min(requestedPage, totalPages);
+      users = stmts.getDirectoryUsersPage.all(DIRECTORY_PAGE_SIZE, (page - 1) * DIRECTORY_PAGE_SIZE).sort(byName);
+    }
+    const pagerParams = query ? { q: query } : {};
 
     const chatIds = users.map((u) => u.chat_id).filter(Boolean);
     const presenceMap = await getUsersPresence(chatIds);
 
     const body =
       '<h1>Usuarios</h1>' +
+      renderDirectorySearch('/usuario', query, query ? total : null) +
       '<p><a href="/">Inicio</a></p>' +
-      renderNumberedPager('/usuario', page, totalPages) +
+      renderNumberedPager('/usuario', page, totalPages, pagerParams) +
       renderList(users, (user) => `/usuario/${user.chat_id}`, (user) => {
         const presence = user.chat_id ? presenceMap.get(user.chat_id) : null;
         const onlineTag = presence && presence.isOnline ? '*' : '';
         return `${truncateName(user.username)}${onlineTag}[${user.unseen_count}]`;
-      }, 'Sin usuarios.', (user) => getLetterBucket(user.username)) +
-      renderNumberedPager('/usuario', page, totalPages);
+      }, query ? 'Ningún usuario coincide.' : 'Sin usuarios.', (user) => getLetterBucket(user.username)) +
+      renderNumberedPager('/usuario', page, totalPages, pagerParams);
 
     sendPage(req, res, 200, 'Usuarios', body);
   } catch (error) {
@@ -183,7 +202,7 @@ export async function showUserMessages(req, res, next) {
     const iconTag = (file, alt) =>
       `<img src="/assets/groups_icons/${file}" alt="${escapeXml(alt)}" height="24" width="24" style="vertical-align:middle;"/>`;
 
-    const avatarHtml = renderAvatarImg(await getAvatarUrl(user.chat_id, 'mini'), 'mini');
+    const avatarHtml = renderAvatarImg(await getAvatarUrl(user.chat_id, 'mini', { fallback: 'user' }), 'mini');
     const body =
       `<h1>${avatarHtml ? `${avatarHtml} ` : ''}${escapeXml(user.username)}${onlineTag}</h1>` +
       phoneHtml +
@@ -239,7 +258,7 @@ export async function showUserDetails(req, res, next) {
     const [profileInfo, presenceMap, bigAvatarUrl] = await Promise.all([
       getContactProfileInfo(user.chat_id),
       getUsersPresence([user.chat_id]),
-      getAvatarUrl(user.chat_id, 'big'),
+      getAvatarUrl(user.chat_id, 'big', { fallback: 'user' }),
     ]);
     const presence = presenceMap.get(user.chat_id);
 

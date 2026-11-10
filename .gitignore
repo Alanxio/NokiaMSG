@@ -6,3 +6,4 @@ assets/qr.png
 *.log
 .opencode/
 public/media/
+data-tls-probe/

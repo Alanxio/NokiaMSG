@@ -39,6 +39,15 @@ const DISCONNECT_ALERT_THRESHOLD_MS = 5 * 60 * 1000;
 
 export let client = null;
 let currentQr = null;
+// Sube con cada QR nuevo: la página del QR la usa para pedir la imagen con una URL
+// distinta por QR (cacheable en el móvil) y para saber cuándo hay que recargar.
+let qrVersion = 0;
+// Vinculación con código (número de teléfono) en vez de QR. Va atada a la
+// instancia de cliente que lo pidió: si el cliente se recrea, vuelve el modo QR.
+let pairingClient = null;
+let pairingCode = null;
+let pairingError = null;
+let pairingPromise = null;
 let connectionStatus = 'waiting_qr';
 let lastStatusChange = null;
 let reconnectAttempts = 0;
@@ -529,14 +538,24 @@ export async function startWhatsappClient(processMessageFn) {
     console.log('[whatsapp] Cambio de estado interno:', state);
   });
 
+  client.on('code', (code) => {
+    if (!client || pairingClient !== client) return;
+    pairingCode = code;
+    qrVersion += 1;
+    console.log('[whatsapp] Codigo de vinculacion actualizado.');
+  });
+
   client.on('qr', async (qr) => {
     gotQrOrAuth = true;
+    // En modo código WhatsApp Web puede seguir emitiendo QR, pero ya no valen.
+    if (pairingClient && pairingClient === client) return;
     console.log('\n[whatsapp] ═══════════════════════════════════════');
     console.log('[whatsapp] ESCANEA EL QR PARA VINCULAR WHATSAPP');
     console.log('[whatsapp] ═══════════════════════════════════════\n');
     qrcodeTerminal.generate(qr, { small: true });
 
     currentQr = qr;
+    qrVersion += 1;
     connectionStatus = 'waiting_qr';
     lastStatusChange = new Date().toISOString();
 
@@ -1806,6 +1825,65 @@ function buildLocationMediaInfo(msg) {
 
 export function getQrText() {
   return currentQr;
+}
+
+export function getQrVersion() {
+  return qrVersion;
+}
+
+export function getPairingPhone() {
+  return String(process.env.WHATSAPP_PAIRING_PHONE || '').replace(/\D/g, '');
+}
+
+export function getPairingState() {
+  const active = Boolean(client) && pairingClient === client;
+  return {
+    active,
+    code: active ? pairingCode : null,
+    error: active ? pairingError : null,
+  };
+}
+
+// Cambia este cliente a vinculación por código. WhatsApp Web deja de aceptar el QR
+// y emite un código nuevo cada 3 min (evento 'code') hasta que se vincula.
+export function requestWhatsappPairingCode() {
+  const phone = getPairingPhone();
+  if (!phone) return Promise.reject(new Error('Falta WHATSAPP_PAIRING_PHONE'));
+  if (!client || connectionStatus !== 'waiting_qr') {
+    return Promise.reject(new Error('WhatsApp no esta esperando vinculacion'));
+  }
+  if (pairingClient === client && (pairingPromise || pairingCode)) {
+    return pairingPromise || Promise.resolve(pairingCode);
+  }
+
+  const target = client;
+  pairingClient = target;
+  pairingCode = null;
+  pairingError = null;
+  currentQr = null;
+  qrVersion += 1;
+  console.log('[whatsapp] Pidiendo codigo de vinculacion...');
+
+  pairingPromise = target.requestPairingCode(phone, true)
+    .then((code) => {
+      if (pairingClient === target) {
+        pairingCode = code;
+        qrVersion += 1;
+      }
+      return code;
+    })
+    .catch((err) => {
+      console.error('[whatsapp] Error pidiendo codigo de vinculacion:', err?.message || err);
+      if (pairingClient === target) {
+        pairingError = 'No se pudo obtener el codigo';
+        qrVersion += 1;
+      }
+      throw err;
+    })
+    .finally(() => {
+      if (pairingClient === target) pairingPromise = null;
+    });
+  return pairingPromise;
 }
 
 export function getConnectionStatus() {

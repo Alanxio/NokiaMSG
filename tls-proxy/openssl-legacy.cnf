@@ -1,0 +1,13 @@
+# OpenSSL 3 rechaza al cargar certificados firmados con SHA-1 (ca md too weak) y TLS 1.0
+# salvo con nivel de seguridad 0. Node lee la sección nodejs_conf de OPENSSL_CONF.
+nodejs_conf = nodejs_init
+
+[nodejs_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+CipherString = DEFAULT:@SECLEVEL=0
+MinProtocol = TLSv1

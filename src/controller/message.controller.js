@@ -28,6 +28,7 @@ function normalizeGroupName(rawName) {
 import { castPollVote, client, refreshPollVotesFromWhatsapp, resolveContactPhone, resolveMyVoterIds, syncOutgoingMessageAck } from '../services/whatsapp.service.js';
 import { ensureGroupDisplayName } from './group.controller.js';
 import { registerPendingOutgoing, removeObservedOutgoing, takeObservedOutgoing } from '../services/pending-outgoing.service.js';
+import { getRequestBaseUrl } from '../utils/public-url.js';
 
 const EXISTING_CONTACT_ICON_HTML = '<img src="/assets/user.jpeg" alt="Contacto" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
 
@@ -936,15 +937,9 @@ function signAudioLink(messageId) {
   return crypto.createHmac('sha256', AUDIO_LINK_SECRET).update(String(messageId)).digest('hex').slice(0, 32);
 }
 
-// El Nokia 6111 no soporta HTTPS, así que el objectURI del descriptor va siempre por
-// http://. No se usa X-Forwarded-Proto: el Gateway lo fija a «https» en todas las
-// peticiones aunque el teléfono haya entrado por HTTP.
-function getPublicBaseUrl(req) {
-  const first = (value) => String(value || '').split(',')[0].trim();
-  const proto = 'http';
-  const host = first(req.headers['x-forwarded-host']) || req.headers.host;
-  return `${proto}://${host}`;
-}
+// El objectURI del descriptor va por la misma vía por la que ha entrado el Nokia:
+// https:// si vino cifrado por nokia-tls, http:// si no (ver utils/public-url.js).
+const getPublicBaseUrl = getRequestBaseUrl;
 
 // PRUEBA — OMA DRM 1.0 «combined delivery»: el .amr viaja dentro de un mensaje DRM con
 // un derecho de reproducción limitado a N escuchas (AUDIO_PLAY_COUNT, por defecto 1).

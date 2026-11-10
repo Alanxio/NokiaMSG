@@ -10,6 +10,8 @@ import {
   revokeTrustToken
 } from '../services/auth.service.js';
 import { sendPage, isOperaMini } from './page.controller.js';
+import { alertNewLogin } from '../services/security-alert.service.js';
+import { isTlsRequest, secureCookieSuffix } from '../utils/public-url.js';
 
 function parseCookies(cookieHeader) {
   const list = {};
@@ -66,24 +68,27 @@ export async function processLogin(req, res, next) {
   }
 
   try {
-    const isValid = await bcrypt.compare(pin, hash);
+    const isValid = await bcrypt.compare(String(pin), hash);
 
     if (isValid) {
       resetAttempts(ip);
       const sessionId = createSession(ip);
 
       // Cookie de sesión corta (15 min)
-      const cookies = [`session_id=${sessionId}; HttpOnly; Max-Age=900; Path=/`];
+      // Si el login es por HTTPS, las cookies llevan Secure y nunca viajan en claro.
+      const secure = secureCookieSuffix(req);
+      const cookies = [`session_id=${sessionId}; HttpOnly; Max-Age=900; Path=/${secure}`];
 
       // Cookie de larga duración si marcó "Recordarme"
       if (remember === 'yes') {
-        const { token, days } = createTrustToken();
+        const { token, days } = createTrustToken('web');
         const maxAge = days * 24 * 60 * 60;
-        cookies.push(`trust_token=${token}; HttpOnly; Max-Age=${maxAge}; Path=/`);
+        cookies.push(`trust_token=${token}; HttpOnly; Max-Age=${maxAge}; Path=/${secure}`);
       }
 
       res.setHeader('Set-Cookie', cookies);
       console.log(`[Auth] Login exitoso desde ${ip} (recordar=${remember === 'yes'})`);
+      alertNewLogin({ ip, via: 'web', remember: remember === 'yes', tls: isTlsRequest(req) });
 
       // Saltar a inicio usando meta-refresh (sin código 3xx que el Nokia rechaza)
       const contentType = isOperaMini(req)

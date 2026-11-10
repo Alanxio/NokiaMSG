@@ -1,5 +1,6 @@
 import twilio from 'twilio';
 import { convertEmojisToAscii } from '../utils/emoji.js';
+import { getPublicTlsBaseUrl } from '../utils/public-url.js';
 
 function parseBoolean(value, defaultValue = false) {
   if (value == null || value === '') {
@@ -14,6 +15,9 @@ function normalizeAsciiText(value, fallback = '') {
 }
 
 function getPublicBaseUrl() {
+  // Si el túnel HTTPS está activo, los enlaces de los SMS van cifrados.
+  const tlsBaseUrl = getPublicTlsBaseUrl();
+  if (tlsBaseUrl) return tlsBaseUrl;
   const useCloudflare = (process.env.CLOUDFLARE_ENABLED || '').toLowerCase() === 'true';
   if (useCloudflare && process.env.CLOUDFLARE_TUNNEL_HOSTNAME) {
     return `https://${process.env.CLOUDFLARE_TUNNEL_HOSTNAME}`;
@@ -139,4 +143,17 @@ export async function sendInfraAlertSms(text) {
   }
 
   return sendRawSms(config, text);
+}
+
+// Alertas de seguridad (inicio de sesión nuevo, token robado). Se envían aunque las
+// notificaciones SMS estén desactivadas en Ajustes: desactivar los avisos de mensajes no
+// debe apagar también los avisos de intrusión. Solo hace falta Twilio configurado.
+export async function sendSecurityAlertSms(text) {
+  const config = getSmsConfig();
+  const missing = ['accountSid', 'authToken', 'fromNumber', 'toNumber'].filter((k) => !config[k]);
+  if (missing.length > 0) {
+    console.warn('[SMS] Alerta de seguridad no enviada: Twilio sin configurar.');
+    return { status: 'misconfigured', missing };
+  }
+  return sendRawSms(config, normalizeAsciiText(text));
 }

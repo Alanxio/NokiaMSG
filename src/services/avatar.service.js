@@ -21,6 +21,13 @@ const NO_PHOTO_TTL_MS = 30 * 60 * 1000;
 const RENDER_WAIT_MS = 2500; // lo máximo que una página espera a una foto nueva
 export const AVATAR_SIZES = Object.freeze({ mini: 32, big: 96 });
 
+// Iconos clásicos de Messenger para quien no tiene foto (assets/default_icons). Son
+// estáticos y comunes a todos, así que el Nokia los descarga una sola vez.
+const DEFAULT_AVATARS = Object.freeze({
+  user: { mini: '/assets/default_icons/user_icon_32x32.jpg', big: '/assets/default_icons/user_icon_96x96.jpg' },
+  group: { mini: '/assets/default_icons/group_icon_32x32.jpg', big: '/assets/default_icons/group_icon_96x96.jpg' },
+});
+
 const inFlight = new Map();
 
 function baseName(chatId) {
@@ -130,15 +137,17 @@ function ensureAvatar(chatId) {
   return job;
 }
 
-// URL de la foto lista para <img>, o null si no tiene (o aún no se sabe).
+// URL de la foto lista para <img>. Si no tiene foto (o aún no se sabe) devuelve el icono
+// por defecto de `fallback` ('user' | 'group'), o null si no se pide ninguno.
 // Si la caché está vigente responde al momento; si no, espera como mucho RENDER_WAIT_MS
 // y, si WhatsApp tarda más, usa la versión anterior mientras termina en segundo plano.
-export async function getAvatarUrl(chatId, size = 'mini') {
-  if (!chatId || !AVATAR_SIZES[size]) return null;
+export async function getAvatarUrl(chatId, size = 'mini', { fallback = null } = {}) {
+  const defaultUrl = DEFAULT_AVATARS[fallback]?.[size] || null;
+  if (!chatId || !AVATAR_SIZES[size]) return defaultUrl;
   try {
     mkdirSync(AVATAR_DIR, { recursive: true });
   } catch {
-    return null;
+    return defaultUrl;
   }
 
   let meta = readMeta(chatId);
@@ -150,7 +159,7 @@ export async function getAvatarUrl(chatId, size = 'mini') {
     meta = await Promise.race([ensureAvatar(chatId), timeout]);
   }
 
-  if (!meta?.hasPhoto || !existsSync(avatarFilePath(chatId, size))) return null;
+  if (!meta?.hasPhoto || !existsSync(avatarFilePath(chatId, size))) return defaultUrl;
   return `/avatar/${size}/${encodeURIComponent(chatId)}?v=${meta.version}`;
 }
 
