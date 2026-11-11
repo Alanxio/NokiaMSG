@@ -13,6 +13,10 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { client, getConnectionStatus } from './whatsapp.service.js';
+// Estilo de las fotos guardadas. Si cambia, las fotos se regeneran en local desde la copia
+// sin retocar (_src.jpg). «sin-marco»: como al principio (se probó un marco verde estilo
+// Messenger y se descartó).
+const AVATAR_STYLE = 'sin-marco-1';
 
 const AVATAR_DIR = join(dirname(process.env.DB_PATH || '/data/nokia.db'), 'avatars');
 const AVATAR_TTL_MS = 24 * 60 * 60 * 1000;
@@ -40,6 +44,51 @@ function metaPath(chatId) {
 
 export function avatarFilePath(chatId, size) {
   return join(AVATAR_DIR, `${baseName(chatId)}_${AVATAR_SIZES[size]}.jpg`);
+}
+
+// Copia sin retocar (192 px) de la que se generan los tamaños finales: si cambia el estilo
+// se regeneran sin volver a pedir la foto a WhatsApp.
+function avatarSourcePath(chatId) {
+  return join(AVATAR_DIR, `${baseName(chatId)}_src.jpg`);
+}
+
+function renderAvatar(sharp, sourceBuffer, px) {
+  return sharp(sourceBuffer)
+    .resize(px, px, { fit: 'cover' })
+    .flatten({ background: '#ffffff' })
+    .jpeg({ quality: px <= 32 ? 80 : 75 })
+    .toBuffer();
+}
+
+async function writeAvatarVersions(chatId, sharp, sourceBuffer) {
+  const outputs = await Promise.all(Object.values(AVATAR_SIZES).map((px) => renderAvatar(sharp, sourceBuffer, px)));
+  Object.keys(AVATAR_SIZES).forEach((size, i) => writeFileSync(avatarFilePath(chatId, size), outputs[i]));
+}
+
+// Fotos guardadas con otro estilo (p. ej. con el marco que se probó): se regeneran en local
+// a partir de la copia sin retocar o, si no la hay (fotos antiguas, que nunca tuvieron
+// marco), de la versión grande ya guardada.
+const restyling = new Map();
+function restyleAvatar(chatId, meta) {
+  if (restyling.has(chatId)) return restyling.get(chatId);
+  const job = (async () => {
+    const srcPath = avatarSourcePath(chatId);
+    const bigPath = avatarFilePath(chatId, 'big');
+    const source = existsSync(srcPath) ? readFileSync(srcPath) : existsSync(bigPath) ? readFileSync(bigPath) : null;
+    if (!source) return meta;
+    const { default: sharp } = await import('sharp');
+    if (!existsSync(srcPath)) writeFileSync(srcPath, source);
+    await writeAvatarVersions(chatId, sharp, source);
+    const updated = { ...meta, style: AVATAR_STYLE, version: `${meta.contentHash || 'x'}-${AVATAR_STYLE}` };
+    writeMeta(chatId, updated);
+    console.log(`[avatar] ${chatId}: regenerada con estilo ${AVATAR_STYLE}`);
+    return updated;
+  })().catch((err) => {
+    console.warn(`[avatar] No se pudo regenerar la foto de ${chatId}:`, err?.message || err);
+    return meta;
+  }).finally(() => restyling.delete(chatId));
+  restyling.set(chatId, job);
+  return job;
 }
 
 function readMeta(chatId) {
@@ -101,24 +150,28 @@ async function refreshAvatar(chatId) {
   const original = Buffer.from(await response.arrayBuffer());
 
   const { default: sharp } = await import('sharp');
-  const resized = await Promise.all(Object.values(AVATAR_SIZES).map((px) => sharp(original)
-    .resize(px, px, { fit: 'cover' })
-    .flatten({ background: '#ffffff' })
-    .jpeg({ quality: px <= 32 ? 80 : 75 })
-    .toBuffer()));
 
-  // Misma foto que ya teníamos: no cambiar la versión (el Nokia la conserva en caché).
+  // Misma foto y mismo estilo que ya teníamos: no cambiar la versión (el Nokia la conserva
+  // en caché).
   const contentHash = createHash('sha1').update(original).digest('hex').slice(0, 12);
   const unchanged = previous?.hasPhoto && previous.contentHash === contentHash
+    && previous.style === AVATAR_STYLE
     && Object.keys(AVATAR_SIZES).every((size) => existsSync(avatarFilePath(chatId, size)));
   if (!unchanged) {
-    Object.keys(AVATAR_SIZES).forEach((size, i) => writeFileSync(avatarFilePath(chatId, size), resized[i]));
+    const source = await sharp(original)
+      .resize(192, 192, { fit: 'cover' })
+      .flatten({ background: '#ffffff' })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+    writeFileSync(avatarSourcePath(chatId), source);
+    await writeAvatarVersions(chatId, sharp, source);
   }
   const meta = {
     fetchedAt: Date.now(),
     hasPhoto: true,
     contentHash,
-    version: unchanged ? previous.version : contentHash,
+    style: AVATAR_STYLE,
+    version: unchanged ? previous.version : `${contentHash}-${AVATAR_STYLE}`,
   };
   writeMeta(chatId, meta);
   console.log(`[avatar] ${chatId}: foto ${unchanged ? 'sin cambios' : 'actualizada'} (${source})`);
@@ -159,6 +212,9 @@ export async function getAvatarUrl(chatId, size = 'mini', { fallback = null } = 
     meta = await Promise.race([ensureAvatar(chatId), timeout]);
   }
 
+  if (meta?.hasPhoto && meta.style !== AVATAR_STYLE) {
+    meta = await restyleAvatar(chatId, meta);
+  }
   if (!meta?.hasPhoto || !existsSync(avatarFilePath(chatId, size))) return defaultUrl;
   return `/avatar/${size}/${encodeURIComponent(chatId)}?v=${meta.version}`;
 }

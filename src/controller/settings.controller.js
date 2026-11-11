@@ -65,6 +65,9 @@ export function showSettings(req, res, next) {
       <br/>
       <a href="/ajustes/cerrar-sesiones">Cerrar las demas sesiones</a>
       <br/><br/>
+      <p>Servidor:</p>
+      <a href="/estado">Estado del servidor</a>
+      <br/><br/>
       <p>WhatsApp:</p>
       <a href="/whatsapp/logout">Cerrar sesion de WhatsApp</a>
       <br/><br/>

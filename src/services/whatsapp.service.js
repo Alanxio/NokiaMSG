@@ -3,13 +3,18 @@ import qrcode from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import { existsSync, writeFileSync, unlinkSync, statSync, rmSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
-import { stmts } from '../../db/db.js';
+import db, { stmts } from '../../db/db.js';
 import { saveInteraction } from '../controller/notification.controller.js';
 import { marcarNovedad } from './polling.service.js';
 import { resolveMentions } from '../utils/mentions.js';
 import { saveImageVersions, processSticker, saveRawMediaFile, getStickerKey, attachExistingSticker } from '../utils/media.js';
 import { resolvePendingGroupNames, resolveGroupNameFromWhatsapp } from '../controller/group.controller.js';
 import {
+  claimOwnMessage,
+  isOwnMessageClaimed,
+  isSameOutgoingMessage,
+  isSyncableOwnChat,
+  matchesNokiaSendInFlight,
   rememberPendingOutgoingAck,
   registerObservedOutgoing,
   takePendingOutgoing,
@@ -285,11 +290,14 @@ async function attachDirectMessageListener() {
       if (!bindingExists) {
         await page.exposeFunction('onNokiaDirectMessageAdded', async (data) => {
           try {
+            // También los propios (fromMe): los escritos desde otro dispositivo se sincronizan;
+            // los del Nokia los reconoce message_create y solo los enlaza.
             const messageId = getWhatsappMessageId(data);
-            if (!messageId || data?.id?.fromMe || stmts.findMessageByWhatsappId.get(messageId)) return;
+            if (!messageId || stmts.findMessageByWhatsappId.get(messageId)) return;
 
             await new Promise((resolve) => setTimeout(resolve, 5000));
-            if (stmts.findMessageByWhatsappId.get(messageId) || !client) return;
+            // isOwnMessageClaimed: la librería ya lo está guardando (la media tarda en bajar).
+            if (stmts.findMessageByWhatsappId.get(messageId) || isOwnMessageClaimed(messageId) || !client) return;
 
             const message = new Message(client, data);
             client.emit('message_create', message);
@@ -303,7 +311,7 @@ async function attachDirectMessageListener() {
         const { Msg } = window.require('WAWebCollections');
         if (!window.__nokiaDirectMessageListener) {
           Msg.on('add', (msg) => {
-            if (!msg.isNewMsg || msg.id?.fromMe) return;
+            if (!msg.isNewMsg) return;
             window.onNokiaDirectMessageAdded(window.WWebJS.getMessageModel(msg));
           });
           window.__nokiaDirectMessageListener = true;
@@ -312,7 +320,7 @@ async function attachDirectMessageListener() {
         if (window.__nokiaRecentMessagesRecovered) return [];
         window.__nokiaRecentMessagesRecovered = true;
         return Msg.getModelsArray()
-          .filter((msg) => msg.isNewMsg && !msg.id?.fromMe && Number(msg.t) >= cutoff)
+          .filter((msg) => msg.isNewMsg && Number(msg.t) >= cutoff)
           .sort((a, b) => Number(a.t) - Number(b.t))
           .slice(-500)
           .map((msg) => window.WWebJS.getMessageModel(msg));
@@ -323,7 +331,7 @@ async function attachDirectMessageListener() {
         let recoveredCount = 0;
         for (const data of recoveredMessages) {
           const messageId = getWhatsappMessageId(data);
-          if (!messageId || data?.id?.fromMe || stmts.findMessageByWhatsappId.get(messageId)) continue;
+          if (!messageId || stmts.findMessageByWhatsappId.get(messageId)) continue;
 
           const message = new Message(client, data);
           message.isNokiaBackfill = true;
@@ -364,14 +372,15 @@ async function attachDirectMessageListener() {
   }
 }
 
-export async function syncUnreadCountsFromWhatsapp() {
+// quiet: la página de inicio del Nokia lo llama en cada carga; solo se registra al conectar.
+export async function syncUnreadCountsFromWhatsapp({ quiet = false } = {}) {
   if (!client || connectionStatus !== 'connected') return;
   try {
     const chats = await getChatUnreadSummariesDirectly();
     for (const chat of chats) {
       if (chat.id) await applyChatUnreadCount(chat);
     }
-    console.log(`[whatsapp] 🔄 Sincronizados contadores de no leídos con WhatsApp (${chats.length} chats).`);
+    if (!quiet) console.log(`[whatsapp] 🔄 Sincronizados contadores de no leídos con WhatsApp (${chats.length} chats).`);
   } catch (err) {
     console.warn('[whatsapp] Error sincronizando unread counts:', err.message);
   }
@@ -1146,6 +1155,121 @@ export async function startWhatsappClient(processMessageFn) {
     }
   });
 
+  // ── Mensajes propios escritos desde otros dispositivos ────────────────────────────
+  // Fila de usuario a la que pertenece un chat privado. WhatsApp puede identificar el mismo
+  // chat como @lid en un sitio y como @c.us en otro (ver applyChatUnreadCount): se busca por
+  // id exacto, luego por los mismos dígitos y luego por el teléfono real del contacto, antes
+  // de crear una fila nueva (que partiría la conversación en dos).
+  async function resolveOwnChatUserId(chatId) {
+    const exact = stmts.getUserByChatId.get(chatId);
+    if (exact) return exact.chat_id;
+    const digits = chatId.split('@')[0];
+    const sameDigits = digits ? stmts.getUserByPhonePattern.get(`${digits}@%`) : null;
+    if (sameDigits) return sameDigits.chat_id;
+    const phone = await resolveContactPhone(chatId).catch(() => null);
+    const phoneDigits = phone ? phone.replace(/[^0-9]/g, '') : '';
+    if (phoneDigits && phoneDigits !== digits) {
+      const byPhone = stmts.getUserByPhonePattern.get(`${phoneDigits}@%`);
+      if (byPhone) return byPhone.chat_id;
+    }
+    const { name, priority } = await resolveDisplayNameForChatId(chatId);
+    stmts.upsertUserNameIfPreferred.run(chatId, name, priority);
+    return chatId;
+  }
+
+  // Guarda un mensaje propio enviado desde el móvil / WhatsApp Web / etc. Igual que lo que
+  // guarda el Nokia al enviar (from_me = 1, user_chat_id del destinatario o group_id sin
+  // autor), con media, citas y tipo de mensaje como los entrantes. No toca no leídos ni SMS:
+  // de eso se encarga WhatsApp (al escribir desde el móvil, el chat queda leído y llega por
+  // el listener de unreadCount). Devuelve el id de la fila nueva, o null si no se insertó.
+  async function saveOwnMessage(body, mediaInfo, msg) {
+    const chatId = body.chat_id;
+    const whatsappMsgId = body.whatsapp_msg_id;
+    const isGroup = Number(body.is_group) === 1;
+    const text = String(body.message ?? '').trim().slice(0, 65535);
+    if (!chatId || !whatsappMsgId || !text) return null;
+
+    let userChatId = null;
+    let groupId = null;
+    if (isGroup) {
+      groupId = chatId;
+      if (!stmts.getGroupById.get(chatId)) {
+        const name = (await resolveGroupNameFromWhatsapp(chatId).catch(() => null)) || 'Grupo sin nombre';
+        stmts.upsertGroup.run(chatId, name);
+      }
+    } else {
+      userChatId = await resolveOwnChatUserId(chatId);
+    }
+
+    const hourSend = String(body.time || '');
+    const daySend = String(body.date || hourSend.slice(0, 10));
+    const ack = Number(msg?.ack ?? msg?._data?.ack);
+
+    // ¿Es en realidad un envío del Nokia que perdió su enlace? Mismo chat, mismo texto,
+    // reciente y sin whatsapp_msg_id: se adopta esa fila en vez de duplicarla. Ventana de 10
+    // minutos en vivo; 24 h en la recuperación tras reconexión (tras un reinicio se pierden
+    // los enlaces pendientes en memoria de los envíos de antes).
+    // (hour_send es hora local «AAAA-MM-DD HH:MM:SS»: se resta en UTC solo para la aritmética.)
+    const sendMs = Date.parse(`${hourSend.replace(' ', 'T')}Z`);
+    const since = Number.isFinite(sendMs)
+      ? new Date(sendMs - (msg?.isNokiaBackfill ? 24 * 3600_000 : 10 * 60_000)).toISOString().slice(0, 19).replace('T', ' ')
+      : null;
+    const orphan = since
+      ? stmts.findUnlinkedOwnMessage.get({ text, since, user_chat_id: userChatId, group_id: groupId })
+      : null;
+    if (orphan) {
+      stmts.setMessageWhatsappId.run(whatsappMsgId, orphan.id);
+      syncOutgoingMessageAck(whatsappMsgId, ack);
+      console.log(`[whatsapp] Mensaje propio enlazado a una fila del Nokia sin id (#${orphan.id}) en vez de duplicarlo.`);
+      return null;
+    }
+
+    const hasMedia = Boolean(mediaInfo?.hasMedia);
+    const insert = db.transaction(() => {
+      const result = stmts.insertOwnMessage.run({
+        text,
+        day_send: daySend,
+        hour_send: hourSend,
+        user_chat_id: userChatId,
+        group_id: groupId,
+        has_media: hasMedia ? 1 : 0,
+        is_sticker: Number(body.is_sticker) === 1 ? 1 : 0,
+        media_key: mediaInfo?.mediaKey ?? null,
+        whatsapp_msg_id: whatsappMsgId,
+        quoted_text: body.quoted_text || null,
+        quoted_sender: body.quoted_sender || null,
+        media_type: body.media_type || null,
+      });
+      if (result.changes === 0) return null;
+      const messageId = result.lastInsertRowid;
+      if (hasMedia) {
+        stmts.insertAttachment.run(
+          messageId,
+          mediaInfo.mediaKey ?? null,
+          mediaInfo.mimeType,
+          mediaInfo.filename,
+          mediaInfo.bufferLength,
+          mediaInfo.filePathFull || mediaInfo.originalPath,
+          mediaInfo.filePathView || null,
+          mediaInfo.filePathThumb || null,
+          mediaInfo.durationSec ?? null,
+          0,
+          Math.floor(Date.now() / 1000)
+        );
+      }
+      return messageId;
+    });
+
+    const messageId = insert();
+    if (!messageId) {
+      console.log(`[whatsapp] Mensaje propio ya guardado (duplicado descartado): ${whatsappMsgId}`);
+      return null;
+    }
+    syncOutgoingMessageAck(whatsappMsgId, ack);
+    console.log(`[whatsapp] 📲 Mensaje propio de otro dispositivo guardado (#${messageId}) en ${isGroup ? 'el grupo' : 'el chat'} ${groupId || userChatId}.`);
+    return messageId;
+  }
+
   client.on('message_create', async (msg) => {
     // msg._data.id a veces llega sin ._serialized poblado (mismo entorno inestable de
     // siempre) pero SÍ trae el id ya serializado bajo la clave interna '$1' — nunca usar el
@@ -1169,40 +1293,73 @@ export async function startWhatsappClient(processMessageFn) {
       return;
     }
 
+    // Mensajes propios. Pueden venir de tres sitios:
+    //   1. Del propio Nokia (web o J2ME): la fila ya la insertó el controlador al enviar, pero
+    //      sin whatsapp_msg_id, porque client.sendMessage() no lo devuelve fiablemente en este
+    //      entorno. Este evento sí trae el ID real (msg.id.remote ya viene como string plano)
+    //      y se usa para enlazarlo a posteriori con la fila pendiente de ese chat.
+    //   2. Del Nokia, pero con el envío aún en curso (el evento llega antes de que exista la
+    //      fila): se deja en la cola de «observados» y el controlador lo recoge al insertar.
+    //   3. De otro dispositivo (móvil, WhatsApp Web…): no hay fila ni envío en curso, así que
+    //      se guarda como mensaje propio más abajo, con la misma lógica de media/citas que los
+    //      entrantes, pero sin SMS, sin contador de no leídos y sin aviso sonoro en el Nokia.
+    let ownFromOtherDevice = false;
+    let ownChatId = null;
     if (msg.fromMe) {
-      // La fila ya la insertó validateAndCreateChat (message.controller.js) al enviar, pero
-      // sin whatsapp_msg_id porque client.sendMessage() no lo devuelve fiablemente en este
-      // entorno. Este evento sí trae el ID real y de forma fiable (msg.id.remote ya viene
-      // como string plano, normalizado por la propia librería) — se usa para enlazarlo a
-      // posteriori con la fila que quedó pendiente para este mismo chat.
       const chatId = getSerializedId(msg.id?.remote)
         || getSerializedId(msg._data?.id?.remote)
         || getSerializedId(msg.to)
         || getSerializedId(msg._data?.to);
-      if (whatsappMsgId) {
-        let linkedRow = false;
-        if (chatId) {
-          const rowId = takePendingOutgoing(chatId);
-          if (rowId) {
-            try {
-              stmts.setMessageWhatsappId.run(whatsappMsgId, rowId);
-              linkedRow = true;
-              console.log(`[whatsapp] whatsapp_msg_id asignado a posteriori: fila local #${rowId} -> ${whatsappMsgId}`);
-            } catch (err) {
-              console.warn('[whatsapp] No se pudo enlazar whatsapp_msg_id:', err?.message);
-            }
+      if (!whatsappMsgId) {
+        // Sin id no hay forma segura de evitar duplicados: se omite.
+        console.log(`[whatsapp] Mensaje saliente sin whatsapp_msg_id omitido (chat ${chatId || '?'}).`);
+        return;
+      }
+      let linkedRow = false;
+      if (chatId) {
+        // Solo la fila pendiente de ESTE mensaje (mismo texto, o media sin pie de foto).
+        const rowId = takePendingOutgoing(chatId, (id) => isSameOutgoingMessage(
+          stmts.getMessageById.get(id), { body: msg.body, hasMedia: msg.hasMedia }
+        ));
+        if (rowId) {
+          try {
+            stmts.setMessageWhatsappId.run(whatsappMsgId, rowId);
+            linkedRow = true;
+            console.log(`[whatsapp] whatsapp_msg_id asignado a posteriori: fila local #${rowId} -> ${whatsappMsgId}`);
+          } catch (err) {
+            console.warn('[whatsapp] No se pudo enlazar whatsapp_msg_id:', err?.message);
           }
         }
-        const currentAck = Number(msg.ack ?? msg._data?.ack);
-        if (linkedRow || stmts.findMessageByWhatsappId.get(whatsappMsgId)) {
-          syncOutgoingMessageAck(whatsappMsgId, currentAck);
-        } else if (chatId) {
-          registerObservedOutgoing(chatId, whatsappMsgId);
-          rememberPendingOutgoingAck(whatsappMsgId, currentAck);
-        }
       }
-      console.log(`[whatsapp] Mensaje saliente omitido (ya guardado por validateAndCreateChat): ${whatsappMsgId}`);
-      return;
+      const currentAck = Number(msg.ack ?? msg._data?.ack);
+      if (linkedRow || stmts.findMessageByWhatsappId.get(whatsappMsgId)) {
+        syncOutgoingMessageAck(whatsappMsgId, currentAck);
+        return;
+      }
+      if (!chatId) return;
+      if (matchesNokiaSendInFlight(chatId, { body: msg.body, hasMedia: msg.hasMedia })) {
+        registerObservedOutgoing(chatId, whatsappMsgId);
+        rememberPendingOutgoingAck(whatsappMsgId, currentAck);
+        console.log(`[whatsapp] Mensaje saliente del Nokia aún en curso: ${whatsappMsgId} (se enlazará a su fila).`);
+        return;
+      }
+      if (matchesNokiaSendInFlight(chatId, { anyText: true })) {
+        // Diagnóstico: hay un envío del Nokia en curso a este chat pero el texto no coincide.
+        // Lo normal es que sea un mensaje escrito a la vez desde otro dispositivo; si alguna
+        // vez apareciera duplicado un envío del Nokia, esta línea lo explicaría.
+        console.log(`[whatsapp] Envío del Nokia en curso a ${chatId} con otro texto: este se trata como de otro dispositivo.`);
+      }
+      if (!isSyncableOwnChat(chatId)) {
+        console.log(`[whatsapp] Mensaje propio en ${chatId} (estado/difusión/canal): no se sincroniza.`);
+        return;
+      }
+      // El mismo mensaje puede llegar también por el listener directo: solo lo guarda uno.
+      if (!claimOwnMessage(whatsappMsgId)) return;
+      // Los ticks que lleguen mientras se descarga la media se aplican al insertar.
+      rememberPendingOutgoingAck(whatsappMsgId, currentAck);
+      ownFromOtherDevice = true;
+      ownChatId = chatId;
+      console.log(`[whatsapp] 📲 Mensaje propio enviado desde otro dispositivo a ${chatId}: ${whatsappMsgId}`);
     }
 
     // IGNORAR BACKLOG: Omitimos mensajes con más de 5 minutos (300s) de antigüedad
@@ -1290,12 +1447,15 @@ export async function startWhatsappClient(processMessageFn) {
     }
 
     try {
-      const chatId = msg.from || null;
+      // Entrante: el chat es quien lo manda. Propio desde otro dispositivo: el destinatario.
+      const chatId = ownFromOtherDevice ? ownChatId : (msg.from || null);
       let chat = null;
       let isGroup = Boolean(chatId && chatId.endsWith('@g.us'));
 
       try {
-        chat = await msg.getChat();
+        // Para un mensaje propio basta con el sufijo del id (@g.us): getChat() pasa por la
+        // misma familia de llamadas inestables («r: r») y no aporta nada más.
+        if (!ownFromOtherDevice) chat = await msg.getChat();
         if (typeof chat?.isGroup === 'boolean') {
           isGroup = chat.isGroup;
         }
@@ -1322,7 +1482,13 @@ export async function startWhatsappClient(processMessageFn) {
       let title, senderName, groupName;
       let senderNamePriority = 0;
 
-      if (isGroup) {
+      if (ownFromOtherDevice) {
+        // El remitente soy yo: no se resuelve como contacto (msg.getContact() me devolvería a
+        // mí y acabaría guardándome como el interlocutor del chat).
+        title = 'Yo';
+        senderName = 'Yo';
+        groupName = null;
+      } else if (isGroup) {
         // chat?.name viene de msg.getChat(), que puede toparse con el mismo bug de
         // "r: r" ya documentado (groupMetadata.update()) — probamos primero la vía
         // segura ya usada en el resto de la app antes de caer al ID en crudo.
@@ -1415,7 +1581,7 @@ export async function startWhatsappClient(processMessageFn) {
           message: resolvedBody,
           date: dateStr,
           time: timeStr,
-          chat_id: msg.from,
+          chat_id: chatId,
           sender_chat_id: senderChatId,
           whatsapp_msg_id: whatsappMsgId,
           from_me: msg.fromMe ? 1 : 0,
@@ -1439,10 +1605,17 @@ export async function startWhatsappClient(processMessageFn) {
         json(data) { this._json = data; },
       };
 
+      // Guardado: entrantes por saveInteraction (contacto, no leídos, SMS); propios de otro
+      // dispositivo por saveOwnMessage (from_me = 1, sin nada de eso). El resto (sticker,
+      // encuesta, adjuntos) es igual para los dos.
+      const persist = (request, info) => (ownFromOtherDevice
+        ? saveOwnMessage(request.body, info, msg)
+        : saveInteraction(request, mockRes, logSaveInteractionError, info));
+
       if (esPoll) {
         // Igual que el sticker: mediaInfo=null para que saveInteraction NO pase por el alta
         // genérica de attachments — una encuesta no tiene fichero, tiene opciones.
-        const messageId = await saveInteraction(fakeReq, mockRes, logSaveInteractionError, null);
+        const messageId = await persist(fakeReq, null);
 
         if (messageId && Array.isArray(msg.pollOptions)) {
           try {
@@ -1466,7 +1639,7 @@ export async function startWhatsappClient(processMessageFn) {
             is_sticker: 1,
           },
         };
-        const messageId = await saveInteraction(stickerReq, mockRes, logSaveInteractionError, null);
+        const messageId = await persist(stickerReq, null);
 
         if (messageId) {
           try {
@@ -1495,9 +1668,10 @@ export async function startWhatsappClient(processMessageFn) {
           }
         }
       } else {
-        const messageId = await saveInteraction(fakeReq, mockRes, logSaveInteractionError, mediaInfo);
+        const messageId = await persist(fakeReq, mediaInfo);
         if (
           messageId &&
+          !ownFromOtherDevice &&   // tus propias notas de voz no se transcriben
           (mediaType === 'ptt' || mediaType === 'audio') &&
           mediaInfo?.originalPath
         ) {
@@ -1505,7 +1679,9 @@ export async function startWhatsappClient(processMessageFn) {
         }
       }
 
-      marcarNovedad(resolvedBody);
+      // Aviso sonoro en el Nokia solo para lo que llega de otros: lo que escribes tú desde
+      // otro dispositivo aparece en la conversación sin hacer sonar la alerta.
+      if (!ownFromOtherDevice) marcarNovedad(resolvedBody);
 
     } catch (err) {
       console.error('[whatsapp] Error en message_create:', err?.stack || err?.message || err);

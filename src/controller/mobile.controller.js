@@ -8,9 +8,11 @@ import {
   createTrustToken,
   revokeTrustToken,
 } from '../services/auth.service.js';
-import { client, getConnectionStatus, sendWhatsappSeen } from '../services/whatsapp.service.js';
+import { client, getConnectionStatus, sendWhatsappSeen, syncOutgoingMessageAck } from '../services/whatsapp.service.js';
 import { getPollingState, limpiarNovedad } from '../services/polling.service.js';
-import { registerPendingOutgoing } from '../services/pending-outgoing.service.js';
+import {
+  beginNokiaSend, endNokiaSend, registerPendingOutgoing, removeObservedOutgoing, takeObservedOutgoing,
+} from '../services/pending-outgoing.service.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
 import { ensureGroupDisplayName, ensureGroupDisplayNames } from './group.controller.js';
 import { DIRECTORY_PAGE_SIZE, MESSAGE_PAGE_SIZE, getTotal, toPositiveInt } from './page.controller.js';
@@ -341,59 +343,79 @@ export async function mobileSendMessage(req, res) {
       }
     }
 
-    let sentMessage;
+    // «En curso» hasta enlazar la fila: el message_create propio que llegue mientras tanto es
+    // de este envío (no de otro dispositivo) y no debe guardarse aparte.
+    const sendToken = beginNokiaSend(targetJid, { text: processedText });
     try {
-      sentMessage = await client.sendMessage(targetJid, processedText, { waitUntilMsgSent: true });
-    } catch (error) {
-      console.error('[Mobile] Error enviando mensaje a WhatsApp:', error.message);
-      return jsonError(res, 502, 'WHATSAPP_SEND_FAILED', 'No se pudo enviar el mensaje.');
-    }
-
-    // client.sendMessage() puede no devolver el Message con su id en este entorno — el ID
-    // real se enlaza mas tarde de forma asincrona via message_create + pending-outgoing.
-    const whatsappMsgId = sentMessage?.id?._serialized || null;
-
-    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
-    const pad = (n) => String(n).padStart(2, '0');
-    const daySend = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-    const hourSend = `${daySend} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-
-    let insertedMessageId;
-    if (isGroup) {
-      const result = stmts.insertMessage.run(processedText, daySend, hourSend, 1, null, targetJid, whatsappMsgId);
-      insertedMessageId = result.lastInsertRowid;
-    } else {
-      const existingUser = stmts.getUserByChatId.get(targetJid);
-      if (!existingUser) {
-        let finalName = `+${targetJid.split('@')[0]}`;
-        try {
-          const contact = await client.getContactById(targetJid);
-          if (contact) {
-            finalName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || finalName;
-          }
-        } catch (e) {
-          // Ignorar error de resolucion de contacto, se guarda con nombre generico.
-        }
-        stmts.upsertUser.run(targetJid, finalName);
+      let sentMessage;
+      try {
+        sentMessage = await client.sendMessage(targetJid, processedText, { waitUntilMsgSent: true });
+      } catch (error) {
+        console.error('[Mobile] Error enviando mensaje a WhatsApp:', error.message);
+        return jsonError(res, 502, 'WHATSAPP_SEND_FAILED', 'No se pudo enviar el mensaje.');
       }
-      const result = stmts.insertMessage.run(processedText, daySend, hourSend, 1, targetJid, null, whatsappMsgId);
-      insertedMessageId = result.lastInsertRowid;
-    }
 
-    // La fila debe insertarse aqui mismo: message_create (whatsapp.service.js) NO reinserta
-    // mensajes propios (fromMe), solo enlaza whatsapp_msg_id a posteriori sobre esta fila.
-    if (!whatsappMsgId && insertedMessageId) {
-      registerPendingOutgoing(targetJid, insertedMessageId);
-    }
+      // client.sendMessage() puede no devolver el Message con su id en este entorno — el ID
+      // real se enlaza mas tarde de forma asincrona via message_create + pending-outgoing.
+      let whatsappMsgId = sentMessage?.id?._serialized || null;
 
-    res.status(201).json({
-      id: insertedMessageId,
-      chatId: targetJid,
-      type: isGroup ? 'group' : 'user',
-      text: processedText,
-      sentAt: hourSend,
-      whatsappMsgId,
-    });
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
+      const pad = (n) => String(n).padStart(2, '0');
+      const daySend = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+      const hourSend = `${daySend} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+
+      let insertedMessageId;
+      if (isGroup) {
+        const result = stmts.insertMessage.run(processedText, daySend, hourSend, 1, null, targetJid, whatsappMsgId);
+        insertedMessageId = result.lastInsertRowid;
+      } else {
+        const existingUser = stmts.getUserByChatId.get(targetJid);
+        if (!existingUser) {
+          let finalName = `+${targetJid.split('@')[0]}`;
+          try {
+            const contact = await client.getContactById(targetJid);
+            if (contact) {
+              finalName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || finalName;
+            }
+          } catch (e) {
+            // Ignorar error de resolucion de contacto, se guarda con nombre generico.
+          }
+          stmts.upsertUser.run(targetJid, finalName);
+        }
+        const result = stmts.insertMessage.run(processedText, daySend, hourSend, 1, targetJid, null, whatsappMsgId);
+        insertedMessageId = result.lastInsertRowid;
+      }
+
+      // La fila debe insertarse aqui mismo: message_create (whatsapp.service.js) reconoce este
+      // envío como del Nokia y solo enlaza whatsapp_msg_id a posteriori sobre esta fila.
+      // Igual que en message.controller.js: si WhatsApp ya confirmó el envío antes de llegar
+      // aquí, su id está en la cola de «observados».
+      if (insertedMessageId) {
+        if (whatsappMsgId) {
+          removeObservedOutgoing(targetJid, whatsappMsgId);
+          syncOutgoingMessageAck(whatsappMsgId, sentMessage?.ack);
+        } else {
+          whatsappMsgId = takeObservedOutgoing(targetJid);
+          if (whatsappMsgId) {
+            stmts.setMessageWhatsappId.run(whatsappMsgId, insertedMessageId);
+            syncOutgoingMessageAck(whatsappMsgId, sentMessage?.ack);
+          } else {
+            registerPendingOutgoing(targetJid, insertedMessageId);
+          }
+        }
+      }
+
+      res.status(201).json({
+        id: insertedMessageId,
+        chatId: targetJid,
+        type: isGroup ? 'group' : 'user',
+        text: processedText,
+        sentAt: hourSend,
+        whatsappMsgId,
+      });
+    } finally {
+      endNokiaSend(sendToken);
+    }
   } catch (error) {
     console.error('[Mobile] Error en mobileSendMessage:', error);
     jsonError(res, 500, 'INTERNAL_ERROR', 'Error interno.');

@@ -18,10 +18,6 @@ function getPublicBaseUrl() {
   // Si el túnel HTTPS está activo, los enlaces de los SMS van cifrados.
   const tlsBaseUrl = getPublicTlsBaseUrl();
   if (tlsBaseUrl) return tlsBaseUrl;
-  const useCloudflare = (process.env.CLOUDFLARE_ENABLED || '').toLowerCase() === 'true';
-  if (useCloudflare && process.env.CLOUDFLARE_TUNNEL_HOSTNAME) {
-    return `https://${process.env.CLOUDFLARE_TUNNEL_HOSTNAME}`;
-  }
   if (process.env.NGROK_HTTP_URL) {
     return process.env.NGROK_HTTP_URL.replace(/\/$/, '');
   }

@@ -355,6 +355,24 @@ export const stmts = {
     SELECT id FROM messages WHERE whatsapp_msg_id = ? LIMIT 1
   `),
 
+  // Mensaje propio escrito desde otro dispositivo (móvil, WhatsApp Web…). Mismas columnas
+  // que guarda saveInteraction, con from_me = 1; OR IGNORE + whatsapp_msg_id UNIQUE descartan
+  // un segundo intento con el mismo mensaje.
+  insertOwnMessage: db.prepare(`
+    INSERT OR IGNORE INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, is_sticker, media_key, whatsapp_msg_id, quoted_text, quoted_sender, is_system, media_type)
+    VALUES (@text, @day_send, @hour_send, 1, @user_chat_id, @group_id, @has_media, @is_sticker, @media_key, @whatsapp_msg_id, @quoted_text, @quoted_sender, 0, @media_type)
+  `),
+
+  // Fila enviada por el Nokia que se quedó sin whatsapp_msg_id (se perdió el enlace en
+  // memoria, p. ej. por un reinicio justo al enviar): mismo chat, mismo texto, reciente.
+  findUnlinkedOwnMessage: db.prepare(`
+    SELECT id FROM messages
+    WHERE from_me = 1 AND whatsapp_msg_id IS NULL AND text = @text AND hour_send >= @since
+      AND ((@user_chat_id IS NOT NULL AND user_chat_id = @user_chat_id)
+        OR (@group_id IS NOT NULL AND group_id = @group_id))
+    ORDER BY id DESC LIMIT 1
+  `),
+
   updateMessageAckByWhatsappId: db.prepare(`
     UPDATE messages SET ack_status = ? WHERE whatsapp_msg_id = ? AND ack_status < ?
   `),

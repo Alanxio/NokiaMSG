@@ -2,9 +2,11 @@
 //
 // El 6111 solo habla TLS 1.0 (sin SNI ni extensiones) y solo se fía de nuestra raíz
 // propia (RSA 2048 + SHA-1, instalada en el teléfono). Este servicio:
-//   · recibe la conexión cruda del túnel TCP de ngrok. Si llega cabecera PROXY v1 la usa
-//     para saber la IP real del teléfono; la cuenta gratuita «legacy» de ngrok NO permite
-//     proxy_proto (ERR_NGROK_9014), así que normalmente no llega y la IP es la del agente,
+//   · recibe la conexión cruda del túnel TCP: playit.gg (proveedor actual, con PROXY
+//     protocol v1 activado → IP real del teléfono) o ngrok TCP (la cuenta gratuita «legacy»
+//     NO permite proxy_proto, ERR_NGROK_9014, así que ahí la IP es la del agente). OJO: la
+//     cabecera PROXY se acepta de quien la mande; solo es fiable si el túnel siempre la pone,
+//     como playit con PROXY v1,
 //   · descifra TLS 1.0 con AES (lo único antiguo que permite el OpenSSL 3 de Node 18),
 //   · reenvía cada petición HTTP al Gateway añadiendo X-Nokia-TLS, X-Forwarded-Host y
 //     X-Forwarded-For (la IP real; la que mande el cliente se descarta).
@@ -13,7 +15,7 @@
 //
 // Ficheros en /tls (volumen ../NokiaMSN/data/tls):
 //   ca.key, ca.pem, ca.cer   raíz propia (NO regenerar: está instalada en el Nokia)
-//   public-address           «host:puerto» público actual, lo escribe expose.sh
+//   public-address           «host:puerto» público actual, lo escribe GateWayNK/scripts/expose.sh
 //   server-<host>.pem/.key   certificado del servidor para ese host (se genera solo)
 import fs from 'node:fs';
 import path from 'node:path';
@@ -132,7 +134,7 @@ function bridge(socket, first) {
   return duplex;
 }
 
-// ngrok (proxy_proto: 1) antepone «PROXY TCP4 <ip cliente> <ip destino> <p> <p>\r\n».
+// playit (PROXY v1) / ngrok (proxy_proto: 1) anteponen «PROXY TCP4 <ip cliente> <ip destino> <p> <p>\r\n».
 function parseProxyHeader(buf) {
   if (buf.length < 6 || buf.toString('latin1', 0, 6) !== 'PROXY ') return { ip: null, rest: buf };
   const end = buf.indexOf('\r\n');

@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:22.23.3-slim
 
 # Instalar dependencias de ejecución del sistema para Chrome y SQLite
 RUN apt-get update && apt-get install -y \
@@ -42,6 +42,7 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 COPY . /usr/src/app
 
-RUN chmod -R 777 /usr/src/app
+# Sin «RUN chmod -R 777 /usr/src/app»: el contenedor corre como root (no hace falta) y esa
+# capa duplicaba node_modules (~850 MB) en cada cambio de código, haciendo lento el build.
 
 CMD ["node", "src/index.js"]

@@ -8,7 +8,7 @@ const GROUP_ICON_HTML = '<img src="/assets/group.jpeg" alt="G" height="14" width
 
 export async function showHome(req, res, next) {
   try {
-    await syncUnreadCountsFromWhatsapp();
+    await syncUnreadCountsFromWhatsapp({ quiet: true });
     const recentUsers = stmts.getRecentUsersWithUnseen.all(10);
     const recentGroups = stmts.getRecentGroupsWithUnseen.all(10);
 

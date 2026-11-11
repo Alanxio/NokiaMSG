@@ -108,25 +108,20 @@ No te sirve para POP3 ni SMTP. Para correo necesitas una de estas opciones:
 - usar un túnel TCP real
 - poner el proyecto en una VPS con puertos accesibles
 
-## Exposicion publica con ngrok
+## Exposicion publica
 
-Si el servidor ya esta corriendo en `localhost:8080`, abre el tunel con:
-
-```bash
-npm run tunnel
-```
-
-O si quieres arrancar app + tunel juntos fuera de Docker:
+El despliegue y los tuneles se gestionan desde GateWayNK (Gateway + nokia-tls + resto de
+servicios con Docker Compose):
 
 ```bash
-npm run expose
+npm run expose            # = ../GateWayNK/scripts/expose.sh
+npm run expose -- --help  # opciones: --http | --https | --both, --all, --no-build
 ```
 
-Nota:
-
-- `npm run expose` solo te sirve si la app puede conectar a la base de datos desde tu maquina.
-- Con tu `.env` actual, lo normal es usar `docker compose up --build` y luego `npm run tunnel`.
-- Si `NGROK_HTTP_URL` esta vacio, ngrok normalmente te dara una URL `https://...`.
+- Entrada HTTP en claro: ngrok.
+- HTTPS del Nokia 6111 (TLS 1.0, raiz propia): `nokia-tls` detras del tunel TCP de playit.gg
+  (`NOKIA_TLS_PROVIDER=playit`) o de ngrok.
+- La configuracion (authtoken, proveedor, direccion de playit) esta en `GateWayNK/Gateway/.env`.
 
 ## Endpoints
 
@@ -413,10 +408,10 @@ curl -X POST http://localhost:8080/notificacion/test-email \
 4. Si quieres compartir la web fuera:
 
 ```bash
-npm run tunnel
+npm run expose
 ```
 
-5. Usa la URL publica que te devuelva ngrok para HTTP.
+5. Usa la URL publica que muestra el resumen del script.
 
 6. Para que el Nokia reciba correo desde fuera, expón también POP3 por TCP.
 

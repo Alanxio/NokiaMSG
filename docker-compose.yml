@@ -19,18 +19,5 @@ services:
     networks:
       - app-network
 
-  # cloudflared:
-  #   image: cloudflare/cloudflared:latest
-  #   container_name: cloudflared
-  #   restart: always
-  #   command: tunnel run
-  #   environment:
-  #     - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
-  #   depends_on:
-  #     - app
-  #   networks:
-  #     - app-network
-
-
 networks:
   app-network:

@@ -10,7 +10,6 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "test": "node --test test/*.test.js",
-    "tunnel": "./scripts/ngrok-http.sh",
     "expose": "./scripts/expose.sh"
   },
   "dependencies": {

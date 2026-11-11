@@ -11,6 +11,7 @@ import authRoutes from './auth.routes.js';
 import { requireAuth } from '../middlewares/auth.middleware.js';
 import { showSettings, saveSettings, confirmCloseSessions, closeOtherSessions } from '../controller/settings.controller.js';
 import { serveAvatar } from '../services/avatar.service.js';
+import { showStatus } from '../controller/status.controller.js';
 
 const router = Router();
 
@@ -29,6 +30,7 @@ router.use('/grupo', requireAuth, groupRoutes);
 router.use('/mensaje', requireAuth, messageRoutes);
 router.get('/avatar/:size/:id', requireAuth, serveAvatar);
 
+router.get('/estado', requireAuth, showStatus);
 router.get('/ajustes', requireAuth, showSettings);
 router.post('/ajustes', requireAuth, saveSettings);
 router.get('/ajustes/cerrar-sesiones', requireAuth, confirmCloseSessions);

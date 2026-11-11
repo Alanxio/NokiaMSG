@@ -27,7 +27,7 @@ function normalizeGroupName(rawName) {
 // Asegúrate de que esta ruta apunte correctamente a donde exportas el cliente
 import { castPollVote, client, refreshPollVotesFromWhatsapp, resolveContactPhone, resolveMyVoterIds, syncOutgoingMessageAck } from '../services/whatsapp.service.js';
 import { ensureGroupDisplayName } from './group.controller.js';
-import { registerPendingOutgoing, removeObservedOutgoing, takeObservedOutgoing } from '../services/pending-outgoing.service.js';
+import { beginNokiaSend, endNokiaSend, registerPendingOutgoing, removeObservedOutgoing, takeObservedOutgoing } from '../services/pending-outgoing.service.js';
 import { getRequestBaseUrl } from '../utils/public-url.js';
 
 const EXISTING_CONTACT_ICON_HTML = '<img src="/assets/user.jpeg" alt="Contacto" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
@@ -587,123 +587,130 @@ export async function validateAndCreateChat(req, res, next) {
     const sentMedia = [];
 
     for (const { mediaFile, mediaType, text: messageText } of outgoingMessages) {
-      const hasAttachment = !!mediaFile;
-      let sentMessage;
-      if (mediaFile) {
-        const media = new MessageMedia(
-          mediaType === 'video' ? 'video/3gpp' : mediaFile.mimetype,
-          mediaFile.buffer.toString('base64'),
-          mediaFile.originalname
-        );
-        const mediaOptions = {
-          ...options,
-          caption: messageText,
-        };
-        if (!messageText) delete mediaOptions.mentions;
-        try {
-          sentMessage = await client.sendMessage(targetJid, media, mediaOptions);
-        } catch (error) {
-          if (replyMessage) {
-            console.error('[mensaje] No se pudo enviar la respuesta:', error?.message || error);
-            return sendPage(
-              req,
-              res,
-              409,
-              'No se pudo responder',
-              '<p>WhatsApp no pudo vincular la respuesta al mensaje original; no se ha enviado como mensaje normal.</p><p><a href="/mensaje/componer">Volver</a></p>'
-            );
-          }
-          throw error;
-        }
-      } else {
-        try {
-          sentMessage = await client.sendMessage(targetJid, messageText, options);
-        } catch (error) {
-          if (replyMessage) {
-            console.error('[mensaje] No se pudo enviar la respuesta:', error?.message || error);
-            return sendPage(
-              req,
-              res,
-              409,
-              'No se pudo responder',
-              '<p>WhatsApp no pudo vincular la respuesta al mensaje original; no se ha enviado como mensaje normal.</p><p><a href="/mensaje/componer">Volver</a></p>'
-            );
-          }
-          throw error;
-        }
-      }
-
-      // whatsapp-web.js puede no devolver el id, así que se enlaza después del evento
-      // message_create cuando WhatsApp confirme el envío.
-      let whatsappMsgId = sentMessage?.id?._serialized || sentMessage?.id?.$1 || null;
-      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
-      const pad = (n) => String(n).padStart(2, '0');
-      const daySend = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-      const hourSend = `${daySend} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-      const finalText = messageText || (mediaType === 'video' ? '[Video]' : '[Imagen]');
-      let insertedMessageId;
-
-      if (type === 'group' || targetJid.endsWith('@g.us')) {
-        const group = db.prepare('SELECT group_id FROM wgroups WHERE group_id = ?').get(targetJid);
-        if (!group) {
-          let groupName = 'Grupo sin nombre';
+      // Marca este envío como «en curso» hasta haber enlazado su fila: el message_create
+      // propio que WhatsApp emite mientras tanto es de este envío, no de otro dispositivo.
+      const sendToken = beginNokiaSend(targetJid, { text: messageText, hasMedia: Boolean(mediaFile) });
+      try {
+        const hasAttachment = !!mediaFile;
+        let sentMessage;
+        if (mediaFile) {
+          const media = new MessageMedia(
+            mediaType === 'video' ? 'video/3gpp' : mediaFile.mimetype,
+            mediaFile.buffer.toString('base64'),
+            mediaFile.originalname
+          );
+          const mediaOptions = {
+            ...options,
+            caption: messageText,
+          };
+          if (!messageText) delete mediaOptions.mentions;
           try {
-            const chat = await client.getChatById(targetJid);
-            if (chat && chat.name) groupName = chat.name;
-          } catch (e) {}
-          stmts.upsertGroup.run(targetJid, groupName);
-        }
-        const result = hasAttachment
-          ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null, whatsappMsgId)
-          : stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid, whatsappMsgId);
-        insertedMessageId = result.lastInsertRowid;
-      } else {
-        const user = db.prepare('SELECT chat_id FROM users WHERE chat_id = ?').get(targetJid);
-        if (!user) {
-          let finalName = `+${targetJid.split('@')[0]}`;
-          try {
-            const contact = await client.getContactById(targetJid);
-            if (contact) {
-              finalName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || finalName;
+            sentMessage = await client.sendMessage(targetJid, media, mediaOptions);
+          } catch (error) {
+            if (replyMessage) {
+              console.error('[mensaje] No se pudo enviar la respuesta:', error?.message || error);
+              return sendPage(
+                req,
+                res,
+                409,
+                'No se pudo responder',
+                '<p>WhatsApp no pudo vincular la respuesta al mensaje original; no se ha enviado como mensaje normal.</p><p><a href="/mensaje/componer">Volver</a></p>'
+              );
             }
-          } catch (e) {}
-          stmts.upsertUser.run(targetJid, finalName);
-        }
-        const result = hasAttachment
-          ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null, whatsappMsgId)
-          : stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null, whatsappMsgId);
-        insertedMessageId = result.lastInsertRowid;
-      }
-
-      if (replyMessage && insertedMessageId) {
-        stmts.updateMessageQuote.run(
-          getMessageQuotePreview(replyMessage),
-          (Number(replyMessage.from_me) === 1 ? 'Yo' : (replyMessage.username || 'Desconocido')).slice(0, 100),
-          insertedMessageId
-        );
-      }
-
-      if (insertedMessageId) {
-        if (whatsappMsgId) {
-          removeObservedOutgoing(targetJid, whatsappMsgId);
-          syncOutgoingMessageAck(whatsappMsgId, sentMessage?.ack);
+            throw error;
+          }
         } else {
-          whatsappMsgId = takeObservedOutgoing(targetJid);
+          try {
+            sentMessage = await client.sendMessage(targetJid, messageText, options);
+          } catch (error) {
+            if (replyMessage) {
+              console.error('[mensaje] No se pudo enviar la respuesta:', error?.message || error);
+              return sendPage(
+                req,
+                res,
+                409,
+                'No se pudo responder',
+                '<p>WhatsApp no pudo vincular la respuesta al mensaje original; no se ha enviado como mensaje normal.</p><p><a href="/mensaje/componer">Volver</a></p>'
+              );
+            }
+            throw error;
+          }
+        }
+
+        // whatsapp-web.js puede no devolver el id, así que se enlaza después del evento
+        // message_create cuando WhatsApp confirme el envío.
+        let whatsappMsgId = sentMessage?.id?._serialized || sentMessage?.id?.$1 || null;
+        const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
+        const pad = (n) => String(n).padStart(2, '0');
+        const daySend = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+        const hourSend = `${daySend} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+        const finalText = messageText || (mediaType === 'video' ? '[Video]' : '[Imagen]');
+        let insertedMessageId;
+
+        if (type === 'group' || targetJid.endsWith('@g.us')) {
+          const group = db.prepare('SELECT group_id FROM wgroups WHERE group_id = ?').get(targetJid);
+          if (!group) {
+            let groupName = 'Grupo sin nombre';
+            try {
+              const chat = await client.getChatById(targetJid);
+              if (chat && chat.name) groupName = chat.name;
+            } catch (e) {}
+            stmts.upsertGroup.run(targetJid, groupName);
+          }
+          const result = hasAttachment
+            ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null, whatsappMsgId)
+            : stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid, whatsappMsgId);
+          insertedMessageId = result.lastInsertRowid;
+        } else {
+          const user = db.prepare('SELECT chat_id FROM users WHERE chat_id = ?').get(targetJid);
+          if (!user) {
+            let finalName = `+${targetJid.split('@')[0]}`;
+            try {
+              const contact = await client.getContactById(targetJid);
+              if (contact) {
+                finalName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || finalName;
+              }
+            } catch (e) {}
+            stmts.upsertUser.run(targetJid, finalName);
+          }
+          const result = hasAttachment
+            ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null, whatsappMsgId)
+            : stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null, whatsappMsgId);
+          insertedMessageId = result.lastInsertRowid;
+        }
+
+        if (replyMessage && insertedMessageId) {
+          stmts.updateMessageQuote.run(
+            getMessageQuotePreview(replyMessage),
+            (Number(replyMessage.from_me) === 1 ? 'Yo' : (replyMessage.username || 'Desconocido')).slice(0, 100),
+            insertedMessageId
+          );
+        }
+
+        if (insertedMessageId) {
           if (whatsappMsgId) {
-            stmts.setMessageWhatsappId.run(whatsappMsgId, insertedMessageId);
+            removeObservedOutgoing(targetJid, whatsappMsgId);
             syncOutgoingMessageAck(whatsappMsgId, sentMessage?.ack);
           } else {
-            registerPendingOutgoing(targetJid, insertedMessageId);
+            whatsappMsgId = takeObservedOutgoing(targetJid);
+            if (whatsappMsgId) {
+              stmts.setMessageWhatsappId.run(whatsappMsgId, insertedMessageId);
+              syncOutgoingMessageAck(whatsappMsgId, sentMessage?.ack);
+            } else {
+              registerPendingOutgoing(targetJid, insertedMessageId);
+            }
           }
         }
-      }
 
-      if (mediaType === 'video' && insertedMessageId) {
-        db.prepare('UPDATE messages SET media_type = ? WHERE id = ?').run('video', insertedMessageId);
-      }
+        if (mediaType === 'video' && insertedMessageId) {
+          db.prepare('UPDATE messages SET media_type = ? WHERE id = ?').run('video', insertedMessageId);
+        }
 
-      if (mediaFile && insertedMessageId) {
-        sentMedia.push({ messageId: insertedMessageId, mediaFile, mediaType });
+        if (mediaFile && insertedMessageId) {
+          sentMedia.push({ messageId: insertedMessageId, mediaFile, mediaType });
+        }
+      } finally {
+        endNokiaSend(sendToken);
       }
     }
 

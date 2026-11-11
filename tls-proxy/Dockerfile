@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:22.23.3-slim
 
 # openssl: para generar el certificado del servidor cuando cambia la dirección de ngrok.
 RUN apt-get update && apt-get install -y --no-install-recommends openssl \
