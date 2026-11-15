@@ -1,33 +1,21 @@
 import db, { stmts } from '../../db/db.js';
 import { convertEmojisToAscii } from '../utils/emoji.js';
-import { buildAudioFileName, escapeXml, formatPhoneNumber, isNumericOrJid, renderMediaLine, renderMentions, renderPhoneLink, sendInvalidEntity, sendMissingEntity, sendPage } from './page.controller.js';
-import { convertAudioToAmr, getAmrFileName, getMediaDir, processAndAttachMedia, processAndAttachVideo } from '../utils/media.js';
+import { buildAudioFileName, escapeXml, formatPhoneNumber, renderMediaLine, renderMentions, renderPhoneLink, sendInvalidEntity, sendMissingEntity, sendPage } from './page.controller.js';
+import { convertAudioToAmr, getAmrFileName, getMediaDir } from '../utils/media.js';
 import { queueAudioTranscription } from '../services/audio-transcription.service.js';
 import { getMessageQuotePreview } from '../utils/message-preview.js';
 import { CONTACT_NAME_PRIORITY } from '../utils/contact-display-name.js';
 import multer from 'multer';
-import pkg from 'whatsapp-web.js';
 import { basename, join } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import crypto from 'node:crypto';
 
-const { MessageMedia } = pkg;
-
-function normalizeGroupName(rawName) {
-  if (typeof rawName !== 'string' || !rawName.trim()) {
-    return null;
-  }
-  const trimmed = rawName.trim();
-  if (isNumericOrJid(trimmed)) {
-    return null;
-  }
-  return trimmed.slice(0, 100);
-}
-
 // Asegúrate de que esta ruta apunte correctamente a donde exportas el cliente
-import { castPollVote, client, refreshPollVotesFromWhatsapp, resolveContactPhone, resolveMyVoterIds, syncOutgoingMessageAck } from '../services/whatsapp.service.js';
-import { ensureGroupDisplayName } from './group.controller.js';
-import { beginNokiaSend, endNokiaSend, registerPendingOutgoing, removeObservedOutgoing, takeObservedOutgoing } from '../services/pending-outgoing.service.js';
+import { castPollVote, client, refreshPollVotesFromWhatsapp, resolveContactPhone, resolveMyVoterIds } from '../services/whatsapp.service.js';
+import { resolveUnknownMentionNames } from '../utils/mentions.js';
+import { ensureGroupDisplayName, getGroupMentionCandidates } from './group.controller.js';
+import { findComposeMentions } from '../utils/mention-text.js';
+import { isGroupTarget, resolveTargetJid, sendOutgoingMessages, SendMessageError } from '../domain/messaging.service.js';
 import { getRequestBaseUrl } from '../utils/public-url.js';
 
 const EXISTING_CONTACT_ICON_HTML = '<img src="/assets/user.jpeg" alt="Contacto" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
@@ -123,30 +111,13 @@ export async function renderComposePage(req, res, next) {
         body += `<p><font size="1" color="#555555">Respondiendo a ${escapeXml(quotedSender)}:</font><br/><i>${escapeXml(quotedText)}</i></p>`;
       }
 
-      let mentionPickerHtml = '';
-      if (type === 'group') {
-        try {
-          const participants = db.prepare(`
-            SELECT DISTINCT u.chat_id, u.username FROM group_participants gp
-            JOIN users u ON u.chat_id = gp.user_chat_id
-            WHERE gp.group_id = ? AND u.username IS NOT NULL AND u.username != ''
-            ORDER BY u.username ASC
-            LIMIT 15
-          `).all(to);
-
-          if (participants && participants.length > 0) {
-            mentionPickerHtml =
-              `<p><font size="1" color="#555555">Mencionar en grupo:</font><br/>` +
-              `<select name="mention">` +
-              `<option value="">Elegir participante</option>` +
-              participants.map((p) =>
-                `<option value="${escapeXml(p.chat_id)}">@${escapeXml(p.username)}</option>`
-              ).join('') +
-              `</select> ` +
-              `<button type="submit" name="compose_action" value="add_mention">Añadir mención</button></p>`;
-          }
-        } catch (e) {}
-      }
+      // Para mencionar basta con escribir «@» y el nombre (sin tildes ni mayúsculas): al
+      // enviar se completa solo. Recordatorio en una línea corta justo bajo el campo de texto
+      // (la pantalla del 6111 es pequeña), con enlace a los participantes del grupo.
+      const mentionHintHtml = type === 'group'
+        ? `<font size="1" color="#555555">Menciona: @nombre &#183; ` +
+          `<a href="/grupo/${encodeURIComponent(to)}/detalles">Participantes</a></font>`
+        : '';
 
       body += `
         <form action="/mensaje/validar-y-crear" method="POST" enctype="multipart/form-data">
@@ -155,9 +126,10 @@ export async function renderComposePage(req, res, next) {
           ${replyMessage ? `<input type="hidden" name="replyTo" value="${replyMessage.id}"/>` : ''}
           <p>
             <textarea name="text" rows="5" cols="22">${escapeXml(textoPrevio)}</textarea>
+            ${mentionHintHtml}
           </p>
-          ${mentionPickerHtml}
           <p>
+            <br/>
             Multimedia:<br/>
             <input type="file" name="image" accept="image/jpeg,image/png,.3gp,video/3gpp"/>
             Foto 2:<br/>
@@ -391,6 +363,39 @@ export async function renderComposePage(req, res, next) {
   }
 }
 
+// «@pau» encaja con varias personas: se pregunta a quién se refiere (una sola página para
+// todas las dudas del mensaje) y se reenvía el mismo formulario con la elección. Las fotos o
+// vídeos adjuntos no se pueden conservar entre páginas en el Nokia: se piden de nuevo.
+function sendMentionChoicePage(req, res, { phone, type, text, replyTo, ambiguous, hadMedia, groupId }) {
+  const questions = ambiguous.map(({ index, query, candidates }) =>
+    `<p>¿Quién es <b>${escapeXml(query)}</b>?<br/>` +
+    candidates.map((c, i) =>
+      `<input type="radio" name="mention_pick_${index}" value="${escapeXml(c.id)}"${i === 0 ? ' checked="checked"' : ''}/>` +
+      `${escapeXml(c.name)}<br/>`
+    ).join('') +
+    '</p>'
+  ).join('');
+  const mediaHtml = hadMedia
+    ? '<p><font size="1" color="#cc0000">Vuelve a adjuntar la foto o el video:</font><br/>' +
+      '<input type="file" name="image" accept="image/jpeg,image/png,.3gp,video/3gpp"/><br/>' +
+      '<input type="file" name="image2" accept="image/jpeg,image/png"/></p>'
+    : '';
+  const body =
+    '<h1>Mencionar</h1>' +
+    `<p><font size="1" color="#555555">${escapeXml(String(text || '').slice(0, 160))}</font></p>` +
+    '<form action="/mensaje/validar-y-crear" method="POST" enctype="multipart/form-data">' +
+    `<input type="hidden" name="phone" value="${escapeXml(phone)}"/>` +
+    `<input type="hidden" name="type" value="${escapeXml(type || 'group')}"/>` +
+    // &#10;: en un atributo XML un salto de línea literal se convierte en espacio.
+    `<input type="hidden" name="text" value="${escapeXml(text || '').replace(/\r?\n/g, '&#10;')}"/>` +
+    (replyTo !== undefined && replyTo !== '' ? `<input type="hidden" name="replyTo" value="${escapeXml(replyTo)}"/>` : '') +
+    questions +
+    mediaHtml +
+    `<p><input type="submit" value="Enviar"/> <a href="/grupo/${encodeURIComponent(groupId)}">Cancelar</a></p>` +
+    '</form>';
+  return sendPage(req, res, 200, 'Mencionar', body);
+}
+
 export async function validateAndCreateChat(req, res, next) {
   // ===========================================================================
   // 1. Procesar el campo Multimedia (foto o video 3GP) y una segunda foto con multer
@@ -422,41 +427,8 @@ export async function validateAndCreateChat(req, res, next) {
   }
 
   try {
-    const { phone, text, type, replyTo, mention, compose_action: composeAction } = req.body;
+    const { phone, text, type, replyTo } = req.body;
     const mediaFiles = ['image', 'image2'].flatMap((field) => req.files?.[field] || []);
-
-    // En navegadores clásicos no hay forma de que un enlace lea el contenido
-    // todavía no enviado de un textarea. Este submit vuelve al editor con la
-    // mención añadida, conservando todo lo que el usuario ya había escrito.
-    if (composeAction === 'add_mention') {
-      const groupId = typeof phone === 'string' ? phone.trim() : '';
-      const mentionId = typeof mention === 'string' ? mention.trim() : '';
-      const participant = groupId && mentionId
-        ? db.prepare(`
-            SELECT u.username
-            FROM group_participants gp
-            JOIN users u ON u.chat_id = gp.user_chat_id
-            WHERE gp.group_id = ? AND gp.user_chat_id = ?
-            LIMIT 1
-          `).get(groupId, mentionId)
-        : null;
-
-      if (type === 'group' && participant?.username) {
-        let currentText = typeof text === 'string' ? text : '';
-        // Permite escribir «Hola @» antes de elegir: el @ pendiente se sustituye
-        // por la mención completa, sin dejar un segundo arroba.
-        currentText = currentText.replace(/@\s*$/, '');
-        const separator = currentText && !/\s$/.test(currentText) ? ' ' : '';
-        const textWithMention = `${currentText}${separator}@${participant.username} `;
-        const params = new URLSearchParams({
-          to: groupId,
-          type: 'group',
-          text: textWithMention,
-        });
-        if (typeof replyTo === 'string' && replyTo) params.set('replyTo', replyTo);
-        return res.redirect(`/mensaje/componer?${params.toString()}`);
-      }
-    }
 
     const trimmedText = typeof text === 'string' ? text.trim() : '';
     const hasText = trimmedText !== '';
@@ -478,21 +450,17 @@ export async function validateAndCreateChat(req, res, next) {
 
     let processedText = hasText ? convertEmojisToAscii(trimmedText) : '';
 
-    let targetJid = phone.trim();
-
-    if (!targetJid.includes('@')) {
-      const numberDetails = await client.getNumberId(targetJid);
-      if (!numberDetails) {
-        return sendPage(
-          req,
-          res,
-          400,
-          'Error',
-          '<h1>Error</h1><p>El número no tiene WhatsApp registrado.</p><p><a href="/mensaje/componer">Volver</a></p>'
-        );
-      }
-      targetJid = numberDetails._serialized;
+    const targetJid = await resolveTargetJid(phone);
+    if (!targetJid) {
+      return sendPage(
+        req,
+        res,
+        400,
+        'Error',
+        '<h1>Error</h1><p>El número no tiene WhatsApp registrado.</p><p><a href="/mensaje/componer">Volver</a></p>'
+      );
     }
+    const isGroup = isGroupTarget(targetJid, type);
 
     const replyMessage = replyTo === undefined
       ? null
@@ -510,226 +478,61 @@ export async function validateAndCreateChat(req, res, next) {
     // =========================================================================
     // 2. Enviar mensaje de texto, imagen o video con caption
     // =========================================================================
-    const options = {};
-    if (type === 'group' || targetJid.endsWith('@g.us')) {
-      const mentionRegex = /@[A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,}/g;
-      const mentionMatches = processedText.match(mentionRegex);
-      if (mentionMatches && mentionMatches.length > 0) {
-        const mentionedJids = [];
-        // Mapa texto-original -> "@<digitos>", que es el formato que WhatsApp
-        // necesita en el cuerpo del mensaje para reconocer y resaltar la mención
-        // en el dispositivo del destinatario (no basta con pasar `mentions`).
-        const textReplacements = new Map();
-        for (const match of mentionMatches) {
-          if (textReplacements.has(match)) continue;
-          const cleanName = match.slice(1).trim();
-          const cleanDigits = cleanName.replace(/[^0-9]/g, '');
-          let user = db.prepare('SELECT chat_id FROM users WHERE username = ? LIMIT 1').get(cleanName);
-          if (!user && cleanDigits.length >= 8) {
-            user = db.prepare('SELECT chat_id FROM users WHERE chat_id LIKE ? LIMIT 1').get(`${cleanDigits}%`);
-          }
-          if (user && user.chat_id) {
-            if (!mentionedJids.includes(user.chat_id)) {
-              mentionedJids.push(user.chat_id);
-            }
-            textReplacements.set(match, `@${user.chat_id.split('@')[0]}`);
-          }
+    let mentions = null;
+    if (isGroup) {
+      // Menciones: «@ana» o «@ana gar» se completan con el participante que encaja (lista
+      // en vivo de WhatsApp). En el cuerpo viaja «@<número>», que es lo que WhatsApp necesita
+      // para resaltarla y avisar a esa persona.
+      if (processedText.includes('@')) {
+        const picks = {};
+        for (const [key, value] of Object.entries(req.body || {})) {
+          const match = key.match(/^mention_pick_(\d+)$/);
+          if (match && typeof value === 'string' && value) picks[match[1]] = value;
         }
-        if (textReplacements.size > 0) {
-          processedText = processedText.replace(mentionRegex, (m) => textReplacements.get(m) || m);
+        let { candidates, unknownCount } = await getGroupMentionCandidates(targetJid);
+        let mentionResult = findComposeMentions(processedText, candidates, picks);
+        // Lo escrito no encaja con nadie conocido: consultar a WhatsApp los nombres que
+        // faltan (solo entonces, porque en grupos grandes tarda) y volver a intentarlo.
+        if (mentionResult.unmatched.length && unknownCount > 0) {
+          ({ candidates } = await getGroupMentionCandidates(targetJid, { resolveUnknown: true }));
+          mentionResult = findComposeMentions(processedText, candidates, picks);
         }
-        if (mentionedJids.length > 0) {
-          options.mentions = mentionedJids;
+        if (mentionResult.ambiguous.length) {
+          return sendMentionChoicePage(req, res, {
+            phone, type, text, replyTo, ambiguous: mentionResult.ambiguous, hadMedia: hasMedia, groupId: targetJid,
+          });
         }
-      }
-
-      const existingGroup = stmts.getGroupById.get(targetJid);
-      const existingIsRaw = existingGroup ? isNumericOrJid(existingGroup.group_name) : false;
-      let nameToSave = existingGroup ? existingGroup.group_name : null;
-
-      if (!nameToSave || existingIsRaw) {
-        let candidateName = targetJid.replace(/@.*$/, '');
-        if (client) {
-          try {
-            const chat = await client.getChatById(targetJid);
-            if (chat?.name && !isNumericOrJid(chat.name)) {
-              candidateName = chat.name;
-            }
-          } catch (e) {
-            // Ignorar error de resolución de grupo.
-          }
-        }
-        const normalizedName = normalizeGroupName(candidateName) || 'Grupo sin nombre';
-        nameToSave = normalizedName;
-      }
-
-      if (!existingGroup || existingGroup.group_name !== nameToSave) {
-        stmts.upsertGroup.run(targetJid, nameToSave);
+        processedText = mentionResult.sendText;
+        if (mentionResult.mentionedIds.length) mentions = mentionResult.mentionedIds;
       }
     }
 
-    if (replyMessage) {
-      options.quotedMessageId = replyMessage.whatsapp_msg_id;
-      options.ignoreQuoteErrors = false;
-    }
-
-    options.waitUntilMsgSent = true;
-    const urlDestino = type === 'group' || targetJid.endsWith('@g.us')
+    const urlDestino = isGroup
       ? `/grupo/${encodeURIComponent(targetJid)}`
       : `/usuario/${encodeURIComponent(targetJid)}`;
-    const outgoingMessages = hasMedia
-      ? outgoingMediaFiles.map(({ file, mediaType }, index) => ({
-        mediaFile: file,
-        mediaType,
-        text: index === 0 ? processedText : '',
-      }))
-      : [{ mediaFile: null, mediaType: null, text: processedText }];
-    const sentMedia = [];
 
-    for (const { mediaFile, mediaType, text: messageText } of outgoingMessages) {
-      // Marca este envío como «en curso» hasta haber enlazado su fila: el message_create
-      // propio que WhatsApp emite mientras tanto es de este envío, no de otro dispositivo.
-      const sendToken = beginNokiaSend(targetJid, { text: messageText, hasMedia: Boolean(mediaFile) });
-      try {
-        const hasAttachment = !!mediaFile;
-        let sentMessage;
-        if (mediaFile) {
-          const media = new MessageMedia(
-            mediaType === 'video' ? 'video/3gpp' : mediaFile.mimetype,
-            mediaFile.buffer.toString('base64'),
-            mediaFile.originalname
-          );
-          const mediaOptions = {
-            ...options,
-            caption: messageText,
-          };
-          if (!messageText) delete mediaOptions.mentions;
-          try {
-            sentMessage = await client.sendMessage(targetJid, media, mediaOptions);
-          } catch (error) {
-            if (replyMessage) {
-              console.error('[mensaje] No se pudo enviar la respuesta:', error?.message || error);
-              return sendPage(
-                req,
-                res,
-                409,
-                'No se pudo responder',
-                '<p>WhatsApp no pudo vincular la respuesta al mensaje original; no se ha enviado como mensaje normal.</p><p><a href="/mensaje/componer">Volver</a></p>'
-              );
-            }
-            throw error;
-          }
-        } else {
-          try {
-            sentMessage = await client.sendMessage(targetJid, messageText, options);
-          } catch (error) {
-            if (replyMessage) {
-              console.error('[mensaje] No se pudo enviar la respuesta:', error?.message || error);
-              return sendPage(
-                req,
-                res,
-                409,
-                'No se pudo responder',
-                '<p>WhatsApp no pudo vincular la respuesta al mensaje original; no se ha enviado como mensaje normal.</p><p><a href="/mensaje/componer">Volver</a></p>'
-              );
-            }
-            throw error;
-          }
-        }
-
-        // whatsapp-web.js puede no devolver el id, así que se enlaza después del evento
-        // message_create cuando WhatsApp confirme el envío.
-        let whatsappMsgId = sentMessage?.id?._serialized || sentMessage?.id?.$1 || null;
-        const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
-        const pad = (n) => String(n).padStart(2, '0');
-        const daySend = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-        const hourSend = `${daySend} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-        const finalText = messageText || (mediaType === 'video' ? '[Video]' : '[Imagen]');
-        let insertedMessageId;
-
-        if (type === 'group' || targetJid.endsWith('@g.us')) {
-          const group = db.prepare('SELECT group_id FROM wgroups WHERE group_id = ?').get(targetJid);
-          if (!group) {
-            let groupName = 'Grupo sin nombre';
-            try {
-              const chat = await client.getChatById(targetJid);
-              if (chat && chat.name) groupName = chat.name;
-            } catch (e) {}
-            stmts.upsertGroup.run(targetJid, groupName);
-          }
-          const result = hasAttachment
-            ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, null, targetJid, null, whatsappMsgId)
-            : stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid, whatsappMsgId);
-          insertedMessageId = result.lastInsertRowid;
-        } else {
-          const user = db.prepare('SELECT chat_id FROM users WHERE chat_id = ?').get(targetJid);
-          if (!user) {
-            let finalName = `+${targetJid.split('@')[0]}`;
-            try {
-              const contact = await client.getContactById(targetJid);
-              if (contact) {
-                finalName = contact.name || contact.pushname || contact.shortName || contact.verifiedName || finalName;
-              }
-            } catch (e) {}
-            stmts.upsertUser.run(targetJid, finalName);
-          }
-          const result = hasAttachment
-            ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null, whatsappMsgId)
-            : stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null, whatsappMsgId);
-          insertedMessageId = result.lastInsertRowid;
-        }
-
-        if (replyMessage && insertedMessageId) {
-          stmts.updateMessageQuote.run(
-            getMessageQuotePreview(replyMessage),
-            (Number(replyMessage.from_me) === 1 ? 'Yo' : (replyMessage.username || 'Desconocido')).slice(0, 100),
-            insertedMessageId
-          );
-        }
-
-        if (insertedMessageId) {
-          if (whatsappMsgId) {
-            removeObservedOutgoing(targetJid, whatsappMsgId);
-            syncOutgoingMessageAck(whatsappMsgId, sentMessage?.ack);
-          } else {
-            whatsappMsgId = takeObservedOutgoing(targetJid);
-            if (whatsappMsgId) {
-              stmts.setMessageWhatsappId.run(whatsappMsgId, insertedMessageId);
-              syncOutgoingMessageAck(whatsappMsgId, sentMessage?.ack);
-            } else {
-              registerPendingOutgoing(targetJid, insertedMessageId);
-            }
-          }
-        }
-
-        if (mediaType === 'video' && insertedMessageId) {
-          db.prepare('UPDATE messages SET media_type = ? WHERE id = ?').run('video', insertedMessageId);
-        }
-
-        if (mediaFile && insertedMessageId) {
-          sentMedia.push({ messageId: insertedMessageId, mediaFile, mediaType });
-        }
-      } finally {
-        endNokiaSend(sendToken);
+    try {
+      await sendOutgoingMessages({
+        targetJid,
+        isGroup,
+        text: processedText,
+        mediaFiles: outgoingMediaFiles,
+        replyMessage,
+        mentions,
+      });
+    } catch (error) {
+      if (!(error instanceof SendMessageError)) throw error;
+      if (replyMessage) {
+        console.error('[mensaje] No se pudo enviar la respuesta:', error.cause?.message || error.cause || error.message);
+        return sendPage(
+          req,
+          res,
+          409,
+          'No se pudo responder',
+          '<p>WhatsApp no pudo vincular la respuesta al mensaje original; no se ha enviado como mensaje normal.</p><p><a href="/mensaje/componer">Volver</a></p>'
+        );
       }
-    }
-
-    for (const { messageId, mediaFile, mediaType } of sentMedia) {
-      try {
-        const options = {
-          mediaKey: `out_${messageId}_${Date.now()}`,
-          filename: mediaFile.originalname || (mediaType === 'video' ? `out_${messageId}.3gp` : `out_${messageId}.jpg`),
-          mimeType: mediaType === 'video' ? 'video/3gpp' : mediaFile.mimetype || 'image/jpeg',
-        };
-        const saved = mediaType === 'video'
-          ? await processAndAttachVideo(messageId, mediaFile.buffer, options)
-          : await processAndAttachMedia(messageId, mediaFile.buffer, options);
-        if (saved.previewError) {
-          console.error('[mensaje] Video guardado sin fotograma de vista previa:', saved.previewError.message);
-        }
-      } catch (mediaErr) {
-        console.error(`[mensaje] Error guardando attachment saliente (${mediaType}):`, mediaErr.message);
-      }
+      throw error.cause ?? error;
     }
 
     // Pantalla nostálgica de espera de 3 segundos sin botones
@@ -771,6 +574,7 @@ export async function showMessageDetail(req, res, next) {
 
     const attachments = stmts.getAttachmentsByMessageId.all(messageId);
     const attachment = attachments[0] || null;
+    await resolveUnknownMentionNames([message.text], client);
 
     let fromToLabel = '';
     let backUrl = '/';

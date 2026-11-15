@@ -6,11 +6,11 @@ import router from './routes/index.js';
 import { notFound, serverError } from './controller/page.controller.js';
 import { startDailyCleanup, stopDailyCleanup } from './services/cleanup.service.js';
 import { startWhatsappClient, stopWhatsappClient, getConnectionStatus } from './services/whatsapp.service.js';
-import { saveInteraction } from './controller/notification.controller.js';
 import { requireAuth } from './middlewares/auth.middleware.js';
 import { streamSignedAudio } from './controller/message.controller.js';
 import { cleanupOrphanMediaFiles, migrateAttachmentsToView } from './utils/media.js';
 import { loadPersistedSettings } from './utils/settings-env.js';
+import { closeDb } from '../db/db.js';
 
 dotenv.config();
 loadPersistedSettings();
@@ -72,6 +72,82 @@ app.use(serverError);
 // ──────────────────────────────────────────────────────────────────────────────
 // Arranque principal
 // ──────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Apagado ordenado — ÚNICO manejador de SIGTERM/SIGINT del proceso.
+// Orden: dejar de aceptar HTTP → cerrar WhatsApp (Chromium) → cerrar SQLite → salir.
+// Plazos pensados para el stop_grace_period de 20 s del contenedor (después Docker manda
+// SIGKILL): si un paso se cuelga se sigue con el siguiente, y a los 17 s se sale sí o sí.
+// ──────────────────────────────────────────────────────────────────────────────
+const HTTP_DRAIN_MS = 5_000;
+const WHATSAPP_STOP_MS = 8_000;
+const SHUTDOWN_HARD_LIMIT_MS = 17_000;
+
+let httpServer = null;
+let shuttingDown = false;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      console.warn(`[main] ${label}: sin terminar tras ${ms / 1000}s, se continúa.`);
+      resolve();
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function closeHttpServer() {
+  if (!httpServer) return Promise.resolve();
+  return new Promise((resolve) => {
+    // Las peticiones en curso (p. ej. un envío esperando a WhatsApp) tienen HTTP_DRAIN_MS
+    // para terminar; las conexiones que sigan abiertas (long-polling del QR) se cortan.
+    const forceTimer = setTimeout(() => {
+      console.warn(`[http] Conexiones abiertas tras ${HTTP_DRAIN_MS / 1000}s: se cierran a la fuerza.`);
+      httpServer.closeAllConnections();
+    }, HTTP_DRAIN_MS);
+    httpServer.close(() => {
+      clearTimeout(forceTimer);
+      console.log('[http] Servidor HTTP cerrado.');
+      resolve();
+    });
+    httpServer.closeIdleConnections();
+  });
+}
+
+async function shutdown(signal) {
+  if (shuttingDown) {
+    // npm reenvía la señal al hijo y la terminal también la manda: es normal recibirla dos
+    // veces. No se fuerza la salida (el límite duro ya cubre un apagado colgado).
+    console.log(`[main] Señal ${signal} recibida de nuevo; el apagado ya está en curso.`);
+    return;
+  }
+  shuttingDown = true;
+  console.log(`\n[main] Señal ${signal} recibida, cerrando...`);
+
+  const hardLimit = setTimeout(() => {
+    console.error(`[main] El apagado superó ${SHUTDOWN_HARD_LIMIT_MS / 1000}s: salida forzada.`);
+    process.exit(1);
+  }, SHUTDOWN_HARD_LIMIT_MS);
+  hardLimit.unref();
+
+  try {
+    stopDailyCleanup();
+    await closeHttpServer();
+    await withTimeout(stopWhatsappClient(), WHATSAPP_STOP_MS, 'Cierre de WhatsApp');
+  } catch (err) {
+    console.error('[main] Error durante el apagado:', err);
+  } finally {
+    closeDb();
+  }
+  console.log('[main] Apagado completado. Saliendo.');
+  process.exit(0);
+}
+
+// Se registran antes de arrancar nada: una señal durante el arranque (Chromium puede tardar
+// bastante) también pasa por el apagado ordenado.
+process.on('SIGTERM', () => { shutdown('SIGTERM'); });
+process.on('SIGINT', () => { shutdown('SIGINT'); });
+
 async function main() {
   // 0. Migrar attachments antiguos y luego limpiar archivos huérfanos
   await migrateAttachmentsToView();
@@ -82,45 +158,29 @@ async function main() {
 
   // 2. Iniciar cliente WhatsApp Web
   try {
-    // FUNCIÓN ADAPTADORA: Permite que el cliente de WhatsApp mande los datos directamente a saveInteraction
-    const handleIncomingMessage = async (payload) => {
-      const mockReq = { body: payload };
-      const mockRes = {
-        status: () => mockRes,
-        json: () => mockRes
-      };
-      const mockNext = (err) => { if (err) console.error('[main] Error en saveInteraction:', err); };
-      await saveInteraction(mockReq, mockRes, mockNext);
-    };
-
-    await startWhatsappClient(handleIncomingMessage);
+    await startWhatsappClient();
     console.log('[main] Cliente WhatsApp Web iniciado correctamente.');
   } catch (err) {
     console.error('[main] Error al iniciar WhatsApp Web:', err.message);
     console.log('[main] El servidor continuara. Escanea el QR en /whatsapp/qr para vincular.');
   }
 
+  // Si llegó una señal mientras arrancaba WhatsApp, no abrir el puerto: el apagado sigue solo.
+  if (shuttingDown) return;
+
   // 3. Iniciar servidor HTTP Express
-  const httpServer = app.listen(PORT, () => {
+  httpServer = app.listen(PORT, () => {
     console.log(`[http] Servidor Express escuchando en puerto ${PORT}`);
   });
-
-  // 4. Shutdown graceful al recibir señales del SO / Docker
-  async function shutdown(signal) {
-    console.log(`\n[main] Señal ${signal} recibida, cerrando...`);
-    stopDailyCleanup();
-    await stopWhatsappClient();
-    httpServer.close(() => {
-      console.log('[main] Servidor HTTP cerrado. Saliendo.');
-      process.exit(0);
-    });
-  }
-
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 main().catch((err) => {
+  // Durante el apagado, un fallo del arranque a medias (p. ej. SQLite ya cerrada) es
+  // esperable: lo termina shutdown(), no se sale aquí con código de error.
+  if (shuttingDown) {
+    console.warn('[main] Arranque interrumpido por el apagado:', err?.message || err);
+    return;
+  }
   console.error('[main] Error fatal al arrancar:', err);
   process.exit(1);
 });

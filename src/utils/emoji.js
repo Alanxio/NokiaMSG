@@ -147,6 +147,10 @@ const emojiImageMap = {
 // Sustituye emojis por <img> cuando hay imagen local; el resto de emojis
 // conocidos (corazones, gestos, símbolos) siguen en ASCII como respaldo, y
 // cualquier emoji desconocido se descarta — igual que convertEmojisToAscii.
+function escapeAscii(value) {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+}
+
 export function renderEmojisHtml(text) {
   if (!text) return text;
 
@@ -156,7 +160,8 @@ export function renderEmojisHtml(text) {
     if (result.includes(emoji)) {
       // El alt usa el ASCII de respaldo (no el emoji crudo): si dejáramos el emoji
       // en el alt, el bucle de abajo lo encontraría de nuevo y lo corrompería.
-      const alt = emojiMap[emoji] || '';
+      // Escapado: varios ASCII llevan «<» o «>» («<3», «>:(») y romperían el XHTML.
+      const alt = escapeAscii(emojiMap[emoji] || '');
       const img = `<img src="/assets/outline_emojis/em_outline_${iconNum}.png" width="16" height="16" alt="${alt}"/>`;
       result = result.split(emoji).join(img);
     }
@@ -164,7 +169,7 @@ export function renderEmojisHtml(text) {
 
   for (const [emoji, ascii] of Object.entries(emojiMap)) {
     if (result.includes(emoji)) {
-      result = result.split(emoji).join(ascii);
+      result = result.split(emoji).join(escapeAscii(ascii));
     }
   }
 

@@ -9,11 +9,16 @@ import {
 } from '../services/sms-notification.service.js';
 import { isNumericOrJid } from './page.controller.js';
 import { getLastActivityAt } from '../middlewares/auth.middleware.js';
+import { getNokiaActiveWindowMs, getPhoneActiveRemainingMs } from '../services/phone-activity.service.js';
 
 // Si el Nokia ha cargado una página hace menos de esto, el SMS se aplaza (estás en la web).
-function getActiveWindowMs() {
-  const seconds = Number.parseInt(process.env.SMS_ACTIVE_WINDOW_SECONDS || '15', 10);
-  return (Number.isFinite(seconds) && seconds >= 0 ? seconds : 15) * 1000;
+const getActiveWindowMs = getNokiaActiveWindowMs;
+
+// Cuánto falta para poder enviar el SMS de un chat: 0 si ni el Nokia ni el móvil (en ese
+// chat) han tenido actividad reciente.
+function getSmsBlockedRemainingMs(chatId) {
+  const nokiaRemaining = getActiveWindowMs() - (Date.now() - getLastActivityAt());
+  return Math.max(0, nokiaRemaining, getPhoneActiveRemainingMs(chatId));
 }
 const SMS_RETRY_DELAY_MS = 5_000;
 // Un aviso aplazado se sigue reintentando mientras sigas en la web, hasta este límite.
@@ -77,7 +82,7 @@ const deferredSmsChecks = new Map();
 
 function scheduleDeferredSms(isGroup, chatId, payload, startedAt = Date.now()) {
   if (deferredSmsChecks.has(chatId)) return;
-  const waitMs = Math.max(1_000, getActiveWindowMs() - (Date.now() - getLastActivityAt()) + 1_000);
+  const waitMs = Math.max(1_000, getSmsBlockedRemainingMs(chatId) + 1_000);
   const timer = setTimeout(() => {
     deferredSmsChecks.delete(chatId);
     try {
@@ -86,11 +91,11 @@ function scheduleDeferredSms(isGroup, chatId, payload, startedAt = Date.now()) {
         console.log(`[SMS] Aviso aplazado de ${chatId} descartado (${state.unseen === 0 ? 'ya leído' : state.notified ? 'ya notificado' : 'silenciado'})`);
         return;
       }
-      if (Date.now() - getLastActivityAt() < getActiveWindowMs()) {
+      if (getSmsBlockedRemainingMs(chatId) > 0) {
         if (Date.now() - startedAt < SMS_DEFERRED_MAX_MS) {
           scheduleDeferredSms(isGroup, chatId, payload, startedAt);
         } else {
-          console.log(`[SMS] Aviso aplazado de ${chatId} descartado (sigues en la web desde hace 10 min)`);
+          console.log(`[SMS] Aviso aplazado de ${chatId} descartado (sigues activo en el Nokia o el móvil desde hace 10 min)`);
         }
         return;
       }
@@ -378,8 +383,8 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       // SOLUCIÓN AL [Yo]: Inserción segura con parámetros explícitos y nombrados
       // =========================================================================
       const msgResult = db.prepare(`
-        INSERT OR IGNORE INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, is_sticker, media_key, whatsapp_msg_id, quoted_text, quoted_sender, is_system, media_type)
-        VALUES (@text, @day_send, @hour_send, @from_me, @user_chat_id, @group_id, @has_media, @is_sticker, @media_key, @whatsapp_msg_id, @quoted_text, @quoted_sender, @is_system, @media_type)
+        INSERT OR IGNORE INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, is_sticker, media_key, whatsapp_msg_id, quoted_text, quoted_sender, is_system, media_type, mentions_me)
+        VALUES (@text, @day_send, @hour_send, @from_me, @user_chat_id, @group_id, @has_media, @is_sticker, @media_key, @whatsapp_msg_id, @quoted_text, @quoted_sender, @is_system, @media_type, @mentions_me)
       `).run({
         text: processedMessage,
         day_send: daySend,
@@ -394,7 +399,8 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
         quoted_text: quotedText,
         quoted_sender: quotedSender,
         is_system: isSystem ? 1 : 0,
-        media_type: mediaType
+        media_type: mediaType,
+        mentions_me: (payload.mentions_me === 1 || payload.mentions_me === true) && isGroup ? 1 : 0,
       });
 
       if (msgResult.changes === 0) {
@@ -468,6 +474,9 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
         const msSinceActivity = Date.now() - getLastActivityAt();
         const isActiveOnWeb = msSinceActivity < getActiveWindowMs();
         const smsChatId = isGroup ? finalGroupId : finalUserChatId;
+        // Estás hablando en este chat desde el móvil: cada mensaje leído allí deja el chat a 0
+        // y reiniciaría la racha, así que sin esto cada respuesta dispararía otro SMS.
+        const phoneRemainingMs = getPhoneActiveRemainingMs(smsChatId);
 
         if (!fromMe && !alreadyNotified && !isSmsMuted) {
           // Para el nombre de grupo del SMS, usar el que ya está guardado en wgroups (el
@@ -486,6 +495,9 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
           if (isActiveOnWeb) {
             console.log(`[SMS] Aplazado (activo en la web hace ${Math.round(msSinceActivity / 1000)}s), se revisará al acabar la ventana`);
             scheduleDeferredSms(isGroup, smsChatId, smsPayload);
+          } else if (phoneRemainingMs > 0) {
+            console.log(`[SMS] Aplazado (activo en el móvil en este chat, ${Math.round(phoneRemainingMs / 1000)}s de ventana), se enviará solo si sigue sin leer`);
+            scheduleDeferredSms(isGroup, smsChatId, smsPayload);
           } else {
             console.log(`[SMS] Disparando notificación (previousUnseen=${previousUnseen})`);
             // deliverChatSms marca «ya avisado» de forma síncrona antes del primer await,
@@ -503,7 +515,9 @@ export async function saveInteraction(req, res, next, mediaInfo = null) {
       return messageId;
 
     } catch (dbError) {
-      db.exec('ROLLBACK');
+      // Tras el COMMIT ya no hay transacción (el error vino de la parte de SMS/respuesta):
+      // un ROLLBACK ahí lanzaría «no transaction is active» y taparía el error real.
+      if (db.inTransaction) db.exec('ROLLBACK');
       throw dbError;
     }
 

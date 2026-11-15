@@ -1,5 +1,6 @@
 import db, { stmts } from '../../db/db.js';
-import { convertEmojisToAscii } from '../utils/emoji.js';
+import { renderChatMessages } from './chat-view.js';
+import { resolveUnknownMentionNames } from '../utils/mentions.js';
 import { client, getUsersPresence, sendWhatsappSeen, resolveContactPhone, getContactProfileInfo, syncChatUnreadCountFromWhatsapp } from '../services/whatsapp.service.js';
 import { getContactDisplayName } from '../utils/contact-display-name.js';
 import { getAvatarUrl, renderAvatarImg } from '../services/avatar.service.js';
@@ -9,24 +10,18 @@ import {
   MESSAGE_PAGE_SIZE,
   escapeXml,
   formatPhoneNumber,
-  getMessageDateInfo,
   getLetterBucket,
   getTotal,
-  renderAckLabel,
   renderList,
-  renderMediaLine,
-  renderMessageDateSeparator,
-  renderMentions,
-  renderPollLine,
   renderNumberedPager,
   renderPager,
   renderPhoneLink,
-  renderMessageActions,
   sendInvalidEntity,
   sendMissingEntity,
   sendPage,
   toPositiveInt,
   truncateName,
+  LIST_NAME_LENGTH,
   getSearchQuery,
   normalizeSearchText,
   renderDirectorySearch,
@@ -72,7 +67,9 @@ export async function listUsers(req, res, next) {
       renderList(users, (user) => `/usuario/${user.chat_id}`, (user) => {
         const presence = user.chat_id ? presenceMap.get(user.chat_id) : null;
         const onlineTag = presence && presence.isOnline ? '*' : '';
-        return `${truncateName(user.username)}${onlineTag}[${user.unseen_count}]`;
+        // Contador siempre, también «[0]».
+        const unseen = `[${user.unseen_count || 0}]`;
+        return `${truncateName(user.username, LIST_NAME_LENGTH)}${onlineTag}${unseen}`;
       }, query ? 'Ningún usuario coincide.' : 'Sin usuarios.', (user) => getLetterBucket(user.username)) +
       renderNumberedPager('/usuario', page, totalPages, pagerParams);
 
@@ -121,72 +118,14 @@ export async function showUserMessages(req, res, next) {
     const messages = stmts.getUserMessagesPaginated.all(chatId, MESSAGE_PAGE_SIZE, offset);
     const newMessageCount = unseenCount;
 
-    let messagesHtml = '';
-    if (messages.length === 0) {
-      messagesHtml = '<p>Sin mensajes.</p>';
-    } else {
-      let previousDate = null;
-      messages.forEach((message, index) => {
-        const isNew = index < newMessageCount;
-        const unseenMarker = isNew ? '<font color="#cc0000">[!]</font> ' : '';
-        const sentAt = formatHourSend(message.hour_send);
-        const dateInfo = getMessageDateInfo(message);
-        const dateSeparator = dateInfo?.label && dateInfo.key !== previousDate
-          ? renderMessageDateSeparator(dateInfo.label)
-          : '';
-        if (dateInfo) previousDate = dateInfo.key;
-
-        if (Number(message.is_system) === 1) {
-          messagesHtml += `${dateSeparator}<p align="center">${unseenMarker}<i><font size="1" color="#888888">${escapeXml(sentAt)} — ${renderMentions(message.text)}</font></i></p>`;
-          return;
-        }
-
-        const groupPart = message.group_name ? ` | ${escapeXml(message.group_name)}` : '';
-
-        const mediaLine = renderMediaLine(message, { linkToDetail: `/mensaje/${message.id}` });
-        const pollLine = message.media_type === 'poll'
-          ? renderPollLine(message, stmts.getPollOptionCountsByMessageId.all(message.id), { linkToDetail: `/mensaje/${message.id}` })
-          : null;
-        let contentPart;
-        if (mediaLine) {
-          contentPart = mediaLine;
-        } else if (pollLine) {
-          contentPart = pollLine;
-        } else if (message.has_media && message.file_path_thumb) {
-          contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
-        } else if (Number(message.is_sticker) === 1) {
-          contentPart = '<i>[Sticker]</i>';
-        } else {
-          contentPart = renderMentions(message.text);
-        }
-        // Un mensaje borrado se sigue mostrando, marcado en rojo como «(borrado)».
-        const editedTag = Number(message.is_deleted) === 1
-          ? ' <font size="1" color="#cc0000">(borrado)</font>'
-          : Number(message.is_edited) === 1
-            ? ' <font size="1" color="#888888">(editado)</font>'
-            : '';
-
-        let quotedBlock = '';
-        if (message.quoted_text || message.quoted_sender) {
-          const quotedTag = message.quoted_sender ? `R-${escapeXml(message.quoted_sender)}` : 'R';
-          const quotedPreview = message.quoted_text
-            ? escapeXml(truncateName(message.quoted_text, 80))
-            : '(no disponible)';
-          quotedBlock = `<i><font size="1" color="#888888">[${quotedTag}]-&quot;${quotedPreview}&quot;</font></i><br/>`;
-        }
-
-        // CORRECCIÓN DEFINITIVA: Comprobación numérica estricta para evitar falsos positivos
-        const isSaliente = Number(message.from_me) === 1;
-        const fromMeMarker = isSaliente
-          ? `<font color="#006600">[Yo]</font> ${renderAckLabel(message.ack_status)}`
-          : '';
-        const messageActions = renderMessageActions(message, user.chat_id, 'user');
-
-        messagesHtml +=
-          `${dateSeparator}<p>${unseenMarker}${escapeXml(sentAt)}${groupPart}${editedTag}${messageActions}${messageActions && fromMeMarker ? '<br/>' : ''}${fromMeMarker}<br/>` +
-          `${quotedBlock}${contentPart}<br/>----------</p>`;
-      });
-    }
+    // Menciones que aún son un número («@2296…»): nombre de perfil de WhatsApp.
+    await resolveUnknownMentionNames(messages.flatMap((m) => [m.text, m.quoted_text]), client);
+    const messagesHtml = renderChatMessages(messages, {
+      chatId: user.chat_id,
+      type: 'user',
+      newMessageCount,
+      contactName: user.username,
+    });
 
     // Siempre se pide el número personal: el del JID puede ser el de empresa.
     let phone = user.chat_id ? await resolveContactPhone(user.chat_id) : null;
@@ -404,6 +343,8 @@ export async function deleteUser(req, res, next) {
     db.exec('BEGIN');
     try {
       stmts.deleteDmAttachmentsByUserChatId.run(chatId);
+      stmts.deleteDmPollVotesByUserChatId.run(chatId);
+      stmts.deleteDmPollOptionsByUserChatId.run(chatId);
       stmts.deleteDmMessagesByUserChatId.run(chatId);
 
       const remaining = getTotal(stmts.countMessagesByUserChatId, chatId);
@@ -414,7 +355,7 @@ export async function deleteUser(req, res, next) {
 
       db.exec('COMMIT');
     } catch (error) {
-      db.exec('ROLLBACK');
+      if (db.inTransaction) db.exec('ROLLBACK');
       throw error;
     }
 
@@ -432,16 +373,3 @@ export async function deleteUser(req, res, next) {
 
 
 
-function formatHourSend(hourSend) {
-  if (!hourSend) return "00:00";
-  if (typeof hourSend === 'string') {
-    const match = hourSend.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})/);
-    if (match) return match[2];
-  }
-  const ms = typeof hourSend === 'number' && hourSend < 2000000000 ? hourSend * 1000 : Number(hourSend);
-  const date = new Date(ms);
-  if (isNaN(date.getTime())) return "00:00";
-  const hours = String(date.getHours()).padStart(2, '0');
-  const minutes = String(date.getMinutes()).padStart(2, '0');
-  return `${hours}:${minutes}`;
-}

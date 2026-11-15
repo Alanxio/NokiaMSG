@@ -1,5 +1,12 @@
 import { stmts } from '../../db/db.js';
 import { renderEmojisHtml } from '../utils/emoji.js';
+import { splitMentions } from '../utils/mention-text.js';
+import { getMyMentionNames, isMyMentionName } from '../utils/my-identity.js';
+import { isNumericOrJid } from '../utils/jid.js';
+import { formatRichText } from '../utils/rich-text.js';
+
+// Vive en utils/jid.js (lo usa también el dominio); se reexporta para los imports existentes.
+export { isNumericOrJid };
 
 export const DIRECTORY_PAGE_SIZE = 20;
 export const MESSAGE_PAGE_SIZE = 12;
@@ -35,19 +42,6 @@ export function formatPhoneNumber(chatId = '', username = '') {
   return null;
 }
 
-export function isNumericOrJid(value = '') {
-  if (typeof value !== 'string') return false;
-  const trimmed = value.trim();
-  if (!trimmed) return false;
-
-  if (trimmed.includes('@')) {
-    return true;
-  }
-
-  const digits = trimmed.replace(/[^0-9]/g, '');
-  return digits.length >= 8;
-}
-
 export function renderPhoneLink(phone) {
   if (!phone) return '';
   const cleanNumber = phone.replace(/[^0-9+]/g, '');
@@ -79,10 +73,25 @@ export function renderReadLink(message) {
   return `<a href="/mensaje/${message.id}/leidos" title="Ver quién ha leído este mensaje" style="display:inline-block; padding:0; vertical-align:middle;"><img src="/assets/Eye.png" alt="Leídos" width="12" height="12" style="vertical-align:middle;"/></a>`;
 }
 
-export function renderMessageActions(message, chatId, type) {
+// Icono para abrir la imagen / sticker a tamaño completo (sustituye al antiguo «[Ver]»).
+export function renderMaximizeLink(href) {
+  if (!href) return '';
+  return `<a href="${escapeXml(href)}" title="Ver a tamaño completo" style="display:inline-block; padding:0; vertical-align:middle;"><img src="/assets/Max.png" alt="Ver" width="12" height="12" style="vertical-align:middle;"/></a>`;
+}
+
+// Icono Text: abre el detalle de una nota de voz / audio, con su transcripción.
+export function renderTranscriptLink(href) {
+  if (!href) return '';
+  return `<a href="${escapeXml(href)}" title="Transcripción" style="display:inline-block; padding:0; vertical-align:middle;"><img src="/assets/Text.png" alt="Transcripcion" width="12" height="12" style="vertical-align:middle;"/></a>`;
+}
+
+// Iconos de la cabecera de un mensaje, en este orden: responder, leídos (ojo), ver imagen a
+// tamaño completo (Max) o transcripción (Text), y escuchar (Volume).
+export function renderMessageActions(message, chatId, type, { viewHref = null, transcriptHref = null, listen = false } = {}) {
   const readLink = renderReadLink(message);
   const replyLink = renderReplyLink(message, chatId, type);
-  const actions = readLink + replyLink;
+  const actions = replyLink + readLink + renderMaximizeLink(viewHref) + renderTranscriptLink(transcriptHref)
+    + (listen ? renderListenLink(message) : '');
   return actions
     ? `<nobr style="vertical-align:middle;"> ${actions}</nobr>`
     : '';
@@ -168,11 +177,16 @@ export function buildAudioFileName(message) {
 // [Escuchar] apunta a un descriptor OMA Download (.dd). El Nokia 6111 (S40 3ª ed.)
 // ignora Content-Disposition y la URL al nombrar descargas («File.amr»), pero sí usa
 // el <name> del descriptor. Probado: no reproduce audio incrustado con <object>.
-function renderAudioActions(message) {
-  return `<a href="/mensaje/${message.id}/escuchar.dd">[Escuchar]</a>`;
+// Icono Volume (sustituye al antiguo «[Escuchar]»). '' si no hay archivo de audio.
+export function renderListenLink(message) {
+  const hasFile = Boolean(message?.file_path_full) && message?.id;
+  if (!hasFile || !['ptt', 'audio'].includes(message.media_type)) return '';
+  return `<a href="/mensaje/${message.id}/escuchar.dd" title="Escuchar" style="display:inline-block; padding:0; vertical-align:middle;"><img src="/assets/Volume.png" alt="Escuchar" width="12" height="12" style="vertical-align:middle;"/></a>`;
 }
 
-export function renderMediaLine(message, { linkToDetail = null, showPreview = true } = {}) {
+// audioInHeader: en el chat, los iconos de escuchar (Volume) y ver detalle (Max) de las notas
+// de voz / audios van en la cabecera del mensaje, no en esta línea.
+export function renderMediaLine(message, { linkToDetail = null, showPreview = true, audioInHeader = false } = {}) {
   const type = message?.media_type;
   if (!type) return null;
 
@@ -183,11 +197,11 @@ export function renderMediaLine(message, { linkToDetail = null, showPreview = tr
   switch (type) {
     case 'ptt':
       label = `Nota de voz${dur}`;
-      actionHtml = fileName && message.id ? renderAudioActions(message) : '';
+      actionHtml = audioInHeader ? '' : renderListenLink(message);
       break;
     case 'audio':
       label = `Audio${dur}`;
-      actionHtml = fileName && message.id ? renderAudioActions(message) : '';
+      actionHtml = audioInHeader ? '' : renderListenLink(message);
       break;
     case 'video':
       label = `Video${dur}`;
@@ -209,11 +223,12 @@ export function renderMediaLine(message, { linkToDetail = null, showPreview = tr
       return null;
   }
 
-  const verLink = linkToDetail ? ` <a href="${escapeXml(linkToDetail)}">[Ver]</a>` : '';
+  const isAudio = type === 'ptt' || type === 'audio';
+  const verLink = linkToDetail && !(isAudio && audioInHeader) ? ` <a href="${escapeXml(linkToDetail)}">[Ver]</a>` : '';
   const preview = type === 'video' && showPreview && message.file_path_thumb
     ? `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="Video"/> `
     : '';
-  return `${preview}<i>[${label}]</i> ${actionHtml}${verLink}`;
+  return `${preview}<i>[${label}]</i>${actionHtml ? ` ${actionHtml}` : ''}${verLink}`;
 }
 
 // message: fila con media_type === 'poll' y text = "[Encuesta] <pregunta>" (puesto por
@@ -265,38 +280,71 @@ export function getMemberColor(id, colorMap = null) {
 }
 
 // Dominios comunes en España: si un @termina en uno de estos, lo tratamos como correo, no mención.
-const EMAIL_DOMAIN_RE = /\.(com|es|org|net|info|eu)$/i;
+// Nombres conocidos (de la tabla de usuarios) para saber dónde acaba cada mención:
+// «@Ana García hola» resalta «Ana García», no la frase entera. Caché corta: se consulta
+// en cada mensaje pintado.
+const KNOWN_NAMES_TTL_MS = 60_000;
+let knownNamesCache = { at: 0, names: [] };
 
+function getKnownMentionNames() {
+  if (Date.now() - knownNamesCache.at > KNOWN_NAMES_TTL_MS) {
+    try {
+      const names = stmts.getAllUsernames.all().map((r) => r.username);
+      knownNamesCache = { at: Date.now(), names: [...new Set([...names, ...getMyMentionNames()])] };
+    } catch {
+      knownNamesCache = { at: Date.now(), names: getMyMentionNames() };
+    }
+  }
+  return knownNamesCache.names;
+}
+
+// «@34612345678» o «@<LID>» (menciones que no se pudieron resolver al recibir, o las que
+// envía el Nokia, que viajan con el número): nombre guardado de esa persona, si lo hay.
+function mentionNameFromDigits(name) {
+  const digits = name.replace(/[^0-9]/g, '');
+  if (digits.length < 8 || name.replace(/[\s+-]/g, '') !== digits) return name;
+  try {
+    const row = stmts.getUserByPhonePattern.get(`${digits}@%`) || stmts.getUserByPhonePattern.get(`${digits}%`);
+    if (row?.username && !/^\+?\d[\d\s]*$/.test(row.username)) return row.username;
+  } catch { /* sin nombre: se queda el número */ }
+  return name;
+}
+
+// Menciones como texto plano («@34612345678» → «@Ana», las mías → «@Tú»), para vistas
+// previas de una línea donde no caben colores (citas de respuestas).
+export function mentionsToPlainText(value = '') {
+  if (!value) return '';
+  return splitMentions(value, getKnownMentionNames())
+    .map((part) => {
+      if (!part.mention) return part.text;
+      if (part.everyone) return `@${part.name}`;
+      const name = mentionNameFromDigits(part.name);
+      return isMyMentionName(part.name) || isMyMentionName(name) ? '@Tú' : `@${name}`;
+    })
+    .join('');
+}
+
+// Texto de un mensaje en HTML: menciones resaltadas, formato de WhatsApp (*negrita*,
+// _cursiva_, ~tachado~, `código`, citas, viñetas) y URLs, emails y teléfonos enlazados.
 export function renderMentions(value = '') {
   if (!value) return '';
-  const escaped = escapeXml(value).replace(/\r?\n/g, '<br/>');
-
-  const withMentions = escaped.replace(
-    /(@[A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,}(?: [A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü+\-:.]{2,})*)/g,
-    (match) => {
-      if (EMAIL_DOMAIN_RE.test(match)) {
-        return match;
+  const parts = splitMentions(value, getKnownMentionNames())
+    .map((part) => {
+      if (!part.mention) return { text: part.text };
+      // «@all»: a todo el grupo, también a mí → mismo color que «@Tú».
+      if (part.everyone) return { html: `<font color="#cc0000"><b>@${escapeXml(part.name)}</b></font>` };
+      const name = mentionNameFromDigits(part.name);
+      // Me mencionan a mí: otro color y «@Tú», para verlo de un vistazo.
+      if (isMyMentionName(part.name) || isMyMentionName(name)) {
+        return { html: '<font color="#cc0000"><b>@Tú</b></font>' };
       }
-
-      let display = match;
-      // Si la mención contiene un número de teléfono (ej. @34612345678 o @521...), buscar nombre en BD
-      const phoneCandidate = match.slice(1).replace(/[^0-9]/g, '');
-      if (phoneCandidate.length >= 8) {
-        try {
-          const row = stmts.getUserByPhonePattern ? stmts.getUserByPhonePattern.get(`${phoneCandidate}%`) : null;
-          if (row && row.username && row.username !== phoneCandidate && !row.username.startsWith('+')) {
-            display = `@${escapeXml(row.username)}`;
-          }
-        } catch (e) { }
-      }
-
-      return `<font color="#000099"><b>${display}</b></font>`;
-    }
-  );
+      return { html: `<font color="#000099"><b>@${escapeXml(name)}</b></font>` };
+    });
+  const html = formatRichText(parts);
 
   // Al final: los caracteres emoji no los toca escapeXml, así que siguen intactos
   // hasta aquí. Sustituirlos ahora evita que el <img> que insertamos se escape.
-  return renderEmojisHtml(withMentions);
+  return renderEmojisHtml(html);
 }
 
 export function toPositiveInt(value, fallback = 1) {
@@ -454,10 +502,19 @@ export function renderIndexPager(path, pageKey, page, totalPages, params = {}) {
 const MAX_NAME_LENGTH = 16;
 const DIACRITIC_MARKS_RE = /[\u0300-\u036f]/g;
 
+// Recorta por caracteres visibles (grafemas), no por unidades de JavaScript: un emoji
+// compuesto (👰‍♀️, 🏳️‍🌈) cuenta como uno y nunca se parte por la mitad, que en el Nokia
+// salía como símbolos rotos.
+const graphemeSegmenter = new Intl.Segmenter('es', { granularity: 'grapheme' });
+
 export function truncateName(name = '', maxLength = MAX_NAME_LENGTH) {
-  const str = String(name);
-  return str.length > maxLength ? `${str.slice(0, maxLength - 1)}…` : str;
+  const graphemes = Array.from(graphemeSegmenter.segment(String(name)), (s) => s.segment);
+  return graphemes.length > maxLength ? `${graphemes.slice(0, maxLength - 1).join('').trimEnd()}…` : graphemes.join('');
 }
+
+// Largo de los nombres en las listas de usuarios y grupos: con el contador «[3]» detrás
+// cabe en una línea de los 128 px del 6111 en la mayoría de los casos.
+export const LIST_NAME_LENGTH = 15;
 
 export function getLetterBucket(name = '') {
   const stripped = String(name).normalize('NFD').replace(DIACRITIC_MARKS_RE, '');
@@ -488,7 +545,10 @@ export function renderList(items, hrefFor, textFor, emptyText, letterFor = null)
       listOpen = true;
     }
 
-    html += `<li><a href="${escapeXml(hrefFor(item))}" style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeXml(textFor(item))}</a></li>`;
+    // Sin «white-space:nowrap»: el navegador del 6111 lo respeta pero ignora overflow y
+    // text-overflow, así que una línea larga no se recortaba y se salía de la pantalla
+    // (scroll horizontal). Mejor que, como mucho, se parta en dos líneas.
+    html += `<li><a href="${escapeXml(hrefFor(item))}">${escapeXml(textFor(item))}</a></li>`;
   });
 
   if (listOpen) html += '</ul>';

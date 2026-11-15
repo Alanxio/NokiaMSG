@@ -41,8 +41,13 @@ export async function showHome(req, res, next) {
         const presence = item.chat_id ? presenceMap.get(item.chat_id) : null;
         const onlineTag = presence && presence.isOnline ? '*' : '';
         const countTag = item.unseen_count > 0 ? `[${item.unseen_count}]` : '';
+        // Te han mencionado en un mensaje que aún no has leído: «@» en rojo junto al grupo.
+        const mentionTag = item.type === 'group' && item.unseen_count > 0
+          && stmts.groupHasUnreadMention.get(item.id, item.unseen_count)
+          ? '<font color="#cc0000"><b>@</b></font>'
+          : '';
 
-        itemsHtml += `<p>${icon} <a href="${url}">${escapeXml(item.name)}${onlineTag}${countTag}</a></p>`;
+        itemsHtml += `<p>${icon} <a href="${url}">${escapeXml(item.name)}${onlineTag}${countTag}</a>${mentionTag}</p>`;
       });
     }
 

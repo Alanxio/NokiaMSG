@@ -7,3 +7,6 @@ assets/qr.png
 .opencode/
 public/media/
 data-tls-probe/
+# Cachés de Chromium / Puppeteer (whatsapp-web.js)
+.wwebjs_cache/
+.puppeteer_cache/

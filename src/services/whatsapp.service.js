@@ -7,6 +7,8 @@ import db, { stmts } from '../../db/db.js';
 import { saveInteraction } from '../controller/notification.controller.js';
 import { marcarNovedad } from './polling.service.js';
 import { resolveMentions } from '../utils/mentions.js';
+import { mentionsMe, refreshMyNames, setMyIdentity } from '../utils/my-identity.js';
+import { mentionsEveryone } from '../utils/mention-text.js';
 import { saveImageVersions, processSticker, saveRawMediaFile, getStickerKey, attachExistingSticker } from '../utils/media.js';
 import { resolvePendingGroupNames, resolveGroupNameFromWhatsapp } from '../controller/group.controller.js';
 import {
@@ -29,6 +31,9 @@ import {
   getContactDisplayName,
 } from '../utils/contact-display-name.js';
 import { getMessageQuotePreview } from '../utils/message-preview.js';
+import { client, setClient } from '../whatsapp/client-ref.js';
+import { getSerializedId, getWhatsappMessageId } from '../whatsapp/ids.js';
+import { isNokiaActive, markPhoneActivity } from './phone-activity.service.js';
 
 const { Client, LocalAuth, Message } = pkg;
 
@@ -42,7 +47,9 @@ const SEND_SEEN_RETRY_DELAY_MS = 250;
 // desconectado — evita marcar como problema una reconexión normal de unos segundos.
 const DISCONNECT_ALERT_THRESHOLD_MS = 5 * 60 * 1000;
 
-export let client = null;
+// El cliente vive en src/whatsapp/client-ref.js (enlace vivo); se reexporta para los
+// imports existentes. Aquí solo se reasigna con setClient().
+export { client };
 let currentQr = null;
 // Sube con cada QR nuevo: la página del QR la usa para pedir la imagen con una URL
 // distinta por QR (cacheable en el móvil) y para saber cuándo hay que recargar.
@@ -58,28 +65,19 @@ let lastStatusChange = null;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let authReadyTimer = null;
-let storedProcessMessageFn = null;
 let hasEverAuthenticated = false;
 let readyPollInterval = null;
 let disconnectAlertTimer = null;
 let disconnectAlertSent = false;
+// true en cuanto empieza el apagado (stopWhatsappClient). Desde ese momento no se reconecta
+// ni se borra la sesión del disco: las rutas de "sesión corrupta" / "máximos intentos" que
+// hacen rmSync de la sesión podrían dispararse por error mientras Chromium se cierra, y un
+// simple reinicio del contenedor desvincularía el teléfono.
+let stopping = false;
 
 const activeChatsSinceStart = new Set();
 const directMessageListenerPages = new WeakMap();
 const directMessageListenerRetries = new WeakMap();
-
-function getSerializedId(value) {
-  if (typeof value === 'string') return value;
-  if (!value || typeof value !== 'object') return null;
-  const serialized = value._serialized || value.$1;
-  return typeof serialized === 'string' && serialized ? serialized : null;
-}
-
-function getWhatsappMessageId(message) {
-  return getSerializedId(message?.id)
-    || getSerializedId(message?._data?.id)
-    || getSerializedId(message?.rawData?.id);
-}
 
 function checkDisconnectAlert() {
   if (connectionStatus === 'connected') {
@@ -150,22 +148,6 @@ export async function resolveContactPhone(chatId) {
   return null;
 }
 
-function formatWhatsappTimestamp(timestamp) {
-  if (!timestamp) {
-    const now = new Date();
-    const dateStr = now.toISOString().slice(0, 10);
-    const timeStr = now.toISOString().slice(0, 19).replace('T', ' ');
-    return { date: dateStr, time: timeStr };
-  }
-
-  const d = new Date(timestamp * 1000);
-  const pad = (n) => String(n).padStart(2, '0');
-  const dateStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  const timeStr = `${dateStr} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-
-  return { date: dateStr, time: timeStr };
-}
-
 function cleanStaleLocks() {
   try {
     const sessionDir = join(AUTH_DATA_PATH, 'session');
@@ -209,10 +191,16 @@ async function getChatUnreadSummariesDirectly() {
   }
 }
 
-async function applyChatUnreadCount(chat) {
+// live: viene de un cambio en tiempo real (no de una sincronización masiva). Un chat que pasa
+// a 0 en vivo sin que el Nokia esté activo se ha leído en el móvil: se registra como
+// actividad allí para no reiniciar la racha de SMS en cada mensaje (ver phone-activity).
+async function applyChatUnreadCount(chat, { live = false } = {}) {
   const chatId = chat.id?._serialized || chat.id;
   if (!chatId || typeof chatId !== 'string') return;
   const unreadCount = typeof chat.unreadCount === 'number' ? chat.unreadCount : 0;
+  // El «visto» que envía el propio Nokia al abrir un chat también llega aquí: se excluye.
+  const readOnPhone = live && unreadCount === 0 && !isNokiaActive();
+  if (readOnPhone) markPhoneActivity(chatId);
 
   if (chat.isGroup || chatId.endsWith('@g.us')) {
     stmts.updateGroupUnseen.run(unreadCount, unreadCount, chatId);
@@ -233,6 +221,7 @@ async function applyChatUnreadCount(chat) {
       const altDigits = altPhone.replace(/[^0-9]/g, '');
       if (altDigits && altDigits !== baseDigits) {
         stmts.updateUserUnseen.run(unreadCount, unreadCount, `${altDigits}@c.us`, `${altDigits}@%`);
+        if (readOnPhone) markPhoneActivity(`${altDigits}@c.us`);
       }
     }
   }
@@ -251,7 +240,7 @@ async function attachDirectUnreadCountListener() {
   if (!client?.pupPage) return;
   try {
     await client.pupPage.exposeFunction('onRawUnreadCountEvent', (data) => {
-      applyChatUnreadCount(data).then(() => {
+      applyChatUnreadCount(data, { live: true }).then(() => {
         console.log(`[whatsapp] 👁 (directo) unreadCount=${data.unreadCount} para ${data.id}`);
       }).catch((err) => {
         console.warn('[whatsapp] Error aplicando unreadCount (listener directo):', err.message);
@@ -293,6 +282,9 @@ async function attachDirectMessageListener() {
             // También los propios (fromMe): los escritos desde otro dispositivo se sincronizan;
             // los del Nokia los reconoce message_create y solo los enlaza.
             const messageId = getWhatsappMessageId(data);
+            if (data?.type === 'call_log') {
+              console.log(`[whatsapp] 📞 call_log recibido por el listener directo (${messageId || 'sin id'}, de ${getSerializedId(data.from) || '?'})`);
+            }
             if (!messageId || stmts.findMessageByWhatsappId.get(messageId)) return;
 
             await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -311,7 +303,10 @@ async function attachDirectMessageListener() {
         const { Msg } = window.require('WAWebCollections');
         if (!window.__nokiaDirectMessageListener) {
           Msg.on('add', (msg) => {
-            if (!msg.isNewMsg) return;
+            // El registro de llamada que WhatsApp mete en el chat («llamada perdida») no
+            // llega marcado como isNewMsg: sin esta excepción nunca se avisaba de llamadas.
+            const isRecentCallLog = msg.type === 'call_log' && Date.now() / 1000 - Number(msg.t) < 300;
+            if (!msg.isNewMsg && !isRecentCallLog) return;
             window.onNokiaDirectMessageAdded(window.WWebJS.getMessageModel(msg));
           });
           window.__nokiaDirectMessageListener = true;
@@ -320,7 +315,7 @@ async function attachDirectMessageListener() {
         if (window.__nokiaRecentMessagesRecovered) return [];
         window.__nokiaRecentMessagesRecovered = true;
         return Msg.getModelsArray()
-          .filter((msg) => msg.isNewMsg && Number(msg.t) >= cutoff)
+          .filter((msg) => (msg.isNewMsg || msg.type === 'call_log') && Number(msg.t) >= cutoff)
           .sort((a, b) => Number(a.t) - Number(b.t))
           .slice(-500)
           .map((msg) => window.WWebJS.getMessageModel(msg));
@@ -450,6 +445,10 @@ async function sendSeenWithFallback(chatId) {
 }
 
 function scheduleReconnect() {
+  if (stopping) {
+    console.log('[whatsapp] Apagando: no se programa reconexión.');
+    return;
+  }
   if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
     console.log('[whatsapp] Maximos intentos alcanzados. Limpiando sesion y mostrando QR...');
     hasEverAuthenticated = false;
@@ -475,20 +474,23 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(async () => {
     reconnectTimer = null;
     try {
-      await startWhatsappClient(storedProcessMessageFn);
+      await startWhatsappClient();
     } catch (err) {
       console.error('[whatsapp] Error en reconexion:', err.message);
     }
   }, delay);
 }
 
-export async function startWhatsappClient(processMessageFn) {
+export async function startWhatsappClient() {
+  if (stopping) {
+    console.log('[whatsapp] Apagando: no se inicia un cliente nuevo.');
+    return;
+  }
   if (client) {
     console.log('[whatsapp] Cliente ya inicializado, ignorando.');
     return;
   }
 
-  storedProcessMessageFn = processMessageFn;
   cleanStaleLocks();
   connectionStatus = 'connecting';
   lastStatusChange = new Date().toISOString();
@@ -500,11 +502,18 @@ export async function startWhatsappClient(processMessageFn) {
 
   let gotQrOrAuth = false;
 
-  client = new Client({
+  setClient(new Client({
     authStrategy: new LocalAuth({ dataPath: AUTH_DATA_PATH }),
     webVersionCache: { type: 'none' },
     puppeteer: {
       headless: 'shell',
+      // Las señales las gestiona SOLO el apagado ordenado de src/index.js. Por defecto
+      // puppeteer pone sus propios manejadores: con SIGINT mata Chromium y hace
+      // process.exit(130) al instante (cortando el apagado), y con SIGTERM cierra el
+      // navegador en paralelo. Chromium sigue muriendo al salir el proceso: puppeteer
+      // siempre lo mata en el evento 'exit', con o sin estas opciones.
+      handleSIGINT: false,
+      handleSIGTERM: false,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -533,7 +542,7 @@ export async function startWhatsappClient(processMessageFn) {
         '--disable-oopr-debug-crash-dump',
       ],
     },
-  });
+  }));
 
   client.on('loading_screen', (percent, message) => {
     console.log(`[whatsapp] Loading screen: ${percent}% - ${message}`);
@@ -637,12 +646,14 @@ export async function startWhatsappClient(processMessageFn) {
     authReadyTimer = setTimeout(async () => {
       authReadyTimer = null;
       if (readyPollInterval) { clearInterval(readyPollInterval); readyPollInterval = null; }
-      if (connectionStatus === 'authenticated' && client) {
+      if (connectionStatus === 'authenticated' && client && !stopping) {
         console.log('[whatsapp] ⚠ Sin evento ready tras autenticacion (timeout 25s). Sesion probablemente corrupta.');
         const oldClient = client;
-        client = null;
+        setClient(null);
         oldClient.removeAllListeners();
         try { await oldClient.destroy(); } catch { }
+        // El apagado pudo empezar mientras se cerraba Chromium: no borrar la sesión.
+        if (stopping) return;
         hasEverAuthenticated = false;
         connectionStatus = 'waiting_qr';
         lastStatusChange = new Date().toISOString();
@@ -654,7 +665,7 @@ export async function startWhatsappClient(processMessageFn) {
           }
         } catch { }
         try {
-          await startWhatsappClient(storedProcessMessageFn);
+          await startWhatsappClient();
         } catch { }
       }
     }, AUTH_READY_TIMEOUT);
@@ -674,6 +685,18 @@ export async function startWhatsappClient(processMessageFn) {
     currentQr = null;
     reconnectAttempts = 0;
     try { writeFileSync('assets/qr.png', ''); } catch { }
+
+    // Identidad propia (número y LID) para reconocer cuándo me mencionan («@Tú»).
+    try {
+      const myId = getSerializedId(client?.info?.wid);
+      if (myId) {
+        const myIds = await resolveMyVoterIds(myId);
+        setMyIdentity([...myIds], [client?.info?.pushname]);
+        console.log(`[whatsapp] Identidad propia para menciones: ${myIds.size} id(s).`);
+      }
+    } catch (err) {
+      console.warn('[whatsapp] No se pudo resolver la identidad propia:', err?.message || err);
+    }
 
     const maxRetries = 5;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -738,7 +761,7 @@ export async function startWhatsappClient(processMessageFn) {
       const chatId = chat.id?._serialized || chat.id;
       if (!chatId) return;
       const unreadCount = typeof chat.unreadCount === 'number' ? chat.unreadCount : 0;
-      await applyChatUnreadCount(chat);
+      await applyChatUnreadCount(chat, { live: true });
       console.log(`[whatsapp] 👁 Sincronizado estado de lectura para ${chatId}: unreadCount = ${unreadCount}`);
     } catch (err) {
       console.warn('[whatsapp] Error en evento unread_count:', err.message);
@@ -751,7 +774,7 @@ export async function startWhatsappClient(processMessageFn) {
     console.log('[whatsapp] Desconectado:', reason);
     lastStatusChange = new Date().toISOString();
     currentQr = null;
-    client = null;
+    setClient(null);
 
     if (hasEverAuthenticated) {
       console.log('[whatsapp] Habia sesion activa, reintentando conexion...');
@@ -965,7 +988,10 @@ export async function startWhatsappClient(processMessageFn) {
     try {
       if (msg.fromMe) return;
       const age = Math.floor(Date.now() / 1000) - Number(msg.timestamp || 0);
-      if (age > 300) {
+      // En vivo, 5 min. Al recuperar tras un reinicio, 30 min: una llamada perdida mientras
+      // el servidor arrancaba se sigue avisando (tarde, pero mejor que nunca).
+      const maxAge = msg.isNokiaBackfill ? 30 * 60 : 300;
+      if (age > maxAge) {
         console.log(`[whatsapp] 📞 call_log antiguo omitido (edad ${age}s) de ${msg.from}`);
         return;
       }
@@ -1199,6 +1225,8 @@ export async function startWhatsappClient(processMessageFn) {
       }
     } else {
       userChatId = await resolveOwnChatUserId(chatId);
+      // La fila puede estar guardada con otro id (@lid / @c.us) que el del evento.
+      if (!msg?.isNokiaBackfill) markPhoneActivity(userChatId);
     }
 
     const hourSend = String(body.time || '');
@@ -1359,6 +1387,8 @@ export async function startWhatsappClient(processMessageFn) {
       rememberPendingOutgoingAck(whatsappMsgId, currentAck);
       ownFromOtherDevice = true;
       ownChatId = chatId;
+      // Estás escribiendo en este chat desde el móvil: no avisar por SMS de las respuestas.
+      if (!msg.isNokiaBackfill && Math.floor(Date.now() / 1000) - msg.timestamp <= 300) markPhoneActivity(chatId);
       console.log(`[whatsapp] 📲 Mensaje propio enviado desde otro dispositivo a ${chatId}: ${whatsappMsgId}`);
     }
 
@@ -1468,8 +1498,14 @@ export async function startWhatsappClient(processMessageFn) {
 
       // Resolver menciones en mensajes de grupo (solo mensajes nuevos)
       let resolvedBody = msg.body;
+      // ¿Me mencionan a mí? Solo en grupos y en mensajes de otros (marca «@» en la bandeja).
+      // «@all» / «@todos» (mención a todo el grupo) también cuenta.
+      const mentionsMeFlag = isGroup && !ownFromOtherDevice
+        && (mentionsMe(msg.mentionedIds) || mentionsEveryone(msg.body));
       if (isGroup && Array.isArray(msg.mentionedIds) && msg.mentionedIds.length > 0 && client) {
         resolvedBody = await resolveMentions(msg.body, msg.mentionedIds, client);
+        // resolveMentions acaba de guardar mi nombre: que el render lo reconozca como «@Tú».
+        if (mentionsMeFlag) refreshMyNames();
       }
 
       const d = new Date(msg.timestamp * 1000);
@@ -1547,6 +1583,14 @@ export async function startWhatsappClient(processMessageFn) {
               isMedia: rawQuoted.isMedia,
               mimetype: rawQuoted.mimetype,
             });
+            // Las menciones del mensaje citado vienen como «@<número/LID>»: igual que en el
+            // cuerpo, se sustituyen por el nombre (agenda o perfil de WhatsApp).
+            const quotedMentionIds = (Array.isArray(rawQuoted.mentionedJidList) ? rawQuoted.mentionedJidList : [])
+              .map((id) => getSerializedId(id))
+              .filter((id) => typeof id === 'string' && id.includes('@'));
+            if (quotedText && quotedMentionIds.length) {
+              quotedText = await resolveMentions(quotedText, quotedMentionIds, client);
+            }
 
             // Quien cita puede ser cualquiera del grupo, y a quien cita (el autor original
             // del mensaje citado) también — no tiene por qué ser ni "yo" ni quien responde
@@ -1566,6 +1610,11 @@ export async function startWhatsappClient(processMessageFn) {
                   if (baseDigits) {
                     quotedSender = stmts.getUserByPhonePattern.get(`${baseDigits}@%`)?.username || null;
                   }
+                }
+                if (!quotedSender) {
+                  // Alguien que aún no ha escrito en ningún chat del Nokia: su nombre de
+                  // perfil de WhatsApp (o su teléfono) en vez de dejar la cita sin autor.
+                  quotedSender = (await resolveDisplayNameForChatId(quotedId))?.name || null;
                 }
               }
             }
@@ -1595,6 +1644,7 @@ export async function startWhatsappClient(processMessageFn) {
           quoted_text: quotedText,
           quoted_sender: quotedSender,
           media_type: mediaType,
+          mentions_me: mentionsMeFlag ? 1 : 0,
         },
       };
 
@@ -1693,7 +1743,7 @@ export async function startWhatsappClient(processMessageFn) {
     console.log('[whatsapp] Cliente inicializado.');
   } catch (err) {
     console.error('[whatsapp] Error al inicializar cliente:', err.message);
-    client = null;
+    setClient(null);
     lastStatusChange = new Date().toISOString();
 
     if (hasEverAuthenticated) {
@@ -1705,12 +1755,14 @@ export async function startWhatsappClient(processMessageFn) {
   }
 
   setTimeout(async () => {
-    if (!gotQrOrAuth && client) {
+    if (!gotQrOrAuth && client && !stopping) {
       console.log('[whatsapp] Sin QR ni autenticacion en 15s. Limpiando sesion corrupta...');
       try {
         await client.destroy();
       } catch { }
-      client = null;
+      // El apagado pudo empezar mientras se cerraba Chromium: no borrar la sesión.
+      if (stopping) return;
+      setClient(null);
       hasEverAuthenticated = false;
       connectionStatus = 'waiting_qr';
       lastStatusChange = new Date().toISOString();
@@ -1722,13 +1774,16 @@ export async function startWhatsappClient(processMessageFn) {
         }
       } catch { }
       try {
-        await startWhatsappClient(storedProcessMessageFn);
+        await startWhatsappClient();
       } catch { }
     }
   }, 15000);
 }
 
+// Solo para el apagado del proceso (src/index.js): tras llamarla el cliente no vuelve a
+// arrancar ni a reconectar. No usar para "reiniciar" WhatsApp.
 export async function stopWhatsappClient() {
+  stopping = true;
   if (authReadyTimer) { clearTimeout(authReadyTimer); authReadyTimer = null; }
   if (readyPollInterval) { clearInterval(readyPollInterval); readyPollInterval = null; }
   if (disconnectAlertTimer) { clearInterval(disconnectAlertTimer); disconnectAlertTimer = null; }
@@ -1746,7 +1801,7 @@ export async function stopWhatsappClient() {
   } catch (err) {
     console.error('[whatsapp] Error al cerrar cliente:', err.message);
   } finally {
-    client = null;
+    setClient(null);
     currentQr = null;
     connectionStatus = 'disconnected';
     lastStatusChange = new Date().toISOString();
@@ -1771,7 +1826,7 @@ export async function logoutWhatsapp() {
     }
   }
 
-  client = null;
+  setClient(null);
   currentQr = null;
   hasEverAuthenticated = false;
   connectionStatus = 'waiting_qr';

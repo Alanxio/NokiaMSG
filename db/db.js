@@ -190,6 +190,12 @@ try {
   // Columna ya existe, ignorar
 }
 try {
+  // 1 si el mensaje (entrante, de grupo) menciona a esta cuenta: «@» en la bandeja.
+  db.exec(`ALTER TABLE messages ADD COLUMN mentions_me INTEGER DEFAULT 0`);
+} catch {
+  // Columna ya existe, ignorar
+}
+try {
   db.exec(`ALTER TABLE attachments ADD COLUMN duration_sec INTEGER`);
 } catch {
   // Columna ya existe, ignorar
@@ -217,10 +223,6 @@ export const stmts = {
 
   getUserByUsername: db.prepare(`
     SELECT chat_id, username, unseen_count, sms_muted, sms_notified FROM users WHERE username = ? LIMIT 1
-  `),
-
-  updateUserChatId: db.prepare(`
-    UPDATE users SET chat_id = ? WHERE chat_id = ?
   `),
 
   incrementUserUnseen: db.prepare(`
@@ -255,6 +257,22 @@ export const stmts = {
 
   deleteDmAttachmentsByUserChatId: db.prepare(`
     DELETE FROM attachments WHERE message_id IN (
+      SELECT id FROM messages WHERE user_chat_id = ? AND group_id IS NULL
+    )
+  `),
+
+  // Las encuestas cuelgan de sus mensajes (FK sin ON DELETE CASCADE): se borran antes, o
+  // borrar un chat con una encuesta falla con «FOREIGN KEY constraint failed».
+  deleteDmPollVotesByUserChatId: db.prepare(`
+    DELETE FROM poll_votes WHERE option_id IN (
+      SELECT po.id FROM poll_options po
+      JOIN messages m ON m.id = po.message_id
+      WHERE m.user_chat_id = ? AND m.group_id IS NULL
+    )
+  `),
+
+  deleteDmPollOptionsByUserChatId: db.prepare(`
+    DELETE FROM poll_options WHERE message_id IN (
       SELECT id FROM messages WHERE user_chat_id = ? AND group_id IS NULL
     )
   `),
@@ -317,6 +335,21 @@ export const stmts = {
     )
   `),
 
+  // Igual que en los chats individuales: encuestas antes que sus mensajes.
+  deletePollVotesByGroupId: db.prepare(`
+    DELETE FROM poll_votes WHERE option_id IN (
+      SELECT po.id FROM poll_options po
+      JOIN messages m ON m.id = po.message_id
+      WHERE m.group_id = ?
+    )
+  `),
+
+  deletePollOptionsByGroupId: db.prepare(`
+    DELETE FROM poll_options WHERE message_id IN (
+      SELECT id FROM messages WHERE group_id = ?
+    )
+  `),
+
   deleteMessagesByGroupId: db.prepare(`
     DELETE FROM messages WHERE group_id = ?
   `),
@@ -355,6 +388,13 @@ export const stmts = {
     SELECT id FROM messages WHERE whatsapp_msg_id = ? LIMIT 1
   `),
 
+  // ¿Alguno de los últimos `unseen` mensajes del grupo (los no leídos) me menciona?
+  groupHasUnreadMention: db.prepare(`
+    SELECT 1 FROM (
+      SELECT mentions_me FROM messages WHERE group_id = ? ORDER BY id DESC LIMIT ?
+    ) WHERE mentions_me = 1 LIMIT 1
+  `),
+
   // Mensaje propio escrito desde otro dispositivo (móvil, WhatsApp Web…). Mismas columnas
   // que guarda saveInteraction, con from_me = 1; OR IGNORE + whatsapp_msg_id UNIQUE descartan
   // un segundo intento con el mismo mensaje.
@@ -381,17 +421,16 @@ export const stmts = {
     UPDATE messages SET whatsapp_msg_id = ? WHERE id = ?
   `),
 
+  setMessageMediaType: db.prepare(`
+    UPDATE messages SET media_type = ? WHERE id = ?
+  `),
+
   markMessageDeleted: db.prepare(`
     UPDATE messages SET is_deleted = 1 WHERE whatsapp_msg_id = ?
   `),
 
   markMessageEdited: db.prepare(`
     UPDATE messages SET text = ?, is_edited = 1 WHERE whatsapp_msg_id = ?
-  `),
-
-  insertMessageSafe: db.prepare(`
-    INSERT OR IGNORE INTO messages (text, day_send, hour_send, from_me, user_chat_id, group_id, has_media, media_key, whatsapp_msg_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
 
   getMessageById: db.prepare(`
@@ -468,16 +507,6 @@ export const stmts = {
     UPDATE messages SET quoted_text = ?, quoted_sender = ? WHERE id = ?
   `),
 
-  getAllMessagesPaginated: db.prepare(`
-    SELECT m.id, m.text, m.hour_send, m.from_me,
-           u.username, g.group_name
-    FROM messages m
-    LEFT JOIN users   u ON u.chat_id  = m.user_chat_id
-    LEFT JOIN wgroups g ON g.group_id = m.group_id
-    ORDER BY m.hour_send DESC, m.id DESC
-    LIMIT ? OFFSET ?
-  `),
-
   countUserMessages: db.prepare(`
     SELECT COUNT(*) AS total FROM messages WHERE user_chat_id = ? AND group_id IS NULL
   `),
@@ -486,19 +515,11 @@ export const stmts = {
     SELECT COUNT(*) AS total FROM messages WHERE group_id = ?
   `),
 
-  countAllMessages: db.prepare(`
-    SELECT COUNT(*) AS total FROM messages
-  `),
-
   getAllUsers: db.prepare(`
     SELECT u.chat_id, u.username, u.unseen_count FROM users u
     WHERE EXISTS (
       SELECT 1 FROM messages m WHERE m.user_chat_id = u.chat_id AND m.group_id IS NULL
     )
-  `),
-
-  getAllGroups: db.prepare(`
-    SELECT group_id, group_name, unseen_count FROM wgroups
   `),
 
   countDirectoryUsers: db.prepare(`
@@ -544,17 +565,21 @@ export const stmts = {
     DELETE FROM messages WHERE hour_send IS NOT NULL AND hour_send <= ?
   `),
 
+  // Tras borrar mensajes antiguos (limpieza diaria): los no leídos son los últimos mensajes
+  // RECIBIDOS, así que el contador solo puede BAJAR hasta los recibidos que quedan; nunca
+  // subir. Antes se ponía el total de mensajes del chat (propios y ya leídos incluidos), y
+  // cada limpieza marcaba casi todos los chats como no leídos.
   adjustUserUnseen: db.prepare(`
-    UPDATE users SET unseen_count = (
+    UPDATE users SET unseen_count = MIN(unseen_count, (
       SELECT COUNT(*) FROM messages
-      WHERE user_chat_id = users.chat_id AND group_id IS NULL
-    ) WHERE chat_id = ?
+      WHERE user_chat_id = users.chat_id AND group_id IS NULL AND from_me = 0
+    )) WHERE chat_id = ?
   `),
 
   adjustGroupUnseen: db.prepare(`
-    UPDATE wgroups SET unseen_count = (
-      SELECT COUNT(*) FROM messages WHERE group_id = wgroups.group_id
-    ) WHERE group_id = ?
+    UPDATE wgroups SET unseen_count = MIN(unseen_count, (
+      SELECT COUNT(*) FROM messages WHERE group_id = wgroups.group_id AND from_me = 0
+    )) WHERE group_id = ?
   `),
 
   deleteUsersWithoutMessages: db.prepare(`
@@ -602,26 +627,6 @@ export const stmts = {
     UPDATE messages SET transcription = ? WHERE id = ?
   `),
 
-  getLastMessageWithMedia: db.prepare(`
-    SELECT m.id, m.text, m.has_media, a.file_path_thumb, a.mime_type
-    FROM messages m
-    LEFT JOIN attachments a ON a.message_id = m.id
-    WHERE m.user_chat_id = ? AND m.group_id IS NULL
-    ORDER BY m.id DESC LIMIT 1
-  `),
-
-  getLastGroupMessageWithMedia: db.prepare(`
-    SELECT m.id, m.text, m.has_media, a.file_path_thumb, a.mime_type
-    FROM messages m
-    LEFT JOIN attachments a ON a.message_id = m.id
-    WHERE m.group_id = ?
-    ORDER BY m.id DESC LIMIT 1
-  `),
-
-  getAttachmentsByMediaKey: db.prepare(`
-    SELECT * FROM attachments WHERE media_key = ? ORDER BY album_order
-  `),
-
   getAttachmentsByMessageId: db.prepare(`
     SELECT * FROM attachments WHERE message_id = ? ORDER BY album_order
   `),
@@ -665,10 +670,6 @@ export const stmts = {
     )
   `),
 
-  updateAttachmentMessageId: db.prepare(`
-    UPDATE attachments SET message_id = ? WHERE id = ?
-  `),
-
   getMessageByIdWithMedia: db.prepare(`
     SELECT m.id, m.text, m.day_send, m.hour_send, m.from_me, m.has_media, m.is_sticker, m.media_key,
            m.media_type, m.whatsapp_msg_id, m.transcription, m.is_deleted, m.is_system,
@@ -681,13 +682,6 @@ export const stmts = {
     LEFT JOIN attachments a ON a.message_id = m.id
     WHERE m.id = ?
     LIMIT 1
-  `),
-
-  getAlbumAttachments: db.prepare(`
-    SELECT a.* FROM attachments a
-    INNER JOIN messages m ON m.id = a.message_id
-    WHERE m.media_key = ? AND m.media_key IS NOT NULL
-    ORDER BY a.album_order
   `),
 
   insertPollOption: db.prepare(`
@@ -727,15 +721,6 @@ export const stmts = {
     SELECT voter_chat_id, voted_at_ts FROM poll_votes WHERE option_id = ? ORDER BY voted_at_ts ASC
   `),
 
-  // Añade esto justo al final de tu objeto stmts en db.js
-  markMessageAsSeenByUser: db.prepare(`
-    UPDATE messages SET from_me = 1 WHERE user_chat_id = ? AND from_me = 0
-  `), // Nota: Como no tienes columna 'seen', esto es un ejemplo. Si no usas 'seen', mejor usa la Opción 1.
-
-  recalculateUserUnseen: db.prepare(`
-    UPDATE users SET unseen_count = 0 WHERE chat_id = ?
-  `),
-
   resetAllUsersUnseen: db.prepare(`
     UPDATE users SET unseen_count = 0, sms_notified = 0
   `),
@@ -765,22 +750,28 @@ export const stmts = {
     WHERE group_id = ?
   `),
 
+  // Nombres conocidos, para delimitar exactamente las menciones al mostrarlas.
+  getAllUsernames: db.prepare(`
+    SELECT DISTINCT username FROM users WHERE username IS NOT NULL AND username != ''
+  `),
+
   getUserByPhonePattern: db.prepare(`
     SELECT chat_id, username FROM users WHERE chat_id LIKE ? LIMIT 1
   `),
 };
 
-// Cierre seguro de la base de datos para evitar corrupción del modo WAL
-process.on('SIGINT', () => {
-  console.log('[DB] Cerrando conexión SQLite (SIGINT)...');
-  db.close();
-  process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-  console.log('[DB] Cerrando conexión SQLite (SIGTERM)...');
-  db.close();
-  process.exit(0);
-});
+// Cierre de la conexión (vuelca el WAL al fichero principal). Lo llama SOLO el apagado
+// ordenado de src/index.js, como último paso: aquí no se registran manejadores de señales
+// propios, porque un process.exit() desde este módulo cortaba el apagado de index.js antes
+// de cerrar Chromium y el servidor HTTP. Idempotente: llamarlo dos veces no falla.
+export function closeDb() {
+  if (!db.open) return;
+  try {
+    db.close();
+    console.log('[DB] Conexión SQLite cerrada.');
+  } catch (err) {
+    console.error('[DB] Error al cerrar SQLite:', err?.message || err);
+  }
+}
 
 export default db;

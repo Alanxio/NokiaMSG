@@ -41,6 +41,20 @@ function getSmsConfig() {
   };
 }
 
+function getTwilioMissing(config) {
+  const missing = [];
+  if (!config.accountSid) missing.push('TWILIO_ACCOUNT_SID');
+  if (!config.authToken) missing.push('TWILIO_AUTH_TOKEN');
+  if (!config.fromNumber) missing.push('TWILIO_FROM_NUMBER');
+  if (!config.toNumber) missing.push('TWILIO_TO_NUMBER');
+  return missing;
+}
+
+// Variables de Twilio que faltan (vacío = configurado). Para avisarlo en Ajustes.
+export function getTwilioMissingConfig() {
+  return getTwilioMissing(getSmsConfig());
+}
+
 export function getSmsNotificationStatus() {
   const config = getSmsConfig();
 
@@ -128,14 +142,21 @@ export async function sendCallSmsNotification(payload) {
   return sendRawSms(config, smsText);
 }
 
-// Alerta genérica de infraestructura (p.ej. WhatsApp lleva mucho desconectado) — mismo canal
-// Twilio ya configurado, sin el enlace al chat que sí lleva sendSmsNotification.
+// Avisos del gateway (WhatsApp lleva mucho desconectado; el watchdog lee la misma clave del
+// .env para los suyos). Van con su propia casilla en Ajustes, independiente de la de
+// mensajes: activados por defecto. Solo hace falta Twilio configurado.
+export function isGatewayAlertSmsEnabled() {
+  return parseBoolean(process.env.SMS_GATEWAY_ALERTS_ENABLED, true);
+}
+
 export async function sendInfraAlertSms(text) {
   const config = getSmsConfig();
-  const status = getSmsNotificationStatus();
-
-  if (!status.enabled) {
-    return { status: status.status, missing: status.missing };
+  if (!isGatewayAlertSmsEnabled()) {
+    return { status: 'disabled', missing: [] };
+  }
+  const missing = getTwilioMissing(config);
+  if (missing.length > 0) {
+    return { status: 'misconfigured', missing };
   }
 
   return sendRawSms(config, text);

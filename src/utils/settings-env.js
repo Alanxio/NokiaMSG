@@ -12,6 +12,7 @@ export const SETTINGS_ENV_PATH = process.env.ENV_FILE_PATH || path.resolve(proce
 // toman siempre del archivo, que es la fuente de verdad.
 export const SETTINGS_KEYS = [
   'SMS_NOTIFICATIONS_ENABLED',
+  'SMS_GATEWAY_ALERTS_ENABLED',
   'SEND_READ_RECEIPTS_ENABLED',
   'DAILY_CLEANUP_ENABLED',
   'MESSAGE_RETENTION_DAYS',

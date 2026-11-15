@@ -1,6 +1,8 @@
 import db, { stmts } from '../../db/db.js';
-import { convertEmojisToAscii } from '../utils/emoji.js';
+import { renderChatMessages } from './chat-view.js';
+import { resolveUnknownMentionNames } from '../utils/mentions.js';
 import { client, sendWhatsappSeen, resolveContactPhone, syncChatUnreadCountFromWhatsapp } from '../services/whatsapp.service.js';
+import { isMyId } from '../utils/my-identity.js';
 import { releaseAttachmentFiles } from '../services/cleanup.service.js';
 import { getAvatarUrl, renderAvatarImg } from '../services/avatar.service.js';
 import {
@@ -13,27 +15,21 @@ import {
   MESSAGE_PAGE_SIZE,
   escapeXml,
   formatPhoneNumber,
-  getMessageDateInfo,
   buildMemberColorMap,
   getLetterBucket,
   getMemberColor,
   getTotal,
   isNumericOrJid,
-  renderAckLabel,
   renderList,
-  renderMediaLine,
-  renderMessageDateSeparator,
-  renderMentions,
-  renderPollLine,
   renderNumberedPager,
   renderPager,
   renderPhoneLink,
-  renderMessageActions,
   sendInvalidEntity,
   sendMissingEntity,
   sendPage,
   toPositiveInt,
   truncateName,
+  LIST_NAME_LENGTH,
   getSearchQuery,
   normalizeSearchText,
   renderDirectorySearch,
@@ -218,6 +214,34 @@ async function resolveParticipantDisplayName(chatId, storedUser) {
   return formatWhatsappIdentifier(chatId);
 }
 
+// Participantes a los que se puede mencionar al escribir («@ana»): la lista en vivo de
+// WhatsApp (todos, no solo quien ha escrito alguna vez) más los conocidos localmente, sin
+// la propia cuenta. El nombre sale de la BD; los que aún no tienen nombre guardado solo se
+// consultan a WhatsApp con resolveUnknown (es lento en grupos grandes: se hace solo si lo
+// escrito no encaja con nadie conocido).
+export async function getGroupMentionCandidates(groupId, { resolveUnknown = false } = {}) {
+  const details = await fetchGroupDetailsDirectly(groupId);
+  const liveIds = (details?.participants || []).map((p) => p.id).filter(Boolean);
+  const localRows = stmts.getParticipantsByGroupId.all(groupId);
+  const ids = [...new Set([...liveIds, ...localRows.map((r) => r.chat_id)])].filter((id) => !isMyId(id));
+
+  const candidates = [];
+  const unknown = [];
+  for (const id of ids) {
+    const row = stmts.getUserByChatId.get(id);
+    if (row?.username) candidates.push({ id, name: row.username });
+    else unknown.push(id);
+  }
+  if (resolveUnknown) {
+    for (let offset = 0; offset < unknown.length; offset += 6) {
+      const batch = unknown.slice(offset, offset + 6);
+      const names = await Promise.all(batch.map((id) => resolveParticipantDisplayName(id, null)));
+      batch.forEach((id, i) => candidates.push({ id, name: names[i] }));
+    }
+  }
+  return { candidates, unknownCount: resolveUnknown ? 0 : unknown.length };
+}
+
 export async function listGroups(req, res, next) {
   try {
     const requestedPage = toPositiveInt(req.query.p, 1);
@@ -257,7 +281,12 @@ export async function listGroups(req, res, next) {
       renderDirectorySearch('/grupo', query, query ? total : null) +
       '<p><a href="/">Inicio</a></p>' +
       renderNumberedPager('/grupo', page, totalPages, pagerParams) +
-      renderList(resolvedGroups, (group) => `/grupo/${group.group_id}`, (group) => `${truncateName(group.group_name)}[${group.unseen_count}]`, query ? 'Ningún grupo coincide.' : 'Sin grupos.', (group) => getLetterBucket(group.group_name)) +
+      renderList(resolvedGroups, (group) => `/grupo/${group.group_id}`, (group) => {
+        // Contador siempre, también «[0]».
+        const unseen = `[${group.unseen_count || 0}]`;
+        const mention = group.unseen_count > 0 && stmts.groupHasUnreadMention.get(group.group_id, group.unseen_count) ? '@' : '';
+        return `${truncateName(group.group_name, LIST_NAME_LENGTH)}${unseen}${mention}`;
+      }, query ? 'Ningún grupo coincide.' : 'Sin grupos.', (group) => getLetterBucket(group.group_name)) +
       renderNumberedPager('/grupo', page, totalPages, pagerParams);
 
     sendPage(req, res, 200, 'Grupos', body);
@@ -324,78 +353,14 @@ export async function showGroupMessages(req, res, next) {
       stmts.getParticipantsByGroupId.all(groupId).map((p) => p.chat_id)
     );
 
-    let messagesHtml = '';
-    if (messages.length === 0) {
-      messagesHtml = '<p>Sin mensajes.</p>';
-    } else {
-      let previousDate = null;
-      for (let index = 0; index < messages.length; index += 1) {
-        const message = messages[index];
-        const isNew = index < newMessageCount;
-        const unseenMarker = isNew ? '<font color="#cc0000">[!]</font> ' : '';
-        const sentAt = formatHourSend(message.hour_send);
-        const dateInfo = getMessageDateInfo(message);
-        const dateSeparator = dateInfo?.label && dateInfo.key !== previousDate
-          ? renderMessageDateSeparator(dateInfo.label)
-          : '';
-        if (dateInfo) previousDate = dateInfo.key;
-
-        if (Number(message.is_system) === 1) {
-          messagesHtml += `${dateSeparator}<p align="center">${unseenMarker}<i><font size="1" color="#888888">${escapeXml(sentAt)} — ${renderMentions(message.text)}</font></i></p>`;
-          continue;
-        }
-
-        const mediaLine = renderMediaLine(message, { linkToDetail: `/mensaje/${message.id}` });
-        const pollLine = message.media_type === 'poll'
-          ? renderPollLine(message, stmts.getPollOptionCountsByMessageId.all(message.id), { linkToDetail: `/mensaje/${message.id}` })
-          : null;
-        let contentPart;
-        if (mediaLine) {
-          contentPart = mediaLine;
-        } else if (pollLine) {
-          contentPart = pollLine;
-        } else if (message.has_media && message.file_path_thumb) {
-          contentPart = `<img src="${escapeXml(message.file_path_thumb)}" width="40" alt="thumb"/> <a href="/mensaje/${message.id}">[Ver]</a>`;
-        } else if (Number(message.is_sticker) === 1) {
-          contentPart = '<i>[Sticker]</i>';
-        } else {
-          contentPart = renderMentions(message.text);
-        }
-        // Un mensaje borrado se sigue mostrando, marcado en rojo como «(borrado)».
-        const editedTag = Number(message.is_deleted) === 1
-          ? ' <font size="1" color="#cc0000">(borrado)</font>'
-          : Number(message.is_edited) === 1
-            ? ' <font size="1" color="#888888">(editado)</font>'
-            : '';
-
-        const isSaliente = Number(message.from_me) === 1;
-        const fromMeMarker = isSaliente
-          ? `<font color="#006600">[Yo]</font> ${renderAckLabel(message.ack_status)}`
-          : '';
-        const messageActions = renderMessageActions(message, group.group_id, 'group');
-
-        const senderColor = getMemberColor(message.user_chat_id, memberColorMap);
-        const usernameLine = isSaliente
-          ? ''
-          : `<font size="1" color="${senderColor}">[${message.username ? escapeXml(truncateName(convertEmojisToAscii(message.username))) : 'Desconocido'}] dice:</font><br/>`;
-
-        let quotedBlock = '';
-        if (message.quoted_text || message.quoted_sender) {
-          const quotedTag = message.quoted_sender ? `R-${escapeXml(message.quoted_sender)}` : 'R';
-          const quotedPreview = message.quoted_text
-            ? escapeXml(truncateName(message.quoted_text, 80))
-            : '(no disponible)';
-          quotedBlock = `<i><font size="1" color="#888888">[${quotedTag}]-&quot;${quotedPreview}&quot;</font></i><br/>`;
-        }
-
-        messagesHtml +=
-          `${dateSeparator}<p>${unseenMarker}<font size="1" color="#666666">${escapeXml(sentAt)}</font>${editedTag}${messageActions}${messageActions && fromMeMarker ? '<br/>' : ''}${fromMeMarker}<br/>` +
-          usernameLine +
-          quotedBlock +
-          `<font size="1" color="#000000">${contentPart}</font><br/>` +
-          `----------</p>`;
-      }
-    }
+    // Menciones que aún son un número («@2296…»): nombre de perfil de WhatsApp.
+    await resolveUnknownMentionNames(messages.flatMap((m) => [m.text, m.quoted_text]), client);
+    const messagesHtml = renderChatMessages(messages, {
+      chatId: group.group_id,
+      type: 'group',
+      newMessageCount,
+      memberColorMap,
+    });
 
     const isMuted = Number(group.sms_muted) === 1;
     const muteLabel = isMuted ? 'Activar SMS' : 'Silenciar SMS';
@@ -571,6 +536,9 @@ export async function showGroupDetails(req, res, next) {
     const phoneByChatId = new Map(phoneEntries);
 
     // Una persona por línea, con su color del chat; rol en pequeño y teléfono debajo.
+    // Hueco entre una persona y la siguiente: una línea vacía en letra pequeña (media
+    // línea, aprox.), para que nombre + teléfono de cada uno se lean como un bloque.
+    const MEMBER_GAP = '<br/><font size="1">&#160;</font><br/>';
     const renderMember = (id, name, roleTag = '') => {
       const phone = phoneByChatId.get(id);
       return `- <font color="${getMemberColor(id, memberColorMap)}">${escapeXml(name)}</font>${roleTag}` +
@@ -587,7 +555,7 @@ export async function showGroupDetails(req, res, next) {
               : '';
           return renderMember(p.id, resolveDisplay(p.id), roleTag);
         })
-        .join('<br/>') +
+        .join(MEMBER_GAP) +
       '</p>';
 
     if (pastParticipants.length) {
@@ -595,7 +563,7 @@ export async function showGroupDetails(req, res, next) {
         `<p><b>Ya no están (${pastParticipants.length}):</b><br/>` +
         `<font size="1" color="#666666">${pastParticipants
           .map((p) => renderMember(p.chat_id, p.username || p.chat_id))
-          .join('<br/>')}</font></p>`;
+          .join(MEMBER_GAP)}</font></p>`;
     }
 
     body += footerHtml;
@@ -667,13 +635,15 @@ export async function deleteGroup(req, res, next) {
     db.exec('BEGIN');
     try {
       stmts.deleteAttachmentsByGroupId.run(groupId);
+      stmts.deletePollVotesByGroupId.run(groupId);
+      stmts.deletePollOptionsByGroupId.run(groupId);
       stmts.deleteMessagesByGroupId.run(groupId);
       stmts.deleteParticipantsByGroupId.run(groupId);
       stmts.deleteGroupRow.run(groupId);
 
       db.exec('COMMIT');
     } catch (error) {
-      db.exec('ROLLBACK');
+      if (db.inTransaction) db.exec('ROLLBACK');
       throw error;
     }
 
@@ -691,16 +661,3 @@ export async function deleteGroup(req, res, next) {
 
 
 
-function formatHourSend(hourSend) {
-  if (!hourSend) return "00:00";
-  if (typeof hourSend === 'string') {
-    const match = hourSend.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})/);
-    if (match) return match[2];
-  }
-  const ms = typeof hourSend === 'number' && hourSend < 2000000000 ? hourSend * 1000 : Number(hourSend);
-  const date = new Date(ms);
-  if (isNaN(date.getTime())) return "00:00";
-  const hours = String(date.getHours()).padStart(2, '0');
-  const minutes = String(date.getMinutes()).padStart(2, '0');
-  return `${hours}:${minutes}`;
-}

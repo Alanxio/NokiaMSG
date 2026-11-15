@@ -1,4 +1,5 @@
 import { stmts } from '../../db/db.js';
+import { stripBidiIsolates } from './mention-text.js';
 import {
   CONTACT_NAME_PRIORITY,
   formatWhatsappIdentifier,
@@ -69,13 +70,27 @@ async function resolveMentionDisplayName(client, chatId) {
   };
 }
 
-function buildMentionRegex(chatId) {
-  const [identifier] = chatId.split('@');
-  const patterns = [
-    identifier,
-    `+${identifier}`,
-    `lid:${identifier}`
-  ];
+// Identificadores (sin @dominio) con los que puede aparecer la persona en el cuerpo del
+// mensaje. WhatsApp a veces escribe «@<LID>» en el texto pero pasa el número @c.us en
+// mentionedIds, o al revés: sin probar ambos, la mención se quedaba como «@43834469789905».
+async function resolveMentionAliases(client, chatId) {
+  const aliases = new Set([chatId.split('@')[0]]);
+  try {
+    if (typeof client?.getContactLidAndPhone === 'function') {
+      const [result] = await client.getContactLidAndPhone([chatId]);
+      for (const value of [result?.lid, result?.pn]) {
+        const id = value?._serialized || value;
+        if (typeof id === 'string' && id.includes('@')) aliases.add(id.split('@')[0]);
+      }
+    }
+  } catch {
+    // Solo el identificador recibido.
+  }
+  return [...aliases].filter(Boolean);
+}
+
+function buildMentionRegex(identifiers) {
+  const patterns = identifiers.flatMap((identifier) => [identifier, `+${identifier}`, `lid:${identifier}`]);
 
   const escaped = patterns.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   // (?!\d): evita que el identificador de una persona quede "atrapado" como
@@ -89,7 +104,7 @@ export async function resolveMentions(body, mentionedIds, client) {
     return body;
   }
 
-  let resolvedBody = body;
+  let resolvedBody = stripBidiIsolates(body);
 
   // Resolver primero los identificadores más largos: si un ID es prefijo
   // numérico de otro, así se sustituye siempre por el correcto.
@@ -104,7 +119,7 @@ export async function resolveMentions(body, mentionedIds, client) {
       // un contacto guardado a nombre de perfil o número.
       stmts.upsertUserNameIfPreferred.run(chatId, displayName, identity.priority);
 
-      const regex = buildMentionRegex(chatId);
+      const regex = buildMentionRegex(await resolveMentionAliases(client, chatId));
       resolvedBody = resolvedBody.replace(regex, `@${displayName}`);
     } catch (err) {
       console.warn(`[mentions] No se pudo resolver ${chatId}:`, err.message);
@@ -112,4 +127,60 @@ export async function resolveMentions(body, mentionedIds, client) {
   }
 
   return resolvedBody;
+}
+
+// ── Al mostrar ────────────────────────────────────────────────────────────────────
+// Menciones que se quedaron como número («@229604673507579»): las de mensajes guardados
+// antes de resolverse, o las del texto citado de una respuesta. Antes de pintar un chat se
+// consulta a WhatsApp el nombre de perfil de esas personas y se guarda en users, igual que
+// hace resolveMentions al recibir; renderMentions ya lo encuentra por los dígitos.
+const NUMERIC_MENTION_RE = /(?:^|[\s([{¡¿"'«])@\+?(\d{8,20})(?!\d)/g;
+const MENTION_LOOKUP_RETRY_MS = 10 * 60_000;
+const MENTION_LOOKUP_MAX = 10;
+const MENTION_LOOKUP_TIMEOUT_MS = 2_500;
+const mentionLookupAttempts = new Map();
+
+function hasStoredName(digits) {
+  const row = stmts.getUserByPhonePattern.get(`${digits}@%`);
+  return Boolean(row?.username && !/^\+?\d[\d\s]*$/.test(row.username));
+}
+
+async function lookupMentionName(client, digits) {
+  // 14+ cifras: casi siempre un LID; si no, un teléfono. Se prueba también el otro.
+  const ids = digits.length >= 14 ? [`${digits}@lid`, `${digits}@c.us`] : [`${digits}@c.us`, `${digits}@lid`];
+  for (const id of ids) {
+    try {
+      const identity = getContactDisplayName(await client.getContactById(id));
+      if (identity) {
+        stmts.upsertUserNameIfPreferred.run(id, identity.name, identity.priority);
+        return;
+      }
+    } catch {
+      // Siguiente formato.
+    }
+  }
+}
+
+export async function resolveUnknownMentionNames(texts, client) {
+  if (!client?.info) return;
+  const pending = new Set();
+  for (const text of texts) {
+    if (!text || !String(text).includes('@')) continue;
+    for (const match of stripBidiIsolates(text).matchAll(NUMERIC_MENTION_RE)) {
+      const digits = match[1];
+      const lastTry = mentionLookupAttempts.get(digits) || 0;
+      if (Date.now() - lastTry < MENTION_LOOKUP_RETRY_MS || hasStoredName(digits)) continue;
+      pending.add(digits);
+      if (pending.size >= MENTION_LOOKUP_MAX) break;
+    }
+  }
+  if (!pending.size) return;
+
+  for (const digits of pending) mentionLookupAttempts.set(digits, Date.now());
+  // Con un tope de tiempo: si WhatsApp tarda, la página sale igual (con el número) y
+  // la próxima vez ya estará resuelto.
+  await Promise.race([
+    Promise.all([...pending].map((digits) => lookupMentionName(client, digits))),
+    new Promise((resolve) => { setTimeout(resolve, MENTION_LOOKUP_TIMEOUT_MS).unref?.(); }),
+  ]);
 }
