@@ -1,5 +1,6 @@
 import { stmts } from '../../db/db.js';
-import { convertEmojisToAscii } from '../utils/emoji.js';
+import { convertEmojisToAscii, renderMiniEmoji } from '../utils/emoji.js';
+import { getReactionsByMessage, groupReactions } from '../services/reaction.service.js';
 import { stripRichText } from '../utils/rich-text.js';
 import {
   escapeXml,
@@ -54,6 +55,15 @@ function renderContent(message) {
   return renderMentions(message.text);
 }
 
+// Reacciones bajo el mensaje, en pequeño: «😂 ❤2» (el número solo si hay más de una).
+// Quién ha reaccionado se ve en el detalle del mensaje.
+function renderReactionsLine(reactions) {
+  const groups = groupReactions(reactions);
+  if (!groups.length) return '';
+  const items = groups.map(({ reaction, count }) => `${renderMiniEmoji(reaction)}${count > 1 ? count : ''}`);
+  return `<br/><font size="1" color="#666666">${items.join(' ')}</font>`;
+}
+
 // Respuesta a otro mensaje, en una línea pequeña y gris: «| Autor: texto citado».
 //  · Autor recortado (hay nombres de 50+ caracteres) y sin emojis.
 //  · «[Nota de voz]», «[Imagen] pie»…: la etiqueta va aparte, sin cursiva, y el pie después.
@@ -103,6 +113,7 @@ export function renderChatMessages(messages, { chatId, type, newMessageCount = 0
   if (!messages.length) return '<p>Sin mensajes.</p>';
 
   const isGroup = type === 'group';
+  const reactionsByMessage = getReactionsByMessage(messages.map((message) => message.id));
   let html = '';
   let previousDate = null;
   // <hr/> entre mensajes. Si entre dos hay un cambio de fecha, la línea va encima de la
@@ -173,7 +184,7 @@ export function renderChatMessages(messages, { chatId, type, newMessageCount = 0
 
     html +=
       `${dateSeparator}${separator}${headerHtml}` +
-      `<p>${fromMeLine}${usernameLine}${renderQuote(message)}${body}</p>`;
+      `<p>${fromMeLine}${usernameLine}${renderQuote(message)}${body}${renderReactionsLine(reactionsByMessage.get(message.id))}</p>`;
   });
 
   return html;

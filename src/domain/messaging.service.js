@@ -103,21 +103,50 @@ function madridTimestamps() {
   return { daySend, hourSend };
 }
 
+// Alias del mismo chat privado: el JID resuelto y su @lid / @c.us. Un número escrito a mano
+// se resuelve a @c.us, pero si WhatsApp lleva ese chat por LID el message_create propio
+// llega con @lid; sin los alias ese envío parecería hecho desde otro dispositivo.
+async function getPrivateChatAliases(targetJid, waClient) {
+  const aliases = [targetJid];
+  if (typeof waClient?.getContactLidAndPhone !== 'function') return aliases;
+  try {
+    const [result] = await waClient.getContactLidAndPhone([targetJid]);
+    for (const value of [result?.lid, result?.pn]) {
+      const id = typeof value === 'string' ? value : value?._serialized;
+      if (id && id.includes('@') && !aliases.includes(id)) aliases.push(id);
+    }
+  } catch (err) {
+    console.debug(`[mensaje] No se pudo resolver el LID/teléfono de ${targetJid}:`, err?.message || err);
+  }
+  return aliases;
+}
+
+// Fila de usuario donde guardar el chat: la que ya exista con cualquiera de los alias; si no
+// hay ninguna, el @lid (es el id con el que llegarán las respuestas), o el JID resuelto.
+function pickPrivateStorageJid(aliases) {
+  for (const id of aliases) {
+    if (stmts.getUserByChatId.get(id)) return id;
+  }
+  return aliases.find((id) => id.endsWith('@lid')) || aliases[0];
+}
+
 // Enlaza la fila recién insertada con su whatsapp_msg_id: el que devolvió sendMessage, el
 // que message_create ya dejó «observado», o se deja pendiente para cuando llegue.
-function linkOutgoingRow(targetJid, insertedMessageId, whatsappMsgId, ack) {
+function linkOutgoingRow(chatIds, insertedMessageId, whatsappMsgId, ack) {
   if (whatsappMsgId) {
-    removeObservedOutgoing(targetJid, whatsappMsgId);
+    for (const chatId of chatIds) removeObservedOutgoing(chatId, whatsappMsgId);
     syncOutgoingMessageAck(whatsappMsgId, ack);
     return whatsappMsgId;
   }
-  const observedId = takeObservedOutgoing(targetJid);
-  if (observedId) {
-    stmts.setMessageWhatsappId.run(observedId, insertedMessageId);
-    syncOutgoingMessageAck(observedId, ack);
-    return observedId;
+  for (const chatId of chatIds) {
+    const observedId = takeObservedOutgoing(chatId);
+    if (observedId) {
+      stmts.setMessageWhatsappId.run(observedId, insertedMessageId);
+      syncOutgoingMessageAck(observedId, ack);
+      return observedId;
+    }
   }
-  registerPendingOutgoing(targetJid, insertedMessageId);
+  for (const chatId of chatIds) registerPendingOutgoing(chatId, insertedMessageId);
   return null;
 }
 
@@ -152,7 +181,8 @@ async function saveSentAttachments(sentMedia) {
  *        Con varios, el texto va como pie del primero y cada archivo es un mensaje.
  * @param {object|null} [p.replyMessage]  Fila de getReplyMessageById (ya validada).
  * @param {string[]|null} [p.mentions]    JIDs mencionados en el texto.
- * @returns {Promise<Array<{messageId, whatsappMsgId, text, daySend, hourSend}>>}
+ * @returns {Promise<Array<{messageId, whatsappMsgId, chatId, text, daySend, hourSend}>>}
+ *          chatId: chat donde quedó guardado (en privados puede ser el @lid del número).
  * @throws {SendMessageError} code 'SEND_FAILED' si WhatsApp rechaza un envío.
  */
 export async function sendOutgoingMessages({
@@ -165,6 +195,8 @@ export async function sendOutgoingMessages({
   waClient = liveClient,
 }) {
   if (isGroup) await ensureGroupRow(targetJid, waClient);
+  const chatAliases = isGroup ? [targetJid] : await getPrivateChatAliases(targetJid, waClient);
+  const storageJid = isGroup ? targetJid : pickPrivateStorageJid(chatAliases);
 
   const options = {};
   if (mentions?.length) options.mentions = mentions;
@@ -188,7 +220,7 @@ export async function sendOutgoingMessages({
   for (const { mediaFile, mediaType, text: messageText } of outgoingMessages) {
     // Marca este envío como «en curso» hasta haber enlazado su fila: el message_create
     // propio que WhatsApp emite mientras tanto es de este envío, no de otro dispositivo.
-    const sendToken = beginNokiaSend(targetJid, { text: messageText, hasMedia: Boolean(mediaFile) });
+    const sendToken = beginNokiaSend(chatAliases, { text: messageText, hasMedia: Boolean(mediaFile) });
     try {
       let sentMessage;
       try {
@@ -216,6 +248,17 @@ export async function sendOutgoingMessages({
       const hasAttachment = Boolean(mediaFile);
       let insertedMessageId;
 
+      // Red de seguridad: si message_create ya guardó este mismo mensaje como «de otro
+      // dispositivo» (no se reconoció el envío en curso), se adopta esa fila en vez de
+      // insertar otra con el mismo whatsapp_msg_id (UNIQUE) y fallar tras haberlo enviado.
+      const alreadySaved = returnedId ? stmts.findMessageByWhatsappId.get(returnedId) : null;
+      if (alreadySaved) {
+        console.warn(`[mensaje] ${returnedId} ya estaba guardado (fila #${alreadySaved.id}); se reutiliza.`);
+        syncOutgoingMessageAck(returnedId, sentMessage?.ack);
+        results.push({ messageId: alreadySaved.id, whatsappMsgId: returnedId, chatId: storageJid, text: finalText, daySend, hourSend });
+        continue;
+      }
+
       if (isGroup) {
         if (!stmts.getGroupById.get(targetJid)) {
           let groupName = 'Grupo sin nombre';
@@ -230,10 +273,10 @@ export async function sendOutgoingMessages({
           : stmts.insertMessage.run(finalText, daySend, hourSend, 1, null, targetJid, returnedId);
         insertedMessageId = result.lastInsertRowid;
       } else {
-        await ensureUserRow(targetJid, waClient);
+        await ensureUserRow(storageJid, waClient);
         const result = hasAttachment
-          ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, targetJid, null, null, returnedId)
-          : stmts.insertMessage.run(finalText, daySend, hourSend, 1, targetJid, null, returnedId);
+          ? stmts.insertMessageWithMedia.run(finalText, daySend, hourSend, 1, storageJid, null, null, returnedId)
+          : stmts.insertMessage.run(finalText, daySend, hourSend, 1, storageJid, null, returnedId);
         insertedMessageId = result.lastInsertRowid;
       }
 
@@ -247,7 +290,7 @@ export async function sendOutgoingMessages({
 
       let whatsappMsgId = returnedId;
       if (insertedMessageId) {
-        whatsappMsgId = linkOutgoingRow(targetJid, insertedMessageId, returnedId, sentMessage?.ack);
+        whatsappMsgId = linkOutgoingRow(chatAliases, insertedMessageId, returnedId, sentMessage?.ack);
       }
 
       if (mediaType === 'video' && insertedMessageId) {
@@ -258,7 +301,7 @@ export async function sendOutgoingMessages({
         sentMedia.push({ messageId: insertedMessageId, mediaFile, mediaType });
       }
 
-      results.push({ messageId: insertedMessageId, whatsappMsgId, text: finalText, daySend, hourSend });
+      results.push({ messageId: insertedMessageId, whatsappMsgId, chatId: storageJid, text: finalText, daySend, hourSend });
     } finally {
       endNokiaSend(sendToken);
     }

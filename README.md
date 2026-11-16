@@ -18,24 +18,31 @@ Los mensajes se guardan en una base SQLite local (`data/nokia.db`) y se borran s
 pasados unos días. Además de las páginas web hay una API JSON en `/mobile` (con su propio
 token, `X-Nokia-Token`) pensada para un cliente Java ME.
 
-## Cómo encaja con GateWayNK
+## Dos formas de arrancarlo
 
-NokiaMSN no se expone a Internet por sí solo. En producción corre dentro del stack de
-**GateWayNK** (carpeta hermana `../GateWayNK`), que lo levanta con Docker Compose:
+**Solo NokiaMSN** (`scripts/standalone.sh`, todo lo necesario está en este repo; ver
+[Puesta en marcha](#puesta-en-marcha)):
+
+```
+Nokia ──HTTP──▶ ngrok (HTTP) ───────────────────────────▶ nokia-msn:3001
+Nokia ──HTTPS─▶ playit.gg / ngrok TCP ─▶ nokia-tls:8443 ─▶ nokia-msn:3001
+```
+
+**Dentro de GateWayNK** (carpeta hermana `../GateWayNK`), que añade un proxy inverso
+común con otros servicios, un watchdog que reinicia lo que se cuelga y avisa por SMS,
+copias de seguridad y un panel de estado:
 
 ```
 Nokia ──HTTP──▶ ngrok (HTTP) ──────────────────────────▶ gateway:8080 ──▶ nokia-msn:3001
 Nokia ──HTTPS─▶ playit.gg / ngrok TCP ─▶ nokia-tls:8443 ─▶ gateway:8080 ──▶ nokia-msn:3001
 ```
 
-- **gateway**: proxy inverso; es la única puerta de entrada.
 - **nokia-tls** (`tls-proxy/` de este repo): habla el TLS 1.0 que entiende el 6111 y
-  reenvía en claro al gateway.
-- **watchdog**: reinicia servicios colgados y avisa por SMS.
+  reenvía en claro a NokiaMSN (o al gateway).
 - **ngrok**: túnel HTTP público (y opcionalmente el TCP para el HTTPS).
 
-Todos los puertos se publican solo en `127.0.0.1`; lo único que llega desde fuera son
-los túneles.
+En los dos casos los puertos se publican solo en `127.0.0.1`; lo único que llega desde
+fuera son los túneles.
 
 ## Limitaciones
 
@@ -47,7 +54,7 @@ los túneles.
 - Una sola cuenta por instalación, vinculada como un dispositivo más; el teléfono
   principal tiene que seguir conectándose de vez en cuando.
 - Chromium consume bastante RAM: en Docker está limitado a 2 GB (`NOKIA_MSN_MEM_LIMIT`
-  en GateWayNK).
+  en el `.env`, o en el de GateWayNK).
 - Las fotos de visualización única no se descargan: solo aparece el aviso.
 - Las llamadas no se pueden atender; solo quedan registradas como aviso.
 
@@ -80,68 +87,171 @@ los túneles.
 
 ## Puesta en marcha
 
+Esta guía arranca NokiaMSN por su cuenta con `scripts/standalone.sh`: no hace falta nada
+más que este repo. (Si ya usas GateWayNK, mira [Con GateWayNK](#con-gatewaynk) al final.)
+
 ### 1. Requisitos
 
-- Docker y Docker Compose.
-- Este repo en `…/NokiaMSN` y GateWayNK en `…/GateWayNK` (carpetas hermanas).
-- Una cuenta de [ngrok](https://ngrok.com) (la gratuita vale) con un dominio estático.
-- Opcional: [playit.gg](https://playit.gg) Premium para el HTTPS, [Groq](https://console.groq.com)
-  para transcribir y [Twilio](https://www.twilio.com) para los SMS.
+- Un PC con **Linux** que se quede encendido (en macOS/Windows: Docker Desktop y una
+  terminal bash, sin probar).
+- **Docker** con **Docker Compose** (`docker compose version` debe funcionar) y tu usuario
+  con permiso para usarlo (grupo `docker`).
+- Unos **3 GB de RAM** libres (Chromium) y ~2 GB de disco para la imagen.
+- Una cuenta de **WhatsApp** en un smartphone, para vincularla.
+- Una cuenta de **[ngrok](https://ngrok.com)** (la gratuita vale) para entrar desde
+  Internet, con su [dominio estático gratuito](https://dashboard.ngrok.com/domains).
+- Opcional: [playit.gg](https://playit.gg) Premium (HTTPS con dirección fija),
+  [Groq](https://console.groq.com) (transcribir audios) y [Twilio](https://www.twilio.com)
+  (avisos por SMS).
 
-### 2. Configurar el `.env` de NokiaMSN
+No hace falta instalar Node.js: todo se construye y corre dentro de Docker.
+
+### 2. Descargar y elegir el PIN
 
 ```bash
-cp .env.example .env
+git clone https://github.com/Alanxio/NokiaMSG.git NokiaMSN
+cd NokiaMSN
+./scripts/standalone.sh pin
 ```
 
-Lo mínimo imprescindible:
+El script crea el `.env` a partir de [.env.example](.env.example) y te pide el **PIN** con
+el que entrarás desde el Nokia. Para cifrarlo (bcrypt) usa la imagen de NokiaMSN, así que
+la primera vez la construye antes (unos minutos). Para cambiarlo, vuelve a ejecutar `pin`.
 
-1. **PIN de acceso.** Genera el hash y pégalo entre comillas simples (lleva `$`):
+### 3. Configurar ngrok
 
-   ```bash
-   node -e "console.log(require('bcryptjs').hashSync('1234', 10));"
-   ```
-
-   ```env
-   ACCESS_PIN_HASH_BCRYPT='$2b$10$...'
-   ```
-
-2. **`NGROK_HTTP_URL`**: tu dominio estático de ngrok (se usa en los enlaces de los SMS).
-
-Todo lo demás es opcional y está explicado en [.env.example](.env.example): SMS con Twilio,
-transcripción con Groq (`GROQ_API_KEY`), ticks azules, limpieza diaria, escuchas de audio,
-vinculación por código (`WHATSAPP_PAIRING_PHONE`)…
-
-Algunas opciones (SMS, ticks azules, limpieza y días de retención) también se cambian desde
-**Ajustes** en el Nokia, y la app las reescribe en el `.env`.
-
-### 3. Configurar ngrok (en GateWayNK)
-
-El túnel no se configura aquí, sino en `GateWayNK/Gateway/.env`:
+Abre `.env` y rellena, en la sección «Arranque sin GateWayNK»:
 
 ```env
-# Token en https://dashboard.ngrok.com/get-started/your-authtoken
+# https://dashboard.ngrok.com/get-started/your-authtoken
 NGROK_AUTHTOKEN=tu_authtoken
-# Dominio estático en https://dashboard.ngrok.com/domains
-NGROK_HTTP_URL=https://tu-dominio.ngrok-free.app
-
-# HTTPS del Nokia: «ngrok» (túnel TCP, dirección cambiante) o «playit» (dirección fija)
-NOKIA_TLS_PROVIDER=ngrok
-# Solo con playit: host:puerto público del túnel TCP que apunta a 127.0.0.1:8443
-# NOKIA_TLS_PUBLIC_ADDRESS=algo.tun.ply.gg:12345
-
-# Qué entradas abrir por defecto: http | https | both
-# EXPOSE_TUNNELS=both
 ```
 
-`GateWayNK/scripts/expose.sh` genera `.ngrok/ngrok.yml` a partir de esto (el token va por
-variable de entorno, nunca al fichero) y solo arranca el contenedor de ngrok si hace falta.
-Con playit, su agente corre fuera de Docker (servicio de systemd) y el túnel TCP debe
-apuntar a `127.0.0.1:8443` con PROXY protocol v1 activado.
+y, más arriba, tu dominio estático:
+
+```env
+# https://dashboard.ngrok.com/domains
+NGROK_HTTP_URL=https://tu-dominio.ngrok-free.app
+```
+
+Con esto ya tienes la entrada **HTTP** (sin cifrar) y el **HTTPS del Nokia** por un túnel
+TCP de ngrok. El resto de opciones del `.env` (SMS, transcripción, limpieza…) son
+opcionales y están explicadas en el propio fichero.
 
 ### 4. Arrancar
 
-Desde NokiaMSN (redirige a GateWayNK con los mismos argumentos):
+```bash
+./scripts/standalone.sh
+```
+
+Construye lo que haya cambiado, arranca los contenedores, abre los túneles y termina con
+un resumen como este:
+
+```
+══════════════════════════════════════════════════════════
+  NokiaMSN
+══════════════════════════════════════════════════════════
+  Local:        http://127.0.0.1:3001/
+  HTTP:         http://tu-dominio.ngrok-free.app
+  Nokia HTTPS:  https://0.tcp.eu.ngrok.io:12345/  (ngrok)
+  Raíz TLS:     http://0.tcp.eu.ngrok.io:12345/ca.cer  (instálalo una vez en el Nokia como autoridad)
+  WhatsApp:     waiting_qr  → vincula en http://127.0.0.1:3001/whatsapp/qr
+══════════════════════════════════════════════════════════
+```
+
+Los contenedores siguen funcionando al cerrar la terminal y se reinician solos si el PC
+arranca de nuevo (mientras Docker esté activo).
+
+### 5. Vincular WhatsApp
+
+En el navegador del PC abre `http://127.0.0.1:3001/whatsapp/qr`, entra con el PIN y escanea
+el QR desde WhatsApp → *Dispositivos vinculados* → *Vincular un dispositivo*. Si pones tu
+número en `WHATSAPP_PAIRING_PHONE` (`.env`), puedes pedir en su lugar un código de 8
+caracteres. La sesión se guarda en `.wwebjs_auth/` y sobrevive a los reinicios.
+
+### 6. Preparar el Nokia
+
+**Por HTTP** (lo más sencillo, sin cifrar): abre en el navegador del Nokia la dirección
+`HTTP:` del resumen y entra con el PIN. Guárdala como favorito.
+
+**Por HTTPS** (cifrado; se hace una sola vez):
+
+1. Abre en el Nokia la dirección `Raíz TLS:` del resumen (`http://…/ca.cer`, en claro) y
+   acepta instalar el certificado como **autoridad**.
+2. A partir de ahí entra por la dirección `Nokia HTTPS:` (`https://…/`).
+
+La raíz se crea la primera vez en `data/tls/ca.{key,pem,cer}` y el script no la vuelve a
+tocar. **Haz una copia de `data/tls/`**: si se pierde o se regenera, el teléfono deja de
+confiar en el servidor y hay que instalarla de nuevo. Los certificados del servidor
+(`server-<host>.*`) sí se regeneran solos cuando cambia la dirección.
+
+> El HTTPS propio de ngrok (`https://tu-dominio…`) no sirve: el Nokia no entiende TLS 1.2.
+> Por eso el HTTPS del 6111 va por un túnel TCP hasta `nokia-tls`.
+
+**Con ngrok gratuito la dirección HTTPS cambia** cada vez que ngrok se reinicia (al
+reiniciar el PC, por ejemplo). `./scripts/standalone.sh status` avisa cuando pasa; vuelve a
+ejecutar `./scripts/standalone.sh` y apunta el Nokia a la nueva dirección (si tienes Twilio
+configurado, te la manda por SMS). La raíz instalada sigue valiendo.
+
+### HTTPS con dirección fija (playit.gg)
+
+Para no cambiar de dirección (y que NokiaMSN vea la IP real del teléfono):
+
+1. En [playit.gg](https://playit.gg) instala su agente en el PC (servicio del sistema) y
+   crea un túnel **TCP** hacia `127.0.0.1:8443`, con **PROXY protocol v1** activado.
+2. En `.env`:
+
+   ```env
+   NOKIA_TLS_PROVIDER=playit
+   NOKIA_TLS_PUBLIC_ADDRESS=algo.tun.ply.gg:12345
+   ```
+
+3. `./scripts/standalone.sh`: el resumen debe decir «HTTPS del Nokia comprobado».
+
+### Uso del script
+
+| Comando | Qué hace |
+|---|---|
+| `./scripts/standalone.sh` | Construye, arranca y expone (también `npm run standalone`) |
+| `… --http` / `--https` / `--both` | Solo HTTP, solo HTTPS del Nokia, o las dos |
+| `… --local` | Sin túneles: solo `http://127.0.0.1:3001/` |
+| `… --no-build` | Arranca sin reconstruir las imágenes |
+| `… -f` | Al terminar, se queda mostrando los logs |
+| `… status` | Estado de los contenedores, de WhatsApp y de las direcciones |
+| `… logs [servicio]` | Logs en directo (`nokia-msn`, `nokia-tls`, `ngrok`) |
+| `… restart [servicio]` | Reinicia uno o todos |
+| `… pin` | Cambia el PIN |
+| `… stop` | Para todo |
+
+Sin flag, qué se expone lo decide `EXPOSE_TUNNELS` del `.env` (`both` por defecto). Los
+puertos locales se cambian con `NOKIA_MSN_PORT`, `NOKIA_TLS_PORT` y `NGROK_API_PORT`.
+
+**Actualizar:** `git pull` y `./scripts/standalone.sh` (reconstruye lo que haya cambiado).
+
+**Copia de seguridad:** `.env`, `data/` (base de datos y raíz TLS) y `.wwebjs_auth/`
+(sesión de WhatsApp; sin ella hay que volver a vincular).
+
+### Si algo falla
+
+- **«No se puede hablar con Docker»**: arranca Docker (`sudo systemctl start docker`) o
+  añade tu usuario al grupo `docker` y vuelve a iniciar sesión.
+- **«Falta NGROK_AUTHTOKEN»**: sin token solo hay acceso local; revisa el paso 3.
+- **ngrok no abre el túnel TCP** (cuentas nuevas pueden necesitar verificar una tarjeta
+  para TCP): el script sigue solo con HTTP y lo dice. Usa HTTP o playit.
+- **ngrok falla con «ERR_NGROK_108»** (límite de sesiones): la cuenta gratuita admite una
+  sola sesión a la vez; cierra cualquier otro ngrok que use la misma cuenta.
+- **WhatsApp no conecta** o el QR no aparece: `./scripts/standalone.sh logs nokia-msn`.
+  Si la sesión se rompe, desvincula el dispositivo en el móvil y vuelve a escanear.
+- **El Nokia dice que el certificado no es de confianza**: falta instalar `ca.cer` (paso 6)
+  o se regeneró la raíz.
+
+### Con GateWayNK
+
+Si usas el stack de **GateWayNK** (carpeta hermana `../GateWayNK`), NokiaMSN no se arranca
+con `standalone.sh` sino desde allí, y los túneles se configuran en `GateWayNK/Gateway/.env`
+(las mismas claves: `NGROK_AUTHTOKEN`, `NGROK_HTTP_URL`, `NOKIA_TLS_PROVIDER`,
+`NOKIA_TLS_PUBLIC_ADDRESS`, `EXPOSE_TUNNELS`). Desde este repo, `npm run expose` redirige a
+`../GateWayNK/scripts/expose.sh` con los mismos argumentos:
 
 ```bash
 npm run expose             # todo: HTTP + HTTPS
@@ -149,29 +259,9 @@ npm run expose -- --http   # solo HTTP
 npm run expose -- --https  # solo HTTPS del Nokia
 ```
 
-o directamente `../GateWayNK/scripts/expose.sh [up|status|logs|top|stop…]`
-(`--help` muestra todas las opciones). Al terminar enseña las direcciones públicas.
-Ctrl+C solo cierra la terminal; los servicios siguen funcionando.
-
-### 5. Vincular WhatsApp
-
-Entra con el PIN y abre `/whatsapp/qr` (mejor desde el navegador del PC:
-`http://127.0.0.1:3001/whatsapp/qr`). Escanea el QR desde WhatsApp → *Dispositivos
-vinculados*. Si definiste `WHATSAPP_PAIRING_PHONE`, puedes pedir en su lugar un código de
-8 caracteres. La sesión se guarda en `.wwebjs_auth/` y sobrevive a los reinicios.
-
-### 6. Preparar el Nokia para HTTPS (una sola vez)
-
-1. Con el stack levantado, abre en el Nokia `http://<dirección-https>/ca.cer` (mismo
-   host y puerto que el HTTPS, pero en claro) e instala el certificado como autoridad.
-2. A partir de ahí entra por `https://<dirección-https>/`.
-
-La raíz está en `data/tls/ca.{key,pem,cer}`. **No la borres ni la regeneres**: el teléfono
-dejaría de confiar en el servidor y habría que reinstalarla. Los certificados del servidor
-(`server-<host>.*`) sí se regeneran solos cuando cambia la dirección.
-
-> Por HTTP en claro (dominio de ngrok) también funciona, pero sin cifrar. El HTTPS propio
-> de ngrok no sirve: el Nokia no entiende TLS 1.2.
+GateWayNK añade el watchdog (reinicia lo que se cuelga, actualiza solo la dirección HTTPS
+de ngrok y avisa por SMS), copias de seguridad y un panel de estado. No arranques
+`standalone.sh` a la vez: comparten la sesión de WhatsApp y los puertos.
 
 ## Desarrollo
 
@@ -181,8 +271,9 @@ npm run dev     # nodemon; fuera de Docker define DB_PATH=./data/nokia.db en .en
 npm test        # tests con node --test
 ```
 
-El `docker-compose.yml` de este repo levanta solo la app en `localhost:8080`, sin gateway,
-túneles ni HTTPS; sirve para probar en local.
+`docker compose up` con el `docker-compose.yml` de este repo levanta solo la app en
+`127.0.0.1:3001`, sin túneles ni HTTPS (los perfiles `tls` y `ngrok` los activa
+`scripts/standalone.sh`).
 
 Para probar la transcripción con un audio real:
 
@@ -222,7 +313,7 @@ db/             acceso a SQLite (better-sqlite3)
 tls-proxy/      servicio nokia-tls (TLS 1.0 para el 6111)
 assets/         iconos y emojis que se sirven al teléfono
 patches/        parches de patch-package sobre dependencias
-scripts/        utilidades (expose.sh, migraciones, prueba de TLS)
+scripts/        arranque (standalone.sh, expose.sh → GateWayNK), migraciones, prueba de TLS
 data/           base de datos, avatares y certificados (no se sube a git)
 .wwebjs_auth/   sesión de WhatsApp (no se sube a git)
 ```

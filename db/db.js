@@ -96,6 +96,17 @@ db.exec(`
     FOREIGN KEY (option_id) REFERENCES poll_options(id)
   );
 
+  -- Reacciones (una por persona y mensaje, como en WhatsApp). Solo se muestran.
+  -- ON DELETE CASCADE: al borrar un chat o en la limpieza diaria se van con su mensaje.
+  CREATE TABLE IF NOT EXISTS message_reactions (
+    message_id INTEGER NOT NULL,
+    sender_id TEXT NOT NULL,
+    reaction TEXT NOT NULL,
+    reacted_at INTEGER,
+    PRIMARY KEY (message_id, sender_id),
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+  );
+
   CREATE INDEX IF NOT EXISTS idx_messages_user_chat_id ON messages(user_chat_id);
   CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id);
   CREATE INDEX IF NOT EXISTS idx_messages_media_key ON messages(media_key);
@@ -757,6 +768,40 @@ export const stmts = {
 
   getUserByPhonePattern: db.prepare(`
     SELECT chat_id, username FROM users WHERE chat_id LIKE ? LIMIT 1
+  `),
+
+  // ── Reacciones ──
+  // Mensaje por el id corto de WhatsApp (el tramo aleatorio de «fromMe_chat_ID[_autor]»),
+  // para cuando el id completo de la reacción no coincide con el guardado (el chat puede
+  // venir como @lid en uno y @c.us en otro). Ese tramo es único en la práctica.
+  findMessageByShortId: db.prepare(`
+    SELECT id FROM messages
+    WHERE whatsapp_msg_id LIKE '%\\_' || @shortId ESCAPE '\\'
+       OR whatsapp_msg_id LIKE '%\\_' || @shortId || '\\_%' ESCAPE '\\'
+    ORDER BY id DESC LIMIT 1
+  `),
+  upsertReaction: db.prepare(`
+    INSERT INTO message_reactions (message_id, sender_id, reaction, reacted_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(message_id, sender_id) DO UPDATE SET
+      reaction = excluded.reaction, reacted_at = excluded.reacted_at
+  `),
+  deleteReaction: db.prepare(`
+    DELETE FROM message_reactions WHERE message_id = ? AND sender_id = ?
+  `),
+  // ids: JSON con la lista de ids de mensaje (una sola consulta para toda la página).
+  getReactionsForMessages: db.prepare(`
+    SELECT message_id, sender_id, reaction, reacted_at
+    FROM message_reactions
+    WHERE message_id IN (SELECT value FROM json_each(?))
+    ORDER BY reacted_at, sender_id
+  `),
+  getReactionsForMessage: db.prepare(`
+    SELECT r.sender_id, r.reaction, r.reacted_at, u.username, u.name_priority
+    FROM message_reactions r
+    LEFT JOIN users u ON u.chat_id = r.sender_id
+    WHERE r.message_id = ?
+    ORDER BY r.reacted_at, r.sender_id
   `),
 };
 

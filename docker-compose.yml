@@ -1,23 +1,110 @@
+# NokiaMSN por su cuenta, sin GateWayNK. Lo normal es arrancarlo con scripts/standalone.sh,
+# que prepara la raíz TLS y la configuración de ngrok y elige los perfiles; «docker compose
+# up» a mano levanta solo la app (para probar en local).
+#
+#   Nokia ──HTTP──▶ ngrok (HTTP) ─────────────────────────────▶ nokia-msn:3001
+#   Nokia ──HTTPS─▶ playit.gg / ngrok TCP ─▶ nokia-tls:8443 ──▶ nokia-msn:3001
+#
+# Perfiles: «tls» (nokia-tls, el HTTPS TLS 1.0 del 6111) y «ngrok» (túneles públicos).
+# Los puertos solo se publican en 127.0.0.1: desde fuera se entra por los túneles.
+# Dentro de la red de Docker se escucha siempre en 3001 / 8443; *_PORT cambia solo el host.
+name: nokiamsn
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-healthcheck: &healthcheck
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_interval: 2s
+
 services:
-  app:
+  nokia-msn:
     build: .
-    user: "root"
-    container_name: app
-    restart: always
+    container_name: nokiamsn-app
+    restart: unless-stopped
+    init: true   # recoge los procesos zombi de Chromium (whatsapp-web.js)
+    stop_grace_period: 20s
+    mem_limit: ${NOKIA_MSN_MEM_LIMIT:-2g}
+    logging: *logging
     env_file:
       - .env
+    environment:
+      - PORT=3001
+      - DB_PATH=/data/nokia.db
+      - ENV_FILE_PATH=/.env
+      # Sin Gateway delante: solo nokia-tls puede marcar una petición como HTTPS
+      # (X-Nokia-TLS); la misma cabecera llegada por el túnel HTTP se descarta.
+      - TLS_PROXY_HOST=nokia-tls
+    ports:
+      - "127.0.0.1:${NOKIA_MSN_PORT:-3001}:3001"
     volumes:
       - ./.env:/.env
       - ./data:/data
       - ./.wwebjs_auth:/usr/src/app/.wwebjs_auth
       - ./public/media:/usr/src/app/public/media
-    environment:
-      - DB_PATH=/data/nokia.db
-      - ENV_FILE_PATH=/.env
-    ports:
-      - "8080:8080"
+    healthcheck:
+      <<: *healthcheck
+      # Vivo = Express contesta (aunque sea 503 porque WhatsApp está desconectado).
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/healthz',{signal:AbortSignal.timeout(8000)}).then(()=>process.exit(0),()=>process.exit(1))"]
+      start_period: 120s
     networks:
-      - app-network
+      - nokiamsn
+
+  # HTTPS «a la antigua» para el Nokia 6111 (TLS 1.0 + AES, raíz propia instalada en el
+  # teléfono). La raíz y los certificados viven en ./data/tls; public-address lo escribe
+  # scripts/standalone.sh («host:puerto» público del túnel TCP).
+  nokia-tls:
+    build: ./tls-proxy
+    container_name: nokiamsn-tls
+    profiles: ["tls"]
+    restart: unless-stopped
+    init: true
+    logging: *logging
+    environment:
+      - GATEWAY_URL=http://nokia-msn:3001
+      - LISTEN_PORT=8443
+      - TLS_DIR=/tls
+    volumes:
+      - ./data/tls:/tls
+    ports:
+      - "127.0.0.1:${NOKIA_TLS_PORT:-8443}:8443"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8443/',{signal:AbortSignal.timeout(8000)}).then(()=>process.exit(0),()=>process.exit(1))"]
+      start_period: 20s
+    depends_on:
+      - nokia-msn
+    networks:
+      - nokiamsn
+
+  # Túnel HTTP en claro y, con NOKIA_TLS_PROVIDER=ngrok, el TCP del HTTPS del Nokia.
+  # standalone.sh genera .ngrok/ngrok.yml (sin secretos: el token va por variable).
+  ngrok:
+    image: ngrok/ngrok:3.39.13-alpine
+    container_name: nokiamsn-ngrok
+    profiles: ["ngrok"]
+    restart: unless-stopped
+    logging: *logging
+    command: ["start", "--all", "--config", "/etc/ngrok/ngrok.yml", "--log", "stdout"]
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
+    volumes:
+      - ./.ngrok:/etc/ngrok:ro
+    ports:
+      - "127.0.0.1:${NGROK_API_PORT:-4045}:4040"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4040/api/tunnels"]
+      start_period: 30s
+    depends_on:
+      - nokia-msn
+    networks:
+      - nokiamsn
 
 networks:
-  app-network:
+  nokiamsn:

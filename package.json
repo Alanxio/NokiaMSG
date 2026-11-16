@@ -10,7 +10,8 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "test": "node --test test/*.test.js",
-    "expose": "./scripts/expose.sh"
+    "expose": "./scripts/expose.sh",
+    "standalone": "./scripts/standalone.sh"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

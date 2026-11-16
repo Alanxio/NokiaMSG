@@ -4,6 +4,7 @@ import qrcodeTerminal from 'qrcode-terminal';
 import { existsSync, writeFileSync, unlinkSync, statSync, rmSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import db, { stmts } from '../../db/db.js';
+import { applyReaction } from './reaction.service.js';
 import { saveInteraction } from '../controller/notification.controller.js';
 import { marcarNovedad } from './polling.service.js';
 import { resolveMentions } from '../utils/mentions.js';
@@ -862,6 +863,18 @@ export async function startWhatsappClient() {
       applyPollVoteSelection(messageId, voterChatId, selected, votedAtTs);
     } catch (e) {
       console.error('[whatsapp] Error procesando vote_update:', e.message);
+    }
+  });
+
+  // Reacciones: solo se guardan para verlas bajo el mensaje (sin no leídos ni SMS).
+  client.on('message_reaction', (reaction) => {
+    try {
+      const result = applyReaction(reaction);
+      if (result) {
+        console.log(`[whatsapp] Reacción ${result === 'removed' ? 'quitada' : `«${reaction.reaction}»`} de ${getSerializedId(reaction.senderId)}`);
+      }
+    } catch (e) {
+      console.error('[whatsapp] Error procesando message_reaction:', e.message);
     }
   });
 

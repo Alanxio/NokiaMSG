@@ -36,9 +36,13 @@ function normalizeSendText(value) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
-export function beginNokiaSend(chatId, { text = '', hasMedia = false } = {}) {
+// chatIds: el JID al que se envía y sus alias (@c.us / @lid de la misma persona). WhatsApp
+// puede emitir el message_create con cualquiera de ellos: a un número escrito a mano se le
+// envía por @c.us, pero si el chat usa LID el evento llega con @lid.
+export function beginNokiaSend(chatIds, { text = '', hasMedia = false } = {}) {
   const token = ++inFlightSeq;
-  inFlightSends.set(token, { chatId, text: normalizeSendText(text), hasMedia: Boolean(hasMedia), startedAt: Date.now() });
+  const ids = new Set((Array.isArray(chatIds) ? chatIds : [chatIds]).filter(Boolean));
+  inFlightSends.set(token, { chatIds: ids, text: normalizeSendText(text), hasMedia: Boolean(hasMedia), startedAt: Date.now() });
   return token;
 }
 
@@ -53,7 +57,7 @@ export function matchesNokiaSendInFlight(chatId, { body = '', hasMedia = false, 
   const text = normalizeSendText(body);
   for (const [token, send] of inFlightSends) {
     if (now - send.startedAt > IN_FLIGHT_MAX_MS) { inFlightSends.delete(token); continue; }
-    if (send.chatId !== chatId) continue;
+    if (!send.chatIds.has(chatId)) continue;
     if (anyText) return true;
     // Con texto: tiene que coincidir. Adjunto sin pie de foto: basta con que también lleve media.
     if (send.text ? send.text === text : (send.hasMedia && hasMedia)) return true;
@@ -124,6 +128,13 @@ export function takePendingOutgoing(chatId, accepts = () => true) {
   if (index === -1) return null;
   const [rowId] = queue.splice(index, 1);
   if (queue.length === 0) pendingByChatId.delete(chatId);
+  // La fila pudo quedar pendiente bajo varios alias (@c.us y @lid): ya está enlazada, así
+  // que se quita de todas las colas para que no se enlace otra vez a otro mensaje.
+  for (const [otherChatId, otherQueue] of pendingByChatId) {
+    const remaining = otherQueue.filter((id) => id !== rowId);
+    if (remaining.length > 0) pendingByChatId.set(otherChatId, remaining);
+    else pendingByChatId.delete(otherChatId);
+  }
   return rowId ?? null;
 }
 

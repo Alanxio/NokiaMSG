@@ -230,3 +230,53 @@ test('fallo de WhatsApp: SendMessageError con la causa, sin fila y sin envío «
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, before);
   assert.equal(matchesNokiaSendInFlight(jid, { anyText: true }), false);
 });
+
+test('número escrito a mano cuyo chat va por LID: el evento con @lid cuenta como envío en curso y se guarda en el @lid', async () => {
+  const pn = '34600000009@c.us';
+  const lid = '99900000009@lid';
+  const seenInFlightAsLid = [];
+  const waClient = fakeClient({
+    contacts: { [lid]: { pushname: 'Toni' } },
+    reply: (n, { content, options }) => {
+      // Lo que vería el listener de message_create: el chat llega como @lid.
+      seenInFlightAsLid.push(matchesNokiaSendInFlight(lid, {
+        body: typeof content === 'string' ? content : options?.caption,
+        hasMedia: typeof content !== 'string',
+      }));
+      return { id: { _serialized: `true_${lid}_L${n}` }, ack: 1 };
+    },
+  });
+  waClient.getContactLidAndPhone = async () => [{ lid, pn }];
+
+  const [sent] = await sendOutgoingMessages({ targetJid: pn, isGroup: false, text: 'hola lid', waClient });
+
+  assert.deepEqual(seenInFlightAsLid, [true]);
+  assert.equal(sent.chatId, lid);
+  assert.equal(row(sent.messageId).user_chat_id, lid);
+  assert.equal(stmts.getUserByChatId.get(lid).username, 'Toni');
+  assert.equal(stmts.getUserByChatId.get(pn), undefined, 'no se crea una segunda fila @c.us');
+});
+
+test('contacto ya guardado como @c.us: se sigue usando esa fila aunque tenga LID', async () => {
+  const pn = '34600000010@c.us';
+  const lid = '99900000010@lid';
+  stmts.upsertUser.run(pn, 'Eva');
+  const waClient = fakeClient({ reply: () => ({ id: { _serialized: `true_${lid}_E1` } }) });
+  waClient.getContactLidAndPhone = async () => [{ lid, pn }];
+  const [sent] = await sendOutgoingMessages({ targetJid: pn, isGroup: false, text: 'hola', waClient });
+  assert.equal(sent.chatId, pn);
+  assert.equal(row(sent.messageId).user_chat_id, pn);
+});
+
+test('mensaje ya guardado por message_create con el mismo id: se reutiliza la fila, sin UNIQUE', async () => {
+  const jid = '34600000011@c.us';
+  const waId = 'true_34600000011@c.us_DUP1';
+  stmts.upsertUser.run(jid, 'Dup');
+  const existing = stmts.insertMessageWithMedia.run('[Imagen]', '2026-11-16', '2026-11-16 07:32:04', 1, jid, null, null, waId).lastInsertRowid;
+  const waClient = fakeClient({ reply: () => ({ id: { _serialized: waId }, ack: 1 }) });
+  const before = db.prepare('SELECT COUNT(*) AS n FROM messages').get().n;
+  const [sent] = await sendOutgoingMessages({ targetJid: jid, isGroup: false, text: 'pie', waClient });
+  assert.equal(sent.messageId, existing);
+  assert.equal(sent.whatsappMsgId, waId);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, before);
+});

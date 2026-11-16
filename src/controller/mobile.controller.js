@@ -332,7 +332,7 @@ export async function mobileSendMessage(req, res) {
 
     res.status(201).json({
       id: sent.messageId,
-      chatId: targetJid,
+      chatId: sent.chatId || targetJid,
       type: isGroup ? 'group' : 'user',
       text: sent.text,
       sentAt: sent.hourSend,

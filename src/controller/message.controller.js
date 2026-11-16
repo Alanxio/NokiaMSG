@@ -1,5 +1,8 @@
 import db, { stmts } from '../../db/db.js';
-import { convertEmojisToAscii } from '../utils/emoji.js';
+import { convertEmojisToAscii, renderMiniEmoji } from '../utils/emoji.js';
+import { isMyId } from '../utils/my-identity.js';
+import { mergeContactCandidates } from '../utils/contact-search.js';
+import { getSerializedId as getSerializedIdSafe } from '../whatsapp/ids.js';
 import { buildAudioFileName, escapeXml, formatPhoneNumber, renderMediaLine, renderMentions, renderPhoneLink, sendInvalidEntity, sendMissingEntity, sendPage } from './page.controller.js';
 import { convertAudioToAmr, getAmrFileName, getMediaDir } from '../utils/media.js';
 import { queueAudioTranscription } from '../services/audio-transcription.service.js';
@@ -18,7 +21,10 @@ import { findComposeMentions } from '../utils/mention-text.js';
 import { isGroupTarget, resolveTargetJid, sendOutgoingMessages, SendMessageError } from '../domain/messaging.service.js';
 import { getRequestBaseUrl } from '../utils/public-url.js';
 
-const EXISTING_CONTACT_ICON_HTML = '<img src="/assets/user.jpeg" alt="Contacto" height="14" width="18" style="vertical-align:5px; margin-top:-5px; margin-bottom:-5px;" />';
+// Contacto que ya está en el Nokia (tiene chat): Profile.png, mismo estilo que los iconos de
+// 12 px de la interfaz (Chat, Eye, Max…). Grupo: el mismo icono que la portada.
+const EXISTING_CONTACT_ICON_HTML = '<img src="/assets/Profile.png" alt="[N]" width="12" height="12" style="vertical-align:middle;"/>';
+const GROUP_ICON_HTML = '<img src="/assets/group.jpeg" alt="G" height="14" width="18" style="vertical-align:middle;"/>';
 
 function getReplyMessageForTarget(messageId, targetJid) {
   if (typeof messageId !== 'string' || !/^[1-9]\d*$/.test(messageId)) {
@@ -149,21 +155,22 @@ export async function renderComposePage(req, res, next) {
     // =========================================================================
     // CASO 2: PANTALLA DEL BUSCADOR DE CONTACTOS
     // =========================================================================
-    let body = '<h1>Buscar en WhatsApp</h1>';
-    body += '<p><a href="/">Inicio</a> | <a href="/usuario">Ver Contactos</a></p>';
+    const query = typeof q === 'string' ? q.trim().slice(0, 40) : '';
+    let body = '<h1>Buscar en WhatsApp</h1>' +
+      // Mismo buscador que las listas de Usuarios y Grupos: campo + lupa al lado (tabla,
+      // porque el 6111 pone cada campo en su propia línea) y size="7" para sus 128 px.
+      '<form action="/mensaje/componer" method="get">' +
+      '<table cellpadding="0" cellspacing="0"><tr>' +
+      `<td><input type="text" name="q" value="${escapeXml(query)}" size="7" maxlength="40"/></td>` +
+      '<td><input type="image" src="/assets/Search.png" width="16" height="16" alt="Buscar"/></td>' +
+      '</tr></table></form>';
 
-    body += `
-      <form action="/mensaje/componer" method="GET">
-        <p><b>Buscar Nombre o Grupo:</b><br/>
-          <input type="text" name="q" value="${escapeXml(q || '')}" size="15"/>
-          <input type="submit" value="Buscar"/>
-        </p>
-      </form>
-    `;
+    if (!query) {
+      body += '<p><font size="1" color="#666666">Nombre, número o grupo. Encuentra también a quien aún no está en el Nokia.</font></p>';
+    }
 
-    if (q && q.trim() !== '') {
-      const queryClean = q.trim().toLowerCase();
-      body += '<h2>Resultados:</h2>';
+    if (query) {
+      const queryClean = query.toLowerCase();
 
       // client.getContacts()/getChats() serializan TODA la libreta a través de Puppeteer: en
       // una cuenta real pueden tardar mucho, quedarse colgados, o (getChats() en concreto,
@@ -202,102 +209,82 @@ export async function renderComposePage(req, res, next) {
       `).all(`%${queryClean}%`);
 
       const allContacts = (await withTimeout(client.getContacts(), 8000)) || [];
-      const uniqueContactsMap = new Map();
+      const queryDigits = queryClean.replace(/[^0-9]/g, '');
 
-      function normalizeContactName(value) {
-        return value ? String(value).trim().toLowerCase() : '';
-      }
-
-      function shouldPreferCandidate(existing, candidate) {
-        if (existing.isBusiness && !candidate.isBusiness) return true;
-        if (existing.isMyContact !== candidate.isMyContact) return candidate.isMyContact;
-        if (existing.hasRealName !== candidate.hasRealName) return candidate.hasRealName;
-        if (existing.isLid && !candidate.isLid) return true;
-        return false;
-      }
-
+      // Candidatos: agenda del móvil (en vivo) y BD del Nokia. La misma persona puede venir
+      // por número (@c.us) y por id interno (@lid); se unen abajo (mergeContactCandidates).
+      const rawCandidates = [];
       allContacts.forEach(c => {
-        if (c.isUser && !c.isMe && c.number) {
-          const basePhone = c.number.split(':')[0].trim();
-          const server = c.id && c.id.server ? c.id.server : 'c.us';
-          const chatId = `${basePhone}@${server}`;
-          const displayName = (c.name || c.pushname || c.shortName || `+${basePhone}`).trim();
-          const dedupKey = c.name ? normalizeContactName(c.name) : basePhone;
-          const candidate = {
-            chatId,
-            displayName,
-            hasRealName: !!c.name,
-            isBusiness: !!c.isBusiness,
-            isMyContact: !!c.isMyContact,
-            isLid: server === 'lid' || basePhone.length > 14,
-          };
-
-          if (!uniqueContactsMap.has(dedupKey)) {
-            uniqueContactsMap.set(dedupKey, candidate);
-          } else {
-            const existingContact = uniqueContactsMap.get(dedupKey);
-            if (shouldPreferCandidate(existingContact, candidate)) {
-              uniqueContactsMap.set(dedupKey, candidate);
-            }
-          }
-        }
+        if (!c.isUser || c.isMe || !c.number) return;
+        const basePhone = c.number.split(':')[0].trim();
+        const server = c.id && c.id.server ? c.id.server : 'c.us';
+        const chatId = getSerializedIdSafe(c.id) || `${basePhone}@${server}`;
+        const displayName = (c.name || c.pushname || c.shortName || `+${basePhone}`).trim();
+        const matches = displayName.toLowerCase().includes(queryClean)
+          || (queryDigits.length >= 3 && basePhone.includes(queryDigits));
+        if (!matches) return;
+        rawCandidates.push({
+          chatId,
+          displayName,
+          hasRealName: !!c.name,
+          isBusiness: !!c.isBusiness,
+          isMyContact: !!c.isMyContact,
+        });
       });
-
-      const filteredContacts = Array.from(uniqueContactsMap.values()).filter(contact => {
-        const nameLower = contact.displayName.toLowerCase();
-        return nameLower.includes(queryClean) || contact.chatId.includes(queryClean);
-      });
-
-      // Añadir los resultados de la BD local que la vía en vivo no trajo (gente sin
-      // historial de mensaje directo, o si getContacts() no respondió a tiempo), evitando
-      // duplicar a alguien que ya haya salido por la vía en vivo (mismo chat_id o mismo
-      // nombre).
-      const liveChatIds = new Set(filteredContacts.map(c => c.chatId));
-      const liveNames = new Set(filteredContacts.map(c => normalizeContactName(c.displayName)));
       localMatches.forEach(u => {
-        if (liveChatIds.has(u.chat_id) || liveNames.has(normalizeContactName(u.username))) return;
-        filteredContacts.push({
+        rawCandidates.push({
           chatId: u.chat_id,
           displayName: u.username,
-          hasRealName: true,
+          hasRealName: false,
           isBusiness: false,
           isMyContact: false,
-          isLid: false,
         });
       });
 
-      // Si la misma persona aparece con cuenta personal y de empresa bajo nombres distintos
-      // (por lo que el deduplicado de arriba, que compara por nombre, no los une), priorizar
-      // la personal: quien busca casi siempre quiere hablar con la persona, no con el número
-      // de empresa. `sort` es estable, así que dentro de cada grupo se conserva el orden
-      // original.
-      filteredContacts.sort((a, b) => (a.isBusiness === b.isBusiness) ? 0 : (a.isBusiness ? 1 : -1));
+      // LID ↔ número de cada candidato, de una sola llamada (solo los que encajan con la
+      // búsqueda, no toda la agenda).
+      const candidateChatIds = [...new Set(rawCandidates.map(c => c.chatId))];
+      const aliases = new Map();
+      if (candidateChatIds.length && typeof client?.getContactLidAndPhone === 'function') {
+        // Si un id hace fallar la llamada entera (p. ej. un número sin WhatsApp), se pide
+        // uno a uno para no perder la unión de los demás.
+        let resolved = await withTimeout(client.getContactLidAndPhone(candidateChatIds), 5000);
+        if (!Array.isArray(resolved)) {
+          resolved = await Promise.all(candidateChatIds.map(async (id) =>
+            (await withTimeout(client.getContactLidAndPhone([id]), 3000))?.[0] || null));
+        }
+        resolved.forEach((entry, index) => {
+          if (entry) aliases.set(candidateChatIds[index], { lid: getSerializedIdSafe(entry.lid), pn: getSerializedIdSafe(entry.pn) });
+        });
+      }
 
-      // Número de teléfono por resultado, mismo criterio que ya usa showGroupDetails en
-      // group.controller.js: para @lid (id interno, no son dígitos de un número real) hace
-      // falta resolverlo en vivo; para @c.us los dígitos ya están en el propio chat_id.
-      await Promise.all(filteredContacts.map(async (contact) => {
-        contact.phone = (await resolveContactPhone(contact.chatId))
-          || formatPhoneNumber(contact.chatId);
-      }));
-
-      // El icono de "contacto existente" indica que ya está en los Contactos del Nokia (la
-      // BD local), es decir, que tiene historial de mensaje directo — el mismo criterio que
-      // usa la lista de /usuario (getAllUsers). No usar "viene de la vía en vivo": alguien
-      // como Olga puede existir en WhatsApp pero no estar todavía guardada como contacto en
-      // el Nokia, y no debe llevar el icono aunque la búsqueda la haya encontrado en vivo.
-      const candidateIds = filteredContacts.map(c => c.chatId);
-      const existingContactIds = candidateIds.length > 0
+      // ¿Quién tiene ya chat en el Nokia? Con todos los ids posibles de cada persona.
+      const allIds = [...new Set([
+        ...candidateChatIds,
+        ...[...aliases.values()].flatMap(a => [a.lid, a.pn]).filter(Boolean),
+      ])];
+      const existingContactIds = allIds.length > 0
         ? new Set(
             db.prepare(`
               SELECT DISTINCT user_chat_id FROM messages
-              WHERE group_id IS NULL AND user_chat_id IN (${candidateIds.map(() => '?').join(',')})
-            `).all(...candidateIds).map(r => r.user_chat_id)
+              WHERE group_id IS NULL AND user_chat_id IN (SELECT value FROM json_each(?))
+            `).all(JSON.stringify(allIds)).map(r => r.user_chat_id)
           )
         : new Set();
-      filteredContacts.forEach(contact => {
-        contact.isExistingContact = existingContactIds.has(contact.chatId);
-      });
+
+      const filteredContacts = mergeContactCandidates(rawCandidates, { aliases, existingIds: existingContactIds });
+
+      // Primero las cuentas personales: quien busca casi siempre quiere a la persona, no su
+      // número de empresa (sort estable: se conserva el orden dentro de cada grupo).
+      filteredContacts.sort((a, b) => (a.isBusiness === b.isBusiness) ? 0 : (a.isBusiness ? 1 : -1));
+
+      // Teléfono de cada resultado: el número personal que ya dio WhatsApp; si no, se
+      // resuelve (los @lid no son dígitos de un teléfono real).
+      await Promise.all(filteredContacts.slice(0, 5).map(async (contact) => {
+        contact.phone = (contact.pn ? formatPhoneNumber(contact.pn) : null)
+          || (await resolveContactPhone(contact.chatId))
+          || formatPhoneNumber(contact.chatId);
+      }));
 
       const allChats = (await withTimeout(client.getChats(), 8000)) || [];
       const filteredGroups = allChats.filter(c => {
@@ -314,50 +301,72 @@ export async function renderComposePage(req, res, next) {
         });
       });
 
-      let coincidenciaEncontrada = false;
+      const shownContacts = filteredContacts.slice(0, 5);
+      const shownGroups = filteredGroups.slice(0, 5);
+      const total = shownContacts.length + shownGroups.length;
 
-      if (filteredContacts.length > 0) {
-        coincidenciaEncontrada = true;
-        body += '<h3>Contactos</h3>';
-        filteredContacts.slice(0, 5).forEach(contact => {
+      body += `<p><font size="1">${total} resultado${total === 1 ? '' : 's'} para «${escapeXml(query)}» ` +
+        '<a href="/mensaje/componer">[Quitar]</a></font></p>';
+
+      if (shownContacts.length > 0) {
+        body += '<p><b>Contactos</b>';
+        // Leyenda solo si hace falta: el icono marca a quien ya tienes en el Nokia.
+        if (shownContacts.some(contact => contact.isExistingContact)) {
+          body += `<br/><font size="1" color="#666666">${EXISTING_CONTACT_ICON_HTML} = ya en el Nokia</font>`;
+        }
+        body += '</p>';
+        shownContacts.forEach(contact => {
           const iconHtml = contact.isExistingContact ? `${EXISTING_CONTACT_ICON_HTML} ` : '';
-          const phoneHtml = contact.phone ? `<br/>${renderPhoneLink(contact.phone)}` : '';
           // [Ver]: detalles (foto, info, teléfono) para distinguir contactos con el mismo
           // nombre; si aún no está en el Nokia se abre en modo temporal sin guardarlo.
-          const detailsHref = `/usuario/${encodeURIComponent(contact.chatId)}/detalles?q=${encodeURIComponent(q.trim())}`;
-          body += `<p>${iconHtml}• <a href="/mensaje/componer?to=${encodeURIComponent(contact.chatId)}&amp;type=user"><b>${escapeXml(contact.displayName)}</b></a> <a href="${escapeXml(detailsHref)}">[Ver]</a>${phoneHtml}</p>`;
+          const detailsHref = `/usuario/${encodeURIComponent(contact.chatId)}/detalles?q=${encodeURIComponent(query)}`;
+          const composeHref = `/mensaje/componer?to=${encodeURIComponent(contact.chatId)}&type=user`;
+          const businessTag = contact.isBusiness ? '(empresa) ' : '';
+          // Teléfono en su propia línea (sin paréntesis): enlace wtai para llamar desde el Nokia.
+          const phoneHtml = contact.phone
+            ? `<a href="wtai://wp/mc;${escapeXml(contact.phone.replace(/[^0-9+]/g, ''))}"><font color="#666666">${escapeXml(contact.phone)}</font></a> `
+            : '';
+          const name = convertEmojisToAscii(contact.displayName) || contact.displayName;
+          body += '<hr/>' +
+            `<p>${iconHtml}<a href="${escapeXml(composeHref)}"><b>${escapeXml(name)}</b></a>` +
+            `<br/><font size="1" color="#666666">${phoneHtml}${businessTag}<a href="${escapeXml(detailsHref)}">[Ver]</a></font></p>`;
         });
       }
 
-      if (filteredGroups.length > 0) {
-        coincidenciaEncontrada = true;
-        body += '<h3>Grupos</h3>';
-        filteredGroups.slice(0, 5).forEach(group => {
+      if (shownGroups.length > 0) {
+        body += `${shownContacts.length ? '<hr/>' : ''}<p><b>Grupos</b></p>`;
+        shownGroups.forEach(group => {
           const groupId = group.id._serialized;
-          const displayGroupName = group.name || 'Grupo sin nombre';
-          body += `<p>👥 <a href="/mensaje/componer?to=${encodeURIComponent(groupId)}&type=group"><b>${escapeXml(displayGroupName)}</b></a></p>`;
+          const displayGroupName = convertEmojisToAscii(group.name || '') || 'Grupo sin nombre';
+          const composeHref = `/mensaje/componer?to=${encodeURIComponent(groupId)}&type=group`;
+          body += `<hr/><p>${GROUP_ICON_HTML} <a href="${escapeXml(composeHref)}"><b>${escapeXml(displayGroupName)}</b></a></p>`;
         });
       }
 
-      if (!coincidenciaEncontrada) {
+      if (total === 0) {
         body += '<p>No se encontraron resultados.</p>';
         const soloNumeros = queryClean.replace(/[^0-9]/g, '');
         if (soloNumeros.length >= 9) {
           body += `
+            <p><font size="1" color="#666666">Escribir al +${soloNumeros}:</font></p>
             <form action="/mensaje/validar-y-crear" method="POST">
               <input type="hidden" name="phone" value="${soloNumeros}"/>
               <input type="hidden" name="type" value="user"/>
               <p>
                 <textarea name="text" rows="3" cols="18"></textarea>
+                <br/><input type="submit" value="Enviar"/>
               </p>
-              <input type="submit" value="Enviar"/>
             </form>
           `;
+        } else {
+          body += '<p><font size="1" color="#666666">Prueba con parte del nombre o con el número completo.</font></p>';
         }
       }
     }
 
-    sendPage(req, res, 200, 'Buscador Live', body);
+    body += '<hr/><p><a href="/">Inicio</a> | <a href="/usuario">Usuarios</a> | <a href="/grupo">Grupos</a></p>';
+
+    sendPage(req, res, 200, 'Buscar', body);
   } catch (error) {
     next(error);
   }
@@ -507,12 +516,9 @@ export async function validateAndCreateChat(req, res, next) {
       }
     }
 
-    const urlDestino = isGroup
-      ? `/grupo/${encodeURIComponent(targetJid)}`
-      : `/usuario/${encodeURIComponent(targetJid)}`;
-
+    let sentResults;
     try {
-      await sendOutgoingMessages({
+      sentResults = await sendOutgoingMessages({
         targetJid,
         isGroup,
         text: processedText,
@@ -534,6 +540,12 @@ export async function validateAndCreateChat(req, res, next) {
       }
       throw error.cause ?? error;
     }
+
+    // En privados el chat puede haberse guardado con el @lid del número escrito.
+    const chatDestino = sentResults?.[0]?.chatId || targetJid;
+    const urlDestino = isGroup
+      ? `/grupo/${encodeURIComponent(chatDestino)}`
+      : `/usuario/${encodeURIComponent(chatDestino)}`;
 
     // Pantalla nostálgica de espera de 3 segundos sin botones
     res.setHeader('Refresh', `1; url=${urlDestino}`);
@@ -695,6 +707,8 @@ export async function showMessageDetail(req, res, next) {
       }
     }
 
+    contentHtml += await renderReactionsDetail(message.id);
+
     if (!isSticker && !mediaType && attachment?.file_path_full) {
       const fileName = attachment.file_path_full.split('/').pop();
       contentHtml += `<p><a href="/descargar/${escapeXml(fileName)}">Descargar imagen</a></p>`;
@@ -710,6 +724,29 @@ export async function showMessageDetail(req, res, next) {
   } catch (error) {
     next(error);
   }
+}
+
+// Nombre para mostrar de quien reacciona/vota: el de la agenda o perfil si lo hay; si solo
+// tenemos un número, el teléfono personal (no el de empresa).
+async function participantDisplayName(chatId) {
+  const user = stmts.getUserByChatId.get(chatId);
+  const hasRealName = user?.username && Number(user.name_priority) >= CONTACT_NAME_PRIORITY.PROFILE_NAME;
+  return (hasRealName ? user.username : null)
+    || (await resolveContactPhone(chatId))
+    || user?.username
+    || formatPhoneNumber(chatId)
+    || chatId.replace(/@.*$/, '');
+}
+
+// Detalle del mensaje: una línea por reacción, «😂 Ana», con «Tú» para las propias.
+async function renderReactionsDetail(messageId) {
+  const reactions = stmts.getReactionsForMessage.all(messageId);
+  if (!reactions.length) return '';
+  const lines = await Promise.all(reactions.map(async (r) => {
+    const name = isMyId(r.sender_id) ? 'Tú' : await participantDisplayName(r.sender_id);
+    return `${renderMiniEmoji(r.reaction)} ${escapeXml(convertEmojisToAscii(name) || name)}`;
+  }));
+  return `<p><font size="1" color="#666666">Reacciones:</font><br/>${lines.join('<br/>')}</p>`;
 }
 
 async function loadAudioMessage(req, res) {

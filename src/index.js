@@ -1,4 +1,5 @@
 import express from 'express';
+import dns from 'node:dns/promises';
 import { basename, join } from 'path';
 import { existsSync } from 'fs';
 import dotenv from 'dotenv';
@@ -19,6 +20,28 @@ const PORT = Number.parseInt(process.env.PORT ?? '8080', 10);
 const app = express();
 
 app.disable('x-powered-by');
+
+// Sin GateWayNK delante (docker-compose.yml de este repo): «X-Nokia-TLS: 1» solo vale si
+// la conexión viene del contenedor nokia-tls. Por el túnel HTTP en claro, un cliente podría
+// mandarla para hacerse pasar por HTTPS: se descarta. Con el Gateway (sin TLS_PROXY_HOST)
+// esta comprobación ya la hace él.
+const TLS_PROXY_HOST = process.env.TLS_PROXY_HOST || '';
+if (TLS_PROXY_HOST) {
+  const normalizeIp = (ip) => (ip && ip.startsWith('::ffff:') ? ip.slice(7) : ip);
+  app.use(async (req, _res, next) => {
+    if (req.headers['x-nokia-tls'] === undefined) return next();
+    try {
+      // Se resuelve en cada petición marcada: al reiniciar nokia-tls puede cambiar su IP.
+      const addresses = await dns.lookup(TLS_PROXY_HOST, { all: true });
+      const remote = normalizeIp(req.socket.remoteAddress);
+      if (!addresses.some(({ address }) => normalizeIp(address) === remote)) delete req.headers['x-nokia-tls'];
+    } catch {
+      delete req.headers['x-nokia-tls'];
+    }
+    next();
+  });
+}
+
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use('/assets', requireAuth, express.static('assets'));

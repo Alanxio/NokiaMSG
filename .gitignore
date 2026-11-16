@@ -10,3 +10,5 @@ data-tls-probe/
 # Cachés de Chromium / Puppeteer (whatsapp-web.js)
 .wwebjs_cache/
 .puppeteer_cache/
+# Configuración de ngrok que genera scripts/standalone.sh
+.ngrok/
